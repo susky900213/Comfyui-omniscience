@@ -1,0 +1,149 @@
+#comfyui-cline-launcher {
+  position: fixed;
+  bottom: max(88px, calc(env(safe-area-inset-bottom) + 72px));
+  right: 18px;
+  z-index: 10000;
+  border: 1px solid #6d5ce7;
+  border-radius: 6px;
+  padding: 7px 13px;
+  color: #fff;
+  background: #4f3db5;
+  cursor: pointer;
+  box-shadow: 0 2px 10px #0006;
+}
+
+.cline-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 10001;
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 96vw);
+  height: 100vh;
+  color: #e9e7f2;
+  background: #1d1c25;
+  border-left: 1px solid #4c4861;
+  box-shadow: -8px 0 30px #0008;
+  transform: translateX(105%);
+  transition: transform .2s ease;
+  font: 13px/1.45 system-ui, -apple-system, sans-serif;
+}
+
+.cline-panel.open { transform: translateX(0); }
+.cline-project-dialog-backdrop { position: fixed; inset: 0; z-index: 10002; display: flex; align-items: center; justify-content: center; padding: 20px; background: #0009; }
+.cline-project-dialog { width: min(420px, 92vw); padding: 18px; border: 1px solid #5a536e; border-radius: 8px; color: #e9e7f2; background: #272431; box-shadow: 0 12px 40px #000b; }
+.cline-project-dialog h3 { margin: 0 0 8px; }
+.cline-project-dialog p { margin: 8px 0 14px; }
+.cline-project-dialog .cline-field { margin-bottom: 8px; }
+.cline-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.cline-header, .cline-tabs, .cline-composer, .cline-confirm-actions, .cline-toolbar, .cline-inline-actions { display: flex; align-items: center; }
+.cline-header { justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #373445; font-size: 16px; }
+.cline-header-title { display: flex; min-width: 0; align-items: baseline; gap: 10px; }
+.cline-header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
+.cline-global-chat-toggle { white-space: nowrap; }
+.cline-global-chat-toggle.active { border-color: #7665e6; color: #fff; background: #4f3db5; }
+.cline-current-task { min-width: 0; overflow: hidden; flex: 1 1 auto; color: #aaa5b8; font-size: 12px; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.cline-prompt-stats { flex: 0 0 auto; color: #aaa5b8; font-size: 11px; white-space: nowrap; }
+.cline-close { border: 0; color: #bbb6ce; background: transparent; font-size: 24px; cursor: pointer; }
+.cline-task-layout { display: flex; flex: 1; min-height: 0; }
+.cline-task-sidebar { width: 220px; min-width: 220px; overflow-y: auto; padding: 12px 9px; border-right: 1px solid #373445; background: #191820; }
+.cline-task-sidebar h3 { margin: 18px 5px 8px; color: #aaa5b8; font-size: 12px; font-weight: 600; }
+.cline-new-task { width: 100%; }
+.cline-task-list { position: relative; display: flex; flex-direction: column; gap: 0; overflow-y: auto; padding: 4px 2px 12px 0; }
+.cline-task-list::before { position: absolute; top: 20px; bottom: 22px; left: 8px; width: 2px; border-radius: 2px; background: #39334f; content: ""; }
+.cline-task-history-item { position: relative; padding: 0 0 9px 14px; }
+.cline-task-history-item:last-child { padding-bottom: 0; }
+.cline-task-node { position: relative; display: flex; width: 100%; min-width: 0; flex-direction: column; gap: 5px; border: 1px solid #413b58; border-radius: 8px; padding: 10px 9px 9px; color: #ddd8e8; background: #25222f; text-align: left; cursor: pointer; box-shadow: 0 2px 6px #0003; }
+.cline-task-node:hover, .cline-task-node.active { border-color: #7665e6; background: #302b4f; box-shadow: 0 0 0 1px #51477e, 0 3px 9px #0005; }
+.cline-task-node-port { position: absolute; top: 50%; left: -10px; width: 8px; height: 8px; border: 2px solid #615681; border-radius: 50%; background: #25222f; transform: translateY(-50%); }
+.cline-task-node-port.running { border-color: #d1a35c; background: #d1a35c; box-shadow: 0 0 8px #d1a35c99; }
+.cline-task-node-port.cancelled { border-color: #b96363; background: #542e38; }
+.cline-task-node.active .cline-task-node-port { border-color: #9e91ff; background: #6d5ce7; }
+.cline-task-node-header, .cline-task-node-footer { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 6px; }
+.cline-task-node-header { gap: 7px; }
+.cline-task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cline-task-node-description { overflow: hidden; color: #bdb7cd; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.cline-task-node-status { flex: 0 0 auto; border: 1px solid #5b536f; border-radius: 10px; padding: 1px 6px; color: #bbb6ce; font-size: 10px; line-height: 1.4; }
+.cline-task-node-status.running { border-color: #8f713f; color: #e5c47e; }
+.cline-task-node-status.cancelled { border-color: #874b58; color: #e39a9a; }
+.cline-task-node-footer { color: #8f899f; font-size: 10px; }
+.cline-task-node-mode { color: #aaa0e9; }
+.cline-task-prompt-length { overflow: hidden; color: #aaa5b8; text-overflow: ellipsis; white-space: nowrap; }
+.cline-task-node-date { white-space: nowrap; }
+.cline-task-empty { position: relative; z-index: 1; margin: 8px 4px; padding: 8px; border: 1px dashed #49435e; border-radius: 6px; background: #211f2b; text-align: center; }
+.cline-main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
+.cline-toolbar { justify-content: space-between; gap: 8px; padding: 8px 12px 0; }
+.cline-mode-controls { display: flex; gap: 4px; }
+.cline-mode { border: 1px solid #5a536e; border-radius: 4px; padding: 5px 9px; color: #c9c2e8; background: transparent; cursor: pointer; }
+.cline-mode.active { border-color: #6d5ce7; color: white; background: #4f3db5; }
+.cline-tabs { gap: 3px; overflow-x: auto; padding: 8px 12px; border-bottom: 1px solid #373445; }
+.cline-tabs button { border: 0; border-radius: 4px; padding: 7px 12px; color: #bbb6ce; background: transparent; cursor: pointer; }
+.cline-tabs button.active { color: white; background: #4f3db5; }
+.cline-views { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.cline-chat-view, .cline-files-area, .cline-settings-area, .cline-checkpoints-area, .cline-mcp-area, .cline-workflow-area, .cline-skills-area { display: flex; flex: 1; min-height: 0; flex-direction: column; padding: 12px; }
+.cline-hidden { display: none !important; }
+.cline-messages { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 2px 12px; }
+.cline-welcome { margin: 28px 10px; padding: 16px; border: 1px solid #49435e; border-radius: 8px; background: #272431; }
+.cline-welcome p { margin: 8px 0 0; color: #bdb8ca; }
+.cline-message { margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cline-message.user { background: #302b4f; }
+.cline-message.assistant { background: #292832; }
+.cline-message.tool { background: #242630; }
+.cline-message-role { margin-bottom: 5px; color: #a99bf2; font-weight: 600; }
+.cline-tool-calls { margin-top: 8px; color: #aaa5b8; font-size: 11px; }
+.cline-line { min-height: 1.45em; }
+.cline-status, .cline-hint, .cline-context-label, .cline-workspace-label { color: #aaa5b8; }
+.cline-context-label { padding: 7px 0; font-size: 12px; }
+.cline-composer { gap: 8px; align-items: flex-end; padding-top: 8px; border-top: 1px solid #373445; }
+.cline-composer textarea { flex: 1; resize: vertical; min-height: 58px; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: inherit; }
+.cline-skill-selector { margin: 8px 0 0; padding: 8px 0; border-top: 1px solid #373445; }
+.cline-skill-selector-heading, .cline-skill-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cline-skill-selector-heading { color: #cfc8e4; }
+.cline-skill-selector-heading button { padding: 4px 8px; font-size: 11px; }
+.cline-selected-skills { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+.cline-skill-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #7665e6; border-radius: 999px; padding: 3px 7px 3px 9px; color: #eeeaff; background: #302b4f; }
+.cline-skill-chip-remove { border: 0; padding: 0 2px; color: #cfc8e4; background: transparent; cursor: pointer; }
+.cline-skill-command-menu { margin-top: 6px; border: 1px solid #5a536e; border-radius: 6px; padding: 4px; background: #24212f; box-shadow: 0 5px 15px #0007; }
+.cline-skill-command-list { display: flex; max-height: 190px; flex-direction: column; overflow-y: auto; }
+.cline-skill-command-item { display: flex; flex-direction: column; gap: 2px; border: 0; border-radius: 4px; padding: 7px 9px; color: #e9e7f2; background: transparent; text-align: left; cursor: pointer; }
+.cline-skill-command-item:hover, .cline-skill-command-item.active { background: #3b3560; }
+.cline-skill-command-description { overflow: hidden; color: #aaa5b8; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.cline-skill-selector-list { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 7px; }
+.cline-skill-check { display: inline-flex; align-items: center; gap: 5px; color: #d5d0e2; cursor: pointer; }
+.cline-skill-check input { accent-color: #7665e6; }
+.cline-skill-form { margin-bottom: 14px; padding: 12px; border: 1px solid #49435e; border-radius: 7px; background: #272431; }
+.cline-skill-form h4 { margin: 0 0 10px; }
+.cline-skill-editor { min-height: 150px; resize: vertical; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.cline-skill-toolbar { flex-wrap: wrap; }
+.cline-skill-list { flex: 1; min-height: 0; overflow-y: auto; }
+.cline-skill-card { margin-bottom: 10px; padding: 10px; border: 1px solid #49435e; border-radius: 7px; background: #272431; }
+.cline-skill-card.disabled { opacity: .7; }
+.cline-skill-card p { margin: 6px 0; }
+.cline-skill-state { color: #a99bf2; font-size: 11px; }
+.cline-skill-preview { max-height: 130px; overflow: auto; margin: 7px 0; }
+.cline-skills-area { overflow-y: auto; }
+button.cline-primary, .cline-primary { border: 0; border-radius: 5px; padding: 8px 12px; color: #fff; background: #5b47ce; cursor: pointer; }
+button.cline-secondary { border: 1px solid #5a536e; border-radius: 5px; padding: 8px 12px; color: #ddd8e8; background: transparent; cursor: pointer; }
+button.cline-cancel-task { border-color: #9b5050; color: #f0b0b0; }
+button.cline-clear-history { border-color: #756a4c; color: #e3cd92; }
+button:disabled { opacity: .55; cursor: wait; }
+.cline-confirmation { margin: 10px 0; padding: 12px; border: 1px solid #b18443; border-radius: 7px; background: #3a3021; }
+.cline-confirmation p { margin: 7px 0; }
+.cline-action-details { max-height: 180px; overflow: auto; margin: 8px 0; padding: 8px; color: #e0c58c; background: #282116; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cline-confirm-actions { gap: 8px; }
+.cline-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.cline-field input { border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; }
+.cline-json-editor { min-height: 210px; resize: vertical; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.cline-settings-area h3, .cline-files-area h3, .cline-workflow-area h3, .cline-checkpoints-area h3, .cline-mcp-area h3, .cline-skills-area h3 { margin: 4px 0 14px; }
+.cline-workflow-editor { flex: 1; min-height: 300px; resize: vertical; }
+.cline-workflow-section-title { margin: 14px 0 5px; color: #d7d1e8; font-size: 13px; }
+.cline-workflow-area { overflow-y: auto; }
+.cline-inline-actions { gap: 8px; margin: 8px 0; }
+.cline-checkpoint { margin-bottom: 10px; padding: 10px; border: 1px solid #49435e; border-radius: 6px; background: #272431; }
+.cline-checkpoint > strong, .cline-checkpoint > span { display: block; }
+.cline-checkpoint-date { margin-top: 3px; }
+.cline-file-list { flex: 1; overflow-y: auto; margin-top: 10px; }
+.cline-file-row { display: block; width: 100%; border: 0; border-bottom: 1px solid #302d3c; padding: 7px 5px; color: #c9c2e8; background: transparent; text-align: left; cursor: pointer; }
+.cline-file-row:hover { background: #302b4f; }
+.cline-error { color: #f19b9b; }
