@@ -1,4 +1,4 @@
-"""Persistent task, event, context, and checkpoint primitives for ComfyUI-Cline.
+"""Persistent task, event, context, and checkpoint primitives for Comfyui-omniscience.
 
 The original Cline applications keep these concerns outside the UI.  This
 module provides the same boundary for the ComfyUI adapter: task state is
@@ -883,10 +883,10 @@ class CheckpointManager:
         env = os.environ.copy()
         env.update(
             {
-                "GIT_AUTHOR_NAME": "ComfyUI-Cline",
-                "GIT_AUTHOR_EMAIL": "comfyui-cline@localhost",
-                "GIT_COMMITTER_NAME": "ComfyUI-Cline",
-                "GIT_COMMITTER_EMAIL": "comfyui-cline@localhost",
+                "GIT_AUTHOR_NAME": "Comfyui-omniscience",
+                "GIT_AUTHOR_EMAIL": "comfyui-omniscience@localhost",
+                "GIT_COMMITTER_NAME": "Comfyui-omniscience",
+                "GIT_COMMITTER_EMAIL": "comfyui-omniscience@localhost",
             }
         )
         return subprocess.run(

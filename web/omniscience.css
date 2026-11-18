@@ -1,4 +1,4 @@
-#comfyui-cline-launcher {
+#comfyui-omniscience-launcher {
   position: fixed;
   bottom: max(88px, calc(env(safe-area-inset-bottom) + 72px));
   right: 18px;

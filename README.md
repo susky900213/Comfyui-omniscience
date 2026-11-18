@@ -1,13 +1,13 @@
-# ComfyUI-Cline
+# Comfyui-omniscience
 
-这是一个面向 ComfyUI 的 Cline 功能移植版：在 ComfyUI 网页界面中提供一个
+这是一个面向 ComfyUI 的全能 AI 编程助手：在 ComfyUI 网页界面中提供一个
 AI 编程助手侧栏。它不是把 VS Code 扩展源码直接塞进 ComfyUI；Cline 的原版依赖
 VS Code Extension API，因此本项目使用 ComfyUI custom node 的后端路由和前端扩展
 机制重做了相同的核心工作流。
 
 ## 当前功能
 
-- ComfyUI 右上角 `Cline` 按钮和侧栏聊天面板；
+- ComfyUI 右上角 `Omniscience` 按钮和侧栏聊天面板；
 - OpenAI-compatible Chat Completions API，兼容 OpenAI、DeepSeek、OpenRouter、Ollama
   等支持该接口的服务；
 - 列出工作区文件、读取文件、搜索文件；
@@ -26,18 +26,18 @@ VS Code Extension API，因此本项目使用 ComfyUI custom node 的后端路�
 - 完整 Skill 管理：在侧栏创建、编辑、删除、启用/停用 Skill，支持 JSON 导入导出；对话页可以按消息选择多个 Skill，选中的启用 Skill 会注入模型系统提示词；全局对话可按用户明确给出的公开 GitHub 链接安装标准 `SKILL.md` Skill 包；
 - 会话上下文自动压缩：提示词估算达到可配置的最大上下文百分比（默认 80%）时，先调用无工具的摘要请求，再用摘要替换较早历史，同时保留系统提示、最近消息和工具调用结果；摘要失败时回退到本地压缩，不丢失原始会话；设置页会显示当前提示词的 Token、字符数和组成；
 - 文件操作限制在配置的工作区目录内；
-- 配置保存到 `~/.config/comfyui-cline/config.json`，权限尽量设置为 `0600`。
+- 配置保存到 `~/.config/comfyui-omniscience/config.json`，权限尽量设置为 `0600`。
 
 ## 安装
 
 把本目录复制到 ComfyUI 的 `custom_nodes` 目录。例如：
 
 ```bash
-cp -R /Users/apple/workspace/python/Comfyui-cline \
-  /path/to/ComfyUI/custom_nodes/ComfyUI-Cline
+cp -R /path/to/Comfyui-omniscience \
+  /path/to/ComfyUI/custom_nodes/Comfyui-omniscience
 ```
 
-重启 ComfyUI 后，右上角会出现 `Cline` 按钮。首次使用时打开“设置”填写：
+重启 ComfyUI 后，右上角会出现 `Omniscience` 按钮。首次使用时打开“设置”填写：
 
 - **API 地址**：例如 `https://api.openai.com/v1` 或 `http://127.0.0.1:11434/v1`；
 - **模型**：供应商提供的模型名；
@@ -76,17 +76,20 @@ cp -R /Users/apple/workspace/python/Comfyui-cline \
 开发中的节点插入两者之间。模板也不依赖 checkpoint，选择一张输入图片即可进行图像节点
 的基础连线测试。已有同名文件不会被覆盖。
 
-打开 Cline 后，当前画布会在任务页面后台同步，并在发送聊天消息前优先同步一次。同步结果保存在任务数据库的独立实时工作流缓存中，不会覆盖项目目录内已有的 `workflow.json`。如果画布接口暂不可用或实时 JSON 超过 2 MB，聊天仍可正常发送；可在“工作流”页点击“读取当前画布”查看具体同步错误。
+打开 Omniscience 后，当前画布会在任务页面后台同步，并在发送聊天消息前优先同步一次。同步结果保存在任务数据库的独立实时工作流缓存中，不会覆盖项目目录内已有的 `workflow.json`。如果画布接口暂不可用或实时 JSON 超过 2 MB，聊天仍可正常发送；可在“工作流”页点击“读取当前画布”查看具体同步错误。
 
 也可以通过环境变量设置默认值：
 
 ```bash
-export CLINE_API_KEY='your-key'
-export CLINE_MODEL='your-model'
-export CLINE_WORKSPACE='/path/to/project-parent'
-export CLINE_COMFYUI_DIRECTORY='/path/to/ComfyUI'
-export CLINE_MAX_CONTEXT_TOKENS='32000'
+export OMNISCIENCE_API_KEY='your-key'
+export OMNISCIENCE_MODEL='your-model'
+export OMNISCIENCE_WORKSPACE='/path/to/project-parent'
+export OMNISCIENCE_COMFYUI_DIRECTORY='/path/to/ComfyUI'
 ```
+
+旧版 `CLINE_*` 环境变量仍然兼容；已有 `~/.config/comfyui-cline` 配置和
+`~/.local/share/comfyui-cline` 数据，以及旧版 `~/.cline/data/settings/cline_mcp_settings.json`
+MCP 配置，也会在新目录不存在时继续读取。
 
 ## 安全边界
 
@@ -95,7 +98,7 @@ export CLINE_MAX_CONTEXT_TOKENS='32000'
 但 Act 模式不会逐次等待确认；使用远程访问、反向代理或公网暴露 ComfyUI 时，请先
 配置额外的认证层，不要把 API Key 暴露给不可信用户。
 
-API Key 会保存在本机配置文件中（除非只通过 `CLINE_API_KEY` 环境变量提供）。
+API Key 会保存在本机配置文件中（除非只通过 `OMNISCIENCE_API_KEY` 环境变量提供）。
 推荐在多人或不可信环境中只使用环境变量，并确保 ComfyUI 只监听可信地址。
 
 ## 与原版 Cline 的差异
@@ -111,5 +114,5 @@ API Key 会保存在本机配置文件中（除非只通过 `CLINE_API_KEY` 环�
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile __init__.py cline_server.py
+python3 -m py_compile __init__.py omniscience_server.py
 ```

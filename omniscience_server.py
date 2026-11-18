@@ -1,4 +1,4 @@
-"""Backend for the ComfyUI-Cline custom node.
+"""Backend for the Comfyui-omniscience custom node.
 
 This module contains the workspace guard, model adapter, tool loop, and
 aiohttp route registration. It intentionally uses only Python's standard
@@ -26,16 +26,17 @@ from urllib.request import Request, urlopen
 from urllib.request import HTTPRedirectHandler, build_opener
 
 try:
-    from .cline_browser import BrowserManager, BrowserUnavailable
-    from .cline_core import CheckpointManager, ContextManager, SkillStore, TaskStore
-    from .cline_mcp import MCPManager, MCPProtocolError
+    from .omniscience_browser import BrowserManager, BrowserUnavailable
+    from .omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
+    from .omniscience_mcp import MCPManager, MCPProtocolError
 except ImportError:  # Support the repository's direct unittest invocation.
-    from cline_browser import BrowserManager, BrowserUnavailable
-    from cline_core import CheckpointManager, ContextManager, SkillStore, TaskStore
-    from cline_mcp import MCPManager, MCPProtocolError
+    from omniscience_browser import BrowserManager, BrowserUnavailable
+    from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
+    from omniscience_mcp import MCPManager, MCPProtocolError
 
 
-PLUGIN_NAME = "ComfyUI-Cline"
+PRODUCT_NAME = "Comfyui-omniscience"
+PLUGIN_NAME = PRODUCT_NAME
 MAX_FILE_BYTES = 1_000_000
 MAX_WRITE_BYTES = 2_000_000
 MAX_COMMAND_OUTPUT = 20_000
@@ -52,26 +53,45 @@ MIN_COMPACTION_THRESHOLD_PERCENT = 1
 MAX_COMPACTION_THRESHOLD_PERCENT = 99
 MAX_CURRENT_WORKFLOW_BYTES = 2_000_000
 PLAN_TOOL_NAMES = {"list_files", "read_file", "search_files", "browser_navigate", "browser_content", "get_current_workflow"}
+DEFAULT_STATE_DIRECTORY = Path.home() / ".local" / "share" / "comfyui-omniscience"
+LEGACY_STATE_DIRECTORY = Path.home() / ".local" / "share" / "comfyui-cline"
 STATE_DIRECTORY = Path(
     os.environ.get(
-        "CLINE_STATE_DIRECTORY",
-        str(Path.home() / ".local" / "share" / "comfyui-cline"),
+        "OMNISCIENCE_STATE_DIRECTORY",
+        os.environ.get(
+            "CLINE_STATE_DIRECTORY",
+            str(LEGACY_STATE_DIRECTORY if LEGACY_STATE_DIRECTORY.exists() and not DEFAULT_STATE_DIRECTORY.exists() else DEFAULT_STATE_DIRECTORY),
+        ),
     )
 ).expanduser()
-TASK_DATABASE = Path(os.environ.get("CLINE_TASK_DATABASE", str(STATE_DIRECTORY / "tasks.sqlite3"))).expanduser()
-SKILL_DATABASE = Path(os.environ.get("CLINE_SKILL_DATABASE", str(STATE_DIRECTORY / "skills.sqlite3"))).expanduser()
-MCP_SETTINGS_PATH = Path(
-    os.environ.get("CLINE_MCP_SETTINGS_PATH", str(Path.home() / ".cline" / "data" / "settings" / "cline_mcp_settings.json"))
+TASK_DATABASE = Path(
+    os.environ.get("OMNISCIENCE_TASK_DATABASE", os.environ.get("CLINE_TASK_DATABASE", str(STATE_DIRECTORY / "tasks.sqlite3")))
 ).expanduser()
-DEFAULT_MODEL = os.environ.get("CLINE_MODEL", "")
-DEFAULT_API_BASE_URL = os.environ.get("CLINE_API_BASE_URL", "https://api.openai.com/v1")
+SKILL_DATABASE = Path(
+    os.environ.get("OMNISCIENCE_SKILL_DATABASE", os.environ.get("CLINE_SKILL_DATABASE", str(STATE_DIRECTORY / "skills.sqlite3")))
+).expanduser()
+DEFAULT_MCP_SETTINGS_PATH = Path.home() / ".config" / "comfyui-omniscience" / "mcp_settings.json"
+LEGACY_MCP_SETTINGS_PATH = Path.home() / ".cline" / "data" / "settings" / "cline_mcp_settings.json"
+MCP_SETTINGS_PATH = Path(
+    os.environ.get(
+        "OMNISCIENCE_MCP_SETTINGS_PATH",
+        os.environ.get(
+            "CLINE_MCP_SETTINGS_PATH",
+            str(LEGACY_MCP_SETTINGS_PATH if LEGACY_MCP_SETTINGS_PATH.exists() and not DEFAULT_MCP_SETTINGS_PATH.exists() else DEFAULT_MCP_SETTINGS_PATH),
+        ),
+    )
+).expanduser()
+DEFAULT_MODEL = os.environ.get("OMNISCIENCE_MODEL", os.environ.get("CLINE_MODEL", ""))
+DEFAULT_API_BASE_URL = os.environ.get("OMNISCIENCE_API_BASE_URL", os.environ.get("CLINE_API_BASE_URL", "https://api.openai.com/v1"))
 DEFAULT_WORKSPACE = Path.home() / ".Comfyui-node"
-DEFAULT_COMFYUI_DIRECTORY = os.environ.get("CLINE_COMFYUI_DIRECTORY", "").strip()
+DEFAULT_COMFYUI_DIRECTORY = os.environ.get("OMNISCIENCE_COMFYUI_DIRECTORY", os.environ.get("CLINE_COMFYUI_DIRECTORY", "")).strip()
 WORKFLOW_FILENAME = "workflow.json"
+DEFAULT_CONFIG_PATH = Path.home() / ".config" / "comfyui-omniscience" / "config.json"
+LEGACY_CONFIG_PATH = Path.home() / ".config" / "comfyui-cline" / "config.json"
 CONFIG_PATH = Path(
     os.environ.get(
-        "CLINE_CONFIG_FILE",
-        str(Path.home() / ".config" / "comfyui-cline" / "config.json"),
+        "OMNISCIENCE_CONFIG_FILE",
+        os.environ.get("CLINE_CONFIG_FILE", str(DEFAULT_CONFIG_PATH)),
     )
 ).expanduser()
 logger = logging.getLogger(__name__)
@@ -139,7 +159,7 @@ def _workflow_template(project_name: str) -> dict[str, Any]:
     checkpoint or any other model-specific asset.
     """
     note = (
-        f"ComfyUI-Cline 开发工作流：{project_name}\n"
+        f"Comfyui-omniscience 开发工作流：{project_name}\n"
         "在 LoadImage 选择测试图片，然后把新开发的节点接在 LoadImage 和 PreviewImage 之间。\n"
         "如果节点不是图像处理节点，请按节点的输入输出修改这条测试链。"
     )
@@ -612,7 +632,7 @@ def apply_unified_patch(original: str, patch: str) -> str:
 
 
 def _default_workspace() -> Path:
-    configured = os.environ.get("CLINE_WORKSPACE")
+    configured = os.environ.get("OMNISCIENCE_WORKSPACE", os.environ.get("CLINE_WORKSPACE"))
     workspace = Path(configured).expanduser() if configured else DEFAULT_WORKSPACE
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace.resolve()
@@ -621,16 +641,22 @@ def _default_workspace() -> Path:
 class SettingsStore:
     """Small local settings file; API keys are never returned by GET settings."""
 
-    def __init__(self, path: Path = CONFIG_PATH):
-        self.path = path
+    def __init__(self, path: Path | None = None):
+        self.path = Path(path or CONFIG_PATH).expanduser()
+        self.legacy_path = LEGACY_CONFIG_PATH if self.path == CONFIG_PATH else None
         self._lock = threading.Lock()
 
     def load(self) -> dict[str, Any]:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return {}
+        paths = [self.path]
+        if self.legacy_path and self.legacy_path != self.path:
+            paths.append(self.legacy_path)
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                continue
+        return {}
 
     def public(self) -> dict[str, Any]:
         data = self.load()
@@ -650,8 +676,8 @@ class SettingsStore:
             ),
             "workspace": workspace,
             "comfyui_directory": comfyui,
-            "api_key_configured": bool(data.get("api_key") or os.environ.get("CLINE_API_KEY")),
-            "api_key_from_environment": bool(os.environ.get("CLINE_API_KEY")),
+            "api_key_configured": bool(data.get("api_key") or os.environ.get("OMNISCIENCE_API_KEY") or os.environ.get("CLINE_API_KEY")),
+            "api_key_from_environment": bool(os.environ.get("OMNISCIENCE_API_KEY") or os.environ.get("CLINE_API_KEY")),
         }
 
     def update(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -696,7 +722,7 @@ class SettingsStore:
         return self.public()
 
     def api_key(self) -> str:
-        return os.environ.get("CLINE_API_KEY") or str(self.load().get("api_key") or "")
+        return os.environ.get("OMNISCIENCE_API_KEY") or os.environ.get("CLINE_API_KEY") or str(self.load().get("api_key") or "")
 
     def comfyui_node_directory(self) -> Path | None:
         data = self.load()
@@ -744,7 +770,7 @@ class _GitHubRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
-SYSTEM_PROMPT = """You are a careful coding assistant embedded in ComfyUI, inspired by Cline.
+SYSTEM_PROMPT = """You are a careful coding assistant embedded in ComfyUI and powered by Comfyui-omniscience.
 You work only inside the configured workspace. Inspect files before editing them.
 Use read_file, list_files, and search_files to understand the project. For changes,
 prefer small apply_patch operations; write_file is available for new or full files.
@@ -762,7 +788,7 @@ tool results that affect the current task, errors and unfinished work. Do not in
 Return only a concise plain-text summary. Do not call tools, edit files, or give generic advice.
 """
 
-GLOBAL_CHAT_SYSTEM_PROMPT = """You are Cline's global conversation assistant inside ComfyUI.
+GLOBAL_CHAT_SYSTEM_PROMPT = """You are Comfyui-omniscience's global conversation assistant inside ComfyUI.
 This conversation is independent of every task, project folder, workspace, workflow,
 file context, task metadata, and task status. Answer questions and discuss ideas
 helpfully, but do not claim to inspect or modify local files or the current ComfyUI
@@ -970,7 +996,7 @@ class ClineAgent:
         api_key = self.settings.api_key()
         model = str(data.get("model") or DEFAULT_MODEL).strip()
         if not model:
-            raise ValueError("No model configured. Open Cline settings and enter a model name.")
+            raise ValueError("No model configured. Open Comfyui-omniscience settings and enter a model name.")
         base_url = str(data.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
         endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -1147,7 +1173,7 @@ class GlobalChatAgent:
     ) -> Any:
         request = Request(
             url,
-            headers={"Accept": accept, "User-Agent": "ComfyUI-Cline-Skill-Installer"},
+            headers={"Accept": accept, "User-Agent": "Comfyui-omniscience-Skill-Installer"},
         )
         opener = build_opener(_GitHubRedirectHandler())
         with opener.open(request, timeout=20) as response:  # noqa: S310 - URL is constructed from validated public GitHub URL
@@ -2288,7 +2314,7 @@ class PersistentClineAgent:
         api_key = self.settings.api_key()
         model = str(data.get("model") or DEFAULT_MODEL).strip()
         if not model:
-            raise ValueError("No model configured. Open Cline settings and enter a model name.")
+            raise ValueError("No model configured. Open Comfyui-omniscience settings and enter a model name.")
         base_url = str(data.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
         endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}

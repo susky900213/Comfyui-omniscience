@@ -1,4 +1,4 @@
-"""Small MCP client for ComfyUI-Cline.
+"""Small MCP client for Comfyui-omniscience.
 
 The client deliberately implements the protocol boundary instead of importing
 an optional MCP SDK.  That keeps the custom node installable with ComfyUI's
@@ -227,7 +227,7 @@ class MCPManager:
             {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "ComfyUI-Cline", "version": "0.2.0"},
+                "clientInfo": {"name": "Comfyui-omniscience", "version": "0.2.0"},
             },
         )
         request = self._message(method, params)

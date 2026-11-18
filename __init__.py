@@ -1,4 +1,4 @@
-"""Cline-like coding assistant extension for ComfyUI.
+"""Comfyui-omniscience coding assistant extension for ComfyUI.
 
 The extension deliberately implements the assistant against ComfyUI's HTTP
 and frontend extension APIs instead of importing Cline's VS Code extension.
@@ -11,13 +11,13 @@ WEB_DIRECTORY = "./web"
 try:
     from server import PromptServer
 
-    from .cline_server import register_routes
+    from .omniscience_server import register_routes
 
     register_routes(PromptServer.instance)
 except Exception as exc:  # pragma: no cover - exercised by ComfyUI startup
     # A custom node must not prevent ComfyUI from starting when an optional
     # integration is unavailable. The error remains visible in the server log.
-    print(f"[ComfyUI-Cline] Failed to register routes: {exc}")
+    print(f"[Comfyui-omniscience] Failed to register routes: {exc}")
 
 
 NODE_CLASS_MAPPINGS = {}

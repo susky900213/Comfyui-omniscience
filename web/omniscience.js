@@ -1,8 +1,8 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-const STYLE_ID = "comfyui-cline-style";
-const PANEL_ID = "comfyui-cline-panel";
+const STYLE_ID = "comfyui-omniscience-style";
+const PANEL_ID = "comfyui-omniscience-panel";
 
 const state = {
   tasks: [],
@@ -62,7 +62,7 @@ function ensureStyle() {
   const link = document.createElement("link");
   link.id = STYLE_ID;
   link.rel = "stylesheet";
-  link.href = new URL("./cline.css", import.meta.url).href;
+  link.href = new URL("./omniscience.css", import.meta.url).href;
   document.head.appendChild(link);
 }
 
@@ -80,7 +80,7 @@ function displayedBusy() { return state.globalChatActive ? state.globalBusy : st
 
 function serializeCurrentCanvasWorkflow() {
   if (!app?.graph || typeof app.graph.serialize !== "function") {
-    throw new Error("ComfyUI 当前画布接口不可用，请确认 Cline 已作为 ComfyUI 前端扩展加载。");
+    throw new Error("ComfyUI 当前画布接口不可用，请确认 Comfyui-omniscience 已作为 ComfyUI 前端扩展加载。");
   }
   const workflow = app.graph.serialize();
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
@@ -107,7 +107,7 @@ async function syncCurrentWorkflow({ force = false, silent = true } = {}) {
     return state.currentWorkflow;
   } catch (error) {
     if (!silent) throw error;
-    console.warn("[ComfyUI-Cline] current workflow sync failed", error);
+    console.warn("[Comfyui-omniscience] current workflow sync failed", error);
     return null;
   }
 }
@@ -208,7 +208,7 @@ function renderMessages() {
   log.replaceChildren();
   if (!messages.length) {
     const welcome = el("div", "cline-welcome");
-    welcome.append(el("strong", "", state.globalChatActive ? "全局对话" : "Cline for ComfyUI"));
+    welcome.append(el("strong", "", state.globalChatActive ? "全局对话" : "Comfyui-omniscience for ComfyUI"));
     welcome.append(el("p", "", state.globalChatActive
       ? "这是独立于所有任务的全局对话。你可以讨论想法、提问，或提供公开 GitHub Skill 链接并明确要求安装；不会读取或修改项目文件。"
       : "创建或选择一个任务，然后描述要检查、规划或修改的内容。Plan 模式只允许读取或浏览；Act 模式会直接执行允许的写入、命令及外部工具调用。"));
@@ -217,7 +217,7 @@ function renderMessages() {
   for (const message of messages) {
     const role = message.role || "assistant";
     const article = el("article", `cline-message ${role}`);
-    article.appendChild(el("div", "cline-message-role", role === "user" ? "你" : role === "assistant" ? "Cline" : "工具结果"));
+    article.appendChild(el("div", "cline-message-role", role === "user" ? "你" : role === "assistant" ? "Omniscience" : "工具结果"));
     const content = el("div", "cline-message-content");
     content.appendChild(lines(message.content || ""));
     article.appendChild(content);
@@ -227,7 +227,7 @@ function renderMessages() {
     log.appendChild(article);
   }
   if (state.error) log.appendChild(el("div", "cline-error", state.error));
-  if (displayedBusy() || (!state.globalChatActive && state.task?.status === "running")) log.appendChild(el("div", "cline-status", "Cline 正在思考或执行…"));
+  if (displayedBusy() || (!state.globalChatActive && state.task?.status === "running")) log.appendChild(el("div", "cline-status", "Omniscience 正在思考或执行…"));
   log.scrollTop = log.scrollHeight;
 }
 
@@ -497,7 +497,7 @@ async function loadTask(taskId, { resetSkills = true } = {}) {
     await loadContextStats();
   } catch (error) {
     state.contextStats = null;
-    console.warn("[ComfyUI-Cline] prompt length refresh failed", error);
+    console.warn("[Comfyui-omniscience] prompt length refresh failed", error);
   }
   renderPanel();
   await syncCurrentWorkflow({ silent: true });
@@ -512,20 +512,20 @@ async function refreshTask() {
   if (result.task.id !== currentTaskId()) return;
   state.task = result.task;
   state.messages = result.messages || [];
-  try { await loadSkills(); } catch (error) { console.warn("[ComfyUI-Cline] skill refresh failed", error); }
+  try { await loadSkills(); } catch (error) { console.warn("[Comfyui-omniscience] skill refresh failed", error); }
   state.busy = result.task.status === "running";
   try {
     await loadContextStats();
   } catch (error) {
     state.contextStats = null;
-    console.warn("[ComfyUI-Cline] prompt length refresh failed", error);
+    console.warn("[Comfyui-omniscience] prompt length refresh failed", error);
   }
   renderPanel();
   if (state.view === "settings") {
     try {
       await loadContextStats();
       renderSettings();
-    } catch (error) { console.warn("[ComfyUI-Cline] context stats refresh failed", error); }
+    } catch (error) { console.warn("[Comfyui-omniscience] context stats refresh failed", error); }
   }
 }
 
@@ -550,7 +550,7 @@ async function pollEvents() {
       await loadTasks();
     }
   } catch (error) {
-    console.warn("[ComfyUI-Cline] event polling failed", error);
+    console.warn("[Comfyui-omniscience] event polling failed", error);
   } finally {
     state.polling = false;
   }
@@ -599,7 +599,7 @@ async function clearHistory() {
       await loadContextStats();
     } catch (error) {
       state.contextStats = null;
-      console.warn("[ComfyUI-Cline] prompt length refresh failed", error);
+      console.warn("[Comfyui-omniscience] prompt length refresh failed", error);
     }
     renderPanel();
     await loadTasks();
@@ -645,7 +645,7 @@ async function sendMessage() {
           .map((skill) => skill.id);
         state.selectedSkillIds = [...new Set([...state.selectedSkillIds, ...newlyInstalled])];
       } catch (error) {
-        console.warn("[ComfyUI-Cline] Skill list refresh failed", error);
+        console.warn("[Comfyui-omniscience] Skill list refresh failed", error);
       }
       return;
     }
@@ -794,7 +794,7 @@ async function renderWorkflow() {
     area.append(liveTitle, liveHint, liveEditor, liveActions);
 
     area.appendChild(el("h4", "cline-workflow-section-title", "项目 workflow.json（不会被实时画布覆盖）"));
-    area.appendChild(el("p", "cline-hint", "这是一个可导入 ComfyUI 的基础测试工作流。已有 workflow.json 不会被 Cline 覆盖。"));
+    area.appendChild(el("p", "cline-hint", "这是一个可导入 ComfyUI 的基础测试工作流。已有 workflow.json 不会被 Comfyui-omniscience 覆盖。"));
     const editor = document.createElement("textarea");
     editor.className = "cline-json-editor cline-workflow-editor";
     editor.readOnly = true;
@@ -1033,7 +1033,7 @@ function renderSkills() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "cline-skills.json";
+    link.download = "comfyui-omniscience-skills.json";
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -1123,7 +1123,7 @@ function buildPanel() {
   const header = el("header", "cline-header");
   const heading = el("div", "cline-header-title");
   heading.append(
-    el("strong", "", "Cline"),
+    el("strong", "", "Comfyui-omniscience"),
     el("span", "cline-current-task", "未选择任务"),
     el("span", "cline-prompt-stats", "提示词：—"),
   );
@@ -1226,15 +1226,15 @@ function buildPanel() {
 }
 
 function installLauncher() {
-  if (document.getElementById("comfyui-cline-launcher")) return;
-  const launcher = button("Cline", "cline-launcher");
-  launcher.id = "comfyui-cline-launcher";
+  if (document.getElementById("comfyui-omniscience-launcher")) return;
+  const launcher = button("Omniscience", "cline-launcher");
+  launcher.id = "comfyui-omniscience-launcher";
   launcher.onclick = () => { buildPanel(); document.getElementById(PANEL_ID).classList.add("open"); };
   document.body.appendChild(launcher);
 }
 
 app.registerExtension({
-  name: "ComfyUI.Cline",
+  name: "ComfyUI.Omniscience",
   async setup() {
     ensureStyle();
     installLauncher();

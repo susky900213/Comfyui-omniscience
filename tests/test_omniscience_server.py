@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from cline_server import (
+from omniscience_server import (
     GlobalChatAgent,
     PersistentClineAgent,
     ProjectFolderExistsError,
@@ -16,8 +16,8 @@ from cline_server import (
     _project_folder_name,
     apply_unified_patch,
 )
-from cline_core import CheckpointManager, ContextManager, SkillStore, TaskStore
-from cline_mcp import MCPManager
+from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
+from omniscience_mcp import MCPManager
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -68,17 +68,17 @@ class WorkspaceTests(unittest.TestCase):
 
 class SettingsTests(unittest.TestCase):
     def test_default_workspace_is_comfyui_node_directory(self):
-        import cline_server
+        import omniscience_server
 
         with tempfile.TemporaryDirectory() as directory:
-            old_default = cline_server.DEFAULT_WORKSPACE
+            old_default = omniscience_server.DEFAULT_WORKSPACE
             try:
-                cline_server.DEFAULT_WORKSPACE = Path(directory) / ".Comfyui-node"
+                omniscience_server.DEFAULT_WORKSPACE = Path(directory) / ".Comfyui-node"
                 public = SettingsStore(Path(directory) / "config.json").public()
                 self.assertEqual(Path(public["workspace"]), (Path(directory) / ".Comfyui-node").resolve())
                 self.assertTrue(Path(public["workspace"]).is_dir())
             finally:
-                cline_server.DEFAULT_WORKSPACE = old_default
+                omniscience_server.DEFAULT_WORKSPACE = old_default
 
     def test_settings_are_saved_without_exposing_key(self):
         with tempfile.TemporaryDirectory() as directory:
