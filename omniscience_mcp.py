@@ -53,6 +53,8 @@ class MCPManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._stdio_tools: dict[str, dict[str, Any]] = {}
+        self._tools_cache: list[dict[str, Any]] | None = None
+        self._tools_cache_key: str | None = None
 
     def load(self) -> dict[str, MCPServer]:
         try:
@@ -106,6 +108,8 @@ class MCPManager:
             except OSError:
                 pass
         self._stdio_tools.clear()
+        self._tools_cache = None
+        self._tools_cache_key = None
         return self.public()
 
     @staticmethod
@@ -236,9 +240,20 @@ class MCPManager:
             raise MCPProtocolError(f"MCP server '{server.name}' did not answer {method}.")
         return self._validate_response(responses[-1], method)
 
+    def _config_signature(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return ""
+
     async def list_tools(self) -> list[dict[str, Any]]:
+        # The tool directory is refreshed only when the configuration file
+        # changes, so per-step tool lookups do not respawn every stdio server.
+        signature = self._config_signature()
+        if self._tools_cache is not None and signature == self._tools_cache_key:
+            return self._tools_cache
         result: list[dict[str, Any]] = []
-        self._stdio_tools.clear()
+        discovered: dict[str, dict[str, Any]] = {}
         for server in self.load().values():
             if server.disabled:
                 continue
@@ -253,9 +268,13 @@ class MCPManager:
                 if not isinstance(tool, dict) or not tool.get("name"):
                     continue
                 name = f"mcp__{server.name}__{tool['name']}"
-                self._stdio_tools[name] = {"server": server.name, "tool": str(tool["name"])}
+                discovered[name] = {"server": server.name, "tool": str(tool["name"])}
                 public_tools.append({"name": name, "original_name": tool["name"], "description": tool.get("description", ""), "inputSchema": tool.get("inputSchema", {"type": "object"}), "autoApprove": tool["name"] in server.auto_approve})
             result.append({"server": server.name, "tools": public_tools})
+        self._stdio_tools = discovered
+        self._tools_cache_key = signature
+        # Failures are transient (server not up yet); do not cache them.
+        self._tools_cache = None if any("error" in group for group in result) else result
         return result
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:

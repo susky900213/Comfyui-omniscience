@@ -6,6 +6,7 @@ const PANEL_ID = "comfyui-omniscience-panel";
 
 const state = {
   tasks: [],
+  projects: [],
   task: null,
   messages: [],
   globalMessages: [],
@@ -20,6 +21,16 @@ const state = {
   skillMenuOpen: false,
   skillQuery: "",
   skillMenuIndex: 0,
+  fileMenuOpen: false,
+  fileQuery: "",
+  fileMenuIndex: 0,
+  fileList: [],
+  fileListScope: "",
+  globalNetworkEnabled: false,
+  fileListLoading: false,
+  uploadBusy: false,
+  networkBusy: false,
+  nodeInstallBusy: false,
   editingSkillId: "",
   cursor: -1,
   view: "chat",
@@ -53,7 +64,12 @@ async function request(path, options = {}) {
   });
   let data = null;
   try { data = await response.json(); } catch { /* status is enough below */ }
-  if (!response.ok) throw new Error(data?.error || `请求失败 (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data?.error || `请求失败 (${response.status})`);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
+  }
   return data;
 }
 
@@ -231,37 +247,285 @@ function renderMessages() {
   log.scrollTop = log.scrollHeight;
 }
 
+function nodeActions(control, onClick) {
+  const wrap = el("span", "cline-node-actions");
+  // The project rows are buttons, so the scan control has to stay a span.
+  const scan = el("span", "cline-node-scan", "安全检测");
+  scan.setAttribute("role", "button");
+  scan.title = "按设置里的检测方式扫描该项目源码（AI/混合模式会调用模型）";
+  const run = async () => {
+    if (scan.classList.contains("busy")) return;
+    scan.classList.add("busy");
+    try {
+      await onClick();
+    } catch (error) {
+      setNodeScanStatus(`检测失败：${error.message}`);
+    } finally {
+      scan.classList.remove("busy");
+    }
+  };
+  scan.onclick = (event) => {
+    event.stopPropagation();
+    run();
+  };
+  scan.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.stopPropagation();
+    event.preventDefault();
+    run();
+  };
+  wrap.append(control, scan);
+  return wrap;
+}
+
+function setNodeScanStatus(message) {
+  const live = document.querySelector(`#${PANEL_ID} .cline-node-scan-status`);
+  if (live) live.textContent = message;
+}
+
+async function scanProject(folder) {
+  setNodeScanStatus(`正在检测“${folder}”…`);
+  const result = await request("/cline/custom-nodes/scan", { method: "POST", body: JSON.stringify({ folder }) });
+  await loadTasks();
+  setNodeScanStatus(`“${folder}”${securityStatusText(result.security)}`);
+}
+
+async function scanTaskProject(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  setNodeScanStatus(`正在检测“${task?.folder || "任务项目"}”…`);
+  const result = await request(`/cline/tasks/${encodeURIComponent(taskId)}/scan`, { method: "POST" });
+  await loadTasks();
+  setNodeScanStatus(`“${task?.folder || "任务项目"}”${securityStatusText(result.security)}`);
+}
+
+async function scanAllProjects(control) {
+  if (control) control.disabled = true;
+  setNodeScanStatus("正在静态检测全部 custom_nodes 项目…");
+  try {
+    const result = await request("/cline/custom-nodes/scan-all", { method: "POST", body: "{}" });
+    await loadTasks();
+    const flagged = (result.results || []).filter((item) => item.security?.verdict && item.security.verdict !== "clean");
+    setNodeScanStatus(
+      `已静态检测 ${result.scanned || 0} 个项目，${flagged.length} 个需复核`
+      + (result.remaining ? `；剩余 ${result.remaining} 个未检测，可再次点击。` : "。"),
+    );
+  } catch (error) {
+    setNodeScanStatus(`检测失败：${error.message}`);
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+
+async function installNodePayload(payload, label) {
+  if (state.nodeInstallBusy) return;
+  state.nodeInstallBusy = true;
+  setNodeInstallButtons(true);
+  try {
+    for (const acknowledged of [false, true]) {
+      nodeInstallStatus(`正在${acknowledged ? "重新" : ""}安装${label}（先做安全检测）…`);
+      try {
+        const result = await request("/cline/custom-nodes/install", {
+          method: "POST",
+          body: JSON.stringify(acknowledged ? { ...payload, acknowledge_security: true } : payload),
+        });
+        await loadTasks();
+        const dependencies = (result.dependencies || []).length ? `；依赖需自行安装：${result.dependencies.join("、")}` : "";
+        nodeInstallStatus(`已安装 ${result.folder}：${securityStatusText(result.security)}${dependencies}未安装依赖、未执行任何脚本，需重启 ComfyUI 才会加载。`);
+        return;
+      } catch (error) {
+        // Only a blocked report (409 + security) may be acknowledged; name conflicts cannot.
+        if (!acknowledged && error.status === 409 && error.payload?.security && securityConfirmation(error, "安装")) continue;
+        nodeInstallStatus(`安装失败：${error.message}`);
+        return;
+      }
+    }
+  } finally {
+    state.nodeInstallBusy = false;
+    setNodeInstallButtons(false);
+  }
+}
+
+function nodeInstallStatus(message) {
+  const live = document.querySelector(`#${PANEL_ID} .cline-node-install-status`);
+  if (live) live.textContent = message;
+}
+
+function setNodeInstallButtons(busy) {
+  for (const selector of [".cline-install-node-github", ".cline-install-node-archive"]) {
+    const control = document.querySelector(`#${PANEL_ID} ${selector}`);
+    if (control) control.disabled = busy;
+  }
+}
+
+async function installNodeArchive(file) {
+  if (!file) return;
+  let encoded = "";
+  try {
+    encoded = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || "").split(",").pop() || "");
+      reader.onerror = () => reject(new Error(`读取 ${file.name} 失败。`));
+      reader.readAsDataURL(file);
+    });
+  } catch (error) {
+    nodeInstallStatus(`安装失败：${error.message}`);
+    return;
+  }
+  await installNodePayload({ archive_name: file.name, archive_base64: encoded }, `节点 ${file.name}`);
+}
+
+function nodeInstallControls() {
+  const wrap = el("div", "cline-node-install");
+  wrap.appendChild(el("h3", "", "安装节点"));
+  const url = document.createElement("input");
+  url.type = "text";
+  url.className = "cline-node-install-url";
+  url.placeholder = "https://github.com/所有者/仓库（或 tree 文件夹链接）";
+  const fromGithub = button("从 GitHub 安装", "cline-secondary cline-install-node-github");
+  fromGithub.onclick = () => {
+    const value = url.value.trim();
+    if (!value) { nodeInstallStatus("请先填写 GitHub 仓库地址。"); return; }
+    installNodePayload({ github_url: value }, `节点 ${value}`);
+  };
+  const picker = document.createElement("input");
+  picker.type = "file";
+  picker.accept = ".zip,.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.txz,application/zip,application/gzip,application/x-tar";
+  picker.hidden = true;
+  picker.onchange = async () => {
+    const file = picker.files?.[0];
+    picker.value = "";
+    if (!file) return;
+    await installNodeArchive(file);
+  };
+  const fromArchive = button("上传压缩包安装", "cline-secondary cline-install-node-archive");
+  fromArchive.onclick = () => { if (!state.nodeInstallBusy) picker.click(); };
+  const actions = el("div", "cline-node-install-actions");
+  actions.append(fromGithub, fromArchive, picker);
+  wrap.appendChild(url);
+  wrap.appendChild(actions);
+  wrap.appendChild(el("p", "cline-node-install-status cline-hint"));
+  wrap.appendChild(el("p", "cline-hint", "只下载并复制节点文件：不安装依赖、不执行包内脚本。接管前会先做安全检测，检测方式与 Skill 共用同一开关（AI 或静态+AI 时每次安装消耗一次模型调用）。"));
+  return wrap;
+}
+
+async function deleteTask(task) {
+  const folder = task.folder || task.title || "未命名项目";
+  if (!window.confirm(`确定删除任务节点“${folder}”？\n\n只删除任务记录、对话历史和由任务创建的软链接，不删除项目文件夹或源码。`)) return;
+  try {
+    await request(`/cline/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
+    if (state.task?.id === task.id) {
+      state.task = null;
+      state.messages = [];
+      state.events = [];
+      state.contextStats = null;
+    }
+    await loadTasks();
+    renderPanel();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+function taskNodeRow(task) {
+  const active = !state.globalChatActive && task.id === currentTaskId();
+  const row = button("", `cline-task-node${active ? " active" : ""}`);
+  const port = el("span", `cline-task-node-port ${statusClass(task.status)}`);
+  port.setAttribute("aria-hidden", "true");
+  const header = el("span", "cline-task-node-header");
+  header.append(
+    el("strong", "cline-task-title", task.folder || task.title || "未命名项目"),
+    el("span", `cline-task-node-status ${statusClass(task.status)}`, statusText(task.status)),
+  );
+  const description = el("span", "cline-task-node-description", task.title || "未命名任务");
+  const footer = el("span", "cline-task-node-footer");
+  footer.append(
+    el("span", "cline-task-node-mode", task.mode === "plan" ? "Plan" : "Act"),
+    ...(active ? [el("span", "cline-task-prompt-length", promptLengthText(state.contextStats).replace("提示词：", ""))] : []),
+    el("span", "cline-task-node-date", taskDate(task)),
+  );
+  row.append(port, header, description, footer);
+  row.appendChild(nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id)));
+  const remove = el("span", "cline-node-delete", "删除");
+  remove.setAttribute("role", "button");
+  remove.tabIndex = 0;
+  remove.title = "删除任务记录；项目文件夹和源码会保留";
+  const runDelete = (event) => {
+    event.stopPropagation();
+    deleteTask(task);
+  };
+  remove.onclick = runDelete;
+  remove.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    runDelete(event);
+  };
+  row.appendChild(remove);
+  row.title = task.id;
+  row.setAttribute("aria-current", active ? "true" : "false");
+  row.onclick = () => loadTask(task.id);
+  return row;
+}
+
+function externalProjectRow(project) {
+  const row = button("", "cline-task-node external");
+  const port = el("span", "cline-task-node-port idle");
+  port.setAttribute("aria-hidden", "true");
+  const header = el("span", "cline-task-node-header");
+  header.append(
+    el("strong", "cline-task-title", project.folder),
+    el("span", "cline-task-node-kind", "ComfyUI"),
+  );
+  const description = el("span", "cline-task-node-description", "custom_nodes 项目，点击接管为任务");
+  const footer = el("span", "cline-task-node-footer");
+  footer.append(
+    el("span", "cline-task-node-mode", "待接管"),
+    el("span", "cline-task-node-date", taskDate({ updated_at: project.modified_at })),
+  );
+  row.append(port, header, description, footer);
+  row.appendChild(nodeActions(skillSecurityControl(project.security), () => scanProject(project.folder)));
+  row.title = project.path;
+  row.onclick = () => adoptProject(project.folder);
+  return row;
+}
+
+async function adoptProject(folder) {
+  const body = (acknowledged) => JSON.stringify(acknowledged ? { folder, acknowledge_security: true } : { folder });
+  try {
+    const result = await request("/cline/custom-nodes/adopt", { method: "POST", body: body(false) });
+    await loadTasks();
+    if (result.task && result.task.id) await loadTask(result.task.id);
+    return;
+  } catch (error) {
+    // Only a security gate (409 with a report) may be acknowledged; a folder name conflict cannot.
+    if (error.status !== 409 || !error.payload?.security || !securityConfirmation(error, "接管")) {
+      showError(error);
+      return;
+    }
+  }
+  try {
+    const retry = await request("/cline/custom-nodes/adopt", { method: "POST", body: body(true) });
+    await loadTasks();
+    if (retry.task && retry.task.id) await loadTask(retry.task.id);
+  } catch (retryError) {
+    showError(retryError);
+  }
+}
+
 function renderTasks() {
   const list = document.querySelector(`#${PANEL_ID} .cline-task-list`);
   if (!list) return;
   list.replaceChildren();
-  if (!state.tasks.length) {
+  const nodes = [
+    ...state.tasks.map((task) => ({ when: Number(task.updated_at || task.created_at) || 0, row: taskNodeRow(task) })),
+    ...state.projects.map((project) => ({ when: Number(project.modified_at) || 0, row: externalProjectRow(project) })),
+  ].sort((left, right) => right.when - left.when);
+  if (!nodes.length) {
     list.appendChild(el("p", "cline-task-empty cline-hint", "还没有任务节点。"));
     return;
   }
-  for (const task of state.tasks) {
-    const active = !state.globalChatActive && task.id === currentTaskId();
-    const row = button("", `cline-task-node${active ? " active" : ""}`);
-    const port = el("span", `cline-task-node-port ${statusClass(task.status)}`);
-    port.setAttribute("aria-hidden", "true");
-    const header = el("span", "cline-task-node-header");
-    header.append(
-      el("strong", "cline-task-title", task.folder || task.title || "未命名项目"),
-      el("span", `cline-task-node-status ${statusClass(task.status)}`, statusText(task.status)),
-    );
-    const description = el("span", "cline-task-node-description", task.title || "未命名任务");
-    const footer = el("span", "cline-task-node-footer");
-    footer.append(
-      el("span", "cline-task-node-mode", task.mode === "plan" ? "Plan" : "Act"),
-      ...(active ? [el("span", "cline-task-prompt-length", promptLengthText(state.contextStats).replace("提示词：", ""))] : []),
-      el("span", "cline-task-node-date", taskDate(task)),
-    );
-    row.append(port, header, description, footer);
-    row.title = task.id;
-    row.setAttribute("aria-current", active ? "true" : "false");
-    row.onclick = () => loadTask(task.id);
+  for (const node of nodes) {
     const item = el("div", "cline-task-history-item");
-    item.appendChild(row);
+    item.appendChild(node.row);
     list.appendChild(item);
   }
 }
@@ -408,23 +672,219 @@ function selectSkillFromMenu(skillId) {
   input?.focus();
 }
 
+function fileCommand(value) {
+  const match = String(value || "").match(/(?:^|\s)@([^\s]*)$/);
+  if (!match) return null;
+  const raw = match[1] || "";
+  return { query: raw, start: match.index + match[0].lastIndexOf("@") };
+}
+
+function resetFileMenu() {
+  state.fileMenuOpen = false;
+  state.fileQuery = "";
+  state.fileMenuIndex = 0;
+}
+
+function matchingFiles() {
+  const query = state.fileQuery.trim().toLocaleLowerCase();
+  return state.fileList
+    .filter((entry) => entry.type === "file")
+    .filter((entry) => !query || `${entry.path} ${entry.name}`.toLocaleLowerCase().includes(query))
+    .slice(0, 30);
+}
+
+function composerScopeKey() {
+  return state.globalChatActive ? "global" : currentTaskId();
+}
+
+function composerHasScope() {
+  return state.globalChatActive || !!currentTaskId();
+}
+
+function globalNetworkEnabled() {
+  return state.globalChatActive ? !!state.globalNetworkEnabled : !!((state.task?.metadata || {}).network_enabled);
+}
+
+async function loadFileList({ force = false } = {}) {
+  const scope = composerScopeKey();
+  if (!scope) return [];
+  if (!force && state.fileListScope === scope) return state.fileList;
+  if (state.fileListLoading) return state.fileList;
+  state.fileListLoading = true;
+  try {
+    const query = state.globalChatActive ? "scope=global" : `task_id=${encodeURIComponent(scope)}`;
+    const result = await request(`/cline/files?${query}&recursive=true`);
+    state.fileList = result.entries || [];
+    state.fileListScope = scope;
+  } catch (error) {
+    console.warn("[Comfyui-omniscience] file list load failed", error);
+  } finally {
+    state.fileListLoading = false;
+  }
+  return state.fileList;
+}
+
+function selectFileFromMenu(path) {
+  const input = document.querySelector(`#${PANEL_ID} textarea[data-composer]`);
+  const command = fileCommand(input?.value || "");
+  if (input && command) {
+    input.value = `${input.value.slice(0, command.start)}@${path} `;
+  } else if (input) {
+    input.value = `${input.value}${input.value && !/\s$/.test(input.value) ? " " : ""}@${path} `;
+  }
+  resetFileMenu();
+  input?.dispatchEvent(new Event("input"));
+  renderFileMenu();
+  input?.focus();
+}
+
+function renderFileMenu() {
+  const area = document.querySelector(`#${PANEL_ID} .cline-composer-actions`);
+  if (!area) return;
+  area.querySelector(".cline-file-command-menu")?.remove();
+  const upload = area.querySelector(".cline-upload-file");
+  const mention = area.querySelector(".cline-mention-file");
+  const network = area.querySelector(".cline-network-toggle");
+  const hasScope = composerHasScope();
+  const networkOn = globalNetworkEnabled();
+  for (const node of [upload, mention]) if (node) node.hidden = !hasScope;
+  if (network) {
+    network.hidden = !hasScope;
+    network.classList.toggle("active", networkOn);
+    network.textContent = networkOn ? "网络访问：已开启" : "网络访问：已关闭";
+    network.disabled = state.networkBusy || displayedBusy();
+  }
+  if (upload) upload.disabled = state.uploadBusy || !hasScope;
+  if (mention) mention.disabled = !hasScope;
+  if (!hasScope || !state.fileMenuOpen) return;
+  const menu = el("div", "cline-file-command-menu");
+  if (state.fileListLoading) {
+    menu.appendChild(el("p", "cline-hint", "正在读取文件列表…"));
+  } else {
+    const matches = matchingFiles();
+    if (!matches.length) menu.appendChild(el("p", "cline-hint", state.globalChatActive ? "全局工作区还没有文件，可先上传。" : "没有匹配的文件。"));
+    else {
+      const list = el("div", "cline-file-command-list");
+      matches.forEach((entry, index) => {
+        const item = button("", `cline-file-command-item${index === state.fileMenuIndex ? " active" : ""}`);
+        item.append(el("strong", "", entry.name), el("span", "cline-file-command-path", entry.path));
+        item.title = entry.path;
+        item.onclick = () => selectFileFromMenu(entry.path);
+        list.appendChild(item);
+      });
+      menu.appendChild(list);
+    }
+  }
+  area.appendChild(menu);
+}
+
+function composerInput() { return document.querySelector(`#${PANEL_ID} textarea[data-composer]`); }
+
+function uploadEndpoint() {
+  return state.globalChatActive
+    ? "/cline/global/upload"
+    : `/cline/tasks/${encodeURIComponent(currentTaskId())}/upload`;
+}
+
+async function uploadFilesToTask(files) {
+  if (!composerHasScope() || !files.length) return;
+  state.uploadBusy = true;
+  renderFileMenu();
+  const input = composerInput();
+  try {
+    for (const file of files) {
+      const encoded = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || "").split(",").pop() || "");
+        reader.onerror = () => reject(new Error(`读取 ${file.name} 失败。`));
+        reader.readAsDataURL(file);
+      });
+      const result = await request(uploadEndpoint(), {
+        method: "POST",
+        body: JSON.stringify({ name: file.name, content_base64: encoded }),
+      });
+      if (input) {
+        const mention = `@${result.path} `;
+        input.value = `${input.value.replace(/\s+$/, "")} ${mention}`.trimStart();
+        input.dispatchEvent(new Event("input"));
+      }
+      await loadFileList({ force: true });
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.uploadBusy = false;
+    renderFileMenu();
+    input?.focus();
+  }
+}
+
+async function toggleNetworkAccess() {
+  if (!composerHasScope() || state.networkBusy) return;
+  const enabled = !globalNetworkEnabled();
+  state.networkBusy = true;
+  renderFileMenu();
+  try {
+    if (state.globalChatActive) {
+      const result = await request("/cline/global/network", { method: "POST", body: JSON.stringify({ enabled }) });
+      state.globalNetworkEnabled = !!result.network_enabled;
+    } else {
+      state.task = await request(`/cline/tasks/${encodeURIComponent(currentTaskId())}/network`, {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    state.networkBusy = false;
+    renderFileMenu();
+  }
+}
+
+async function expandFileMentions(content) {
+  if (!composerHasScope()) return "";
+  const paths = [...new Set([...String(content || "").matchAll(/(?:^|\s)@([^\s@]+)/g)].map((match) => match[1]))];
+  const chunks = [];
+  const scopeQuery = state.globalChatActive ? "scope=global" : `task_id=${encodeURIComponent(currentTaskId())}`;
+  for (const path of paths) {
+    try {
+      const result = await request(`/cline/file?${scopeQuery}&path=${encodeURIComponent(path)}`);
+      const body = String(result.content || "");
+      const trimmed = body.length > 20000 ? `${body.slice(0, 20000)}\n…[内容过长已截断]` : body;
+      chunks.push(`引用文件：${result.path}\n${trimmed}`);
+    } catch (error) {
+      chunks.push(`引用文件：${path}\n[无法读取该文件：${error.message}]`);
+    }
+  }
+  return chunks.join("\n\n");
+}
+
 function renderPanel() {
   renderTasks();
   renderHeader();
   renderMessages();
   renderContext();
   renderSkillSelector();
+  renderFileMenu();
 }
 
 async function loadTasks() {
   const result = await request("/cline/tasks");
   state.tasks = result.tasks || [];
+  try {
+    const external = await request("/cline/custom-nodes");
+    state.projects = external.projects || [];
+  } catch (error) {
+    state.projects = [];
+  }
   renderTasks();
 }
 
 async function loadGlobalChat() {
   const result = await request("/cline/global-chat");
   state.globalMessages = result.messages || [];
+  state.globalNetworkEnabled = !!result.network_enabled;
   return state.globalMessages;
 }
 
@@ -444,6 +904,7 @@ async function toggleGlobalChat() {
     state.skillMenuOpen = false;
     state.skillQuery = "";
     state.skillMenuIndex = 0;
+    resetFileMenu();
     setView("chat");
     renderPanel();
   } catch (error) {
@@ -476,6 +937,7 @@ async function loadTask(taskId, { resetSkills = true } = {}) {
     state.skillMenuOpen = false;
     state.skillQuery = "";
     state.skillMenuIndex = 0;
+    resetFileMenu();
   }
   state.currentWorkflow = null;
   state.currentWorkflowSignature = "";
@@ -627,15 +1089,17 @@ async function sendMessage() {
   try {
     if (state.globalChatActive) {
       const previousSkillIds = new Set(state.skills.map((skill) => skill.id));
+      const mentioned = await expandFileMentions(content);
       input.value = "";
       state.skillMenuOpen = false;
       state.skillQuery = "";
       state.skillMenuIndex = 0;
+      resetFileMenu();
       state.globalBusy = true;
       renderPanel();
       const result = await request("/cline/global-chat/messages", {
         method: "POST",
-        body: JSON.stringify({ content, skill_ids: [...state.selectedSkillIds] }),
+        body: JSON.stringify({ content, skill_ids: [...state.selectedSkillIds], context: mentioned }),
       });
       state.globalMessages = result.messages || [...state.globalMessages, result.message].filter(Boolean);
       try {
@@ -659,15 +1123,18 @@ async function sendMessage() {
     // Canvas synchronization is best effort for chat. An unavailable or very
     // large canvas must not prevent the user from asking the Agent a question.
     await syncCurrentWorkflow({ force: true, silent: true });
-    const context = state.context.join("\n\n");
+    const mentioned = await expandFileMentions(content);
+    const context = [state.context.join("\n\n"), mentioned].filter(Boolean).join("\n\n");
     state.context = [];
     state.skillMenuOpen = false;
     state.skillQuery = "";
     state.skillMenuIndex = 0;
+    resetFileMenu();
     input.value = "";
     state.busy = true;
     renderPanel();
-    const result = await request(`/cline/tasks/${encodeURIComponent(currentTaskId())}/messages`, {
+    // POST /messages only accepts the turn (202); progress arrives via pollEvents.
+    await request(`/cline/tasks/${encodeURIComponent(currentTaskId())}/messages`, {
       method: "POST",
       body: JSON.stringify({ content, context, skill_ids: [...state.selectedSkillIds] }),
     });
@@ -675,9 +1142,9 @@ async function sendMessage() {
     await loadTasks();
   } catch (error) {
     state.error = error.message;
+    state.busy = false;
   } finally {
     if (state.globalChatActive) state.globalBusy = false;
-    else state.busy = false;
     renderPanel();
   }
 }
@@ -888,11 +1355,64 @@ function contextSummaryText(stats) {
   return `当前提示词：约 ${stats.prompt_tokens.toLocaleString()} Token，${stats.prompt_chars.toLocaleString()} 字符，占上下文上限 ${stats.prompt_percent.toFixed(1)}%（消息 ${stats.message_tokens.toLocaleString()}，系统 ${stats.system_tokens.toLocaleString()}，工具 ${stats.tools_tokens.toLocaleString()}）。${status}`;
 }
 
+function providerOptions() {
+  return (state.settings && state.settings.providers) || [];
+}
+
+function applyProviderDefaults(providerId) {
+  const provider = providerOptions().find((entry) => entry.id === providerId);
+  if (!provider) return;
+  const baseInput = document.querySelector(`#${PANEL_ID} .cline-settings-area input[name="api_base_url"]`);
+  const modelInput = document.querySelector(`#${PANEL_ID} .cline-settings-area input[name="model"]`);
+  if (provider.api_base_url && baseInput) baseInput.value = provider.api_base_url;
+  if (provider.models && provider.models.length && modelInput) modelInput.value = provider.models[0];
+  renderModelSuggestions(providerId);
+}
+
+function renderModelSuggestions(providerId) {
+  const datalist = document.querySelector(`#${PANEL_ID} .cline-settings-area datalist#cline-model-options`);
+  if (!datalist) return;
+  const provider = providerOptions().find((entry) => entry.id === providerId) || { models: [] };
+  datalist.replaceChildren(...(provider.models || []).map((model) => {
+    const option = document.createElement("option");
+    option.value = model;
+    return option;
+  }));
+}
+
+function customProviderItems() {
+  return providerOptions().filter((entry) => String(entry.id).startsWith("custom:"));
+}
+
+async function saveCustomProviders(list, statusEl) {
+  try {
+    state.settings = await request("/cline/settings", { method: "POST", body: JSON.stringify({ custom_providers: list }) });
+    renderSettings();
+  } catch (error) {
+    if (statusEl) statusEl.textContent = `保存失败：${error.message}`;
+    else showError(error);
+  }
+}
+
 function renderSettings() {
   const area = document.querySelector(`#${PANEL_ID} .cline-settings-area`);
   if (!area) return;
   area.replaceChildren(el("h3", "", "模型与工作区设置"));
   const settings = state.settings || {};
+  const providerField = el("label", "cline-field");
+  providerField.appendChild(el("span", "", "模型 Provider"));
+  const providerSelect = document.createElement("select");
+  providerSelect.name = "provider";
+  for (const provider of providerOptions()) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = provider.label;
+    if (provider.id === settings.provider) option.selected = true;
+    providerSelect.appendChild(option);
+  }
+  providerSelect.onchange = () => applyProviderDefaults(providerSelect.value);
+  providerField.appendChild(providerSelect);
+  area.appendChild(providerField);
   for (const [label, name, value] of [
     ["API 地址", "api_base_url", settings.api_base_url || "https://api.openai.com/v1"],
     ["模型", "model", settings.model || ""],
@@ -901,6 +1421,7 @@ function renderSettings() {
     ["API Key（留空保持不变）", "api_key", ""],
     ["项目父目录", "workspace", settings.workspace || ""],
     ["ComfyUI 目录（可选）", "comfyui_directory", settings.comfyui_directory || ""],
+    ["浏览器接入地址（auto=复用已打开的浏览器）", "browser_cdp_url", settings.browser_cdp_url || "auto"],
   ]) {
     const field = el("label", "cline-field");
     field.appendChild(el("span", "", label));
@@ -918,9 +1439,79 @@ function renderSettings() {
       input.max = "99";
       input.step = "1";
     }
+    if (name === "model") input.setAttribute("list", "cline-model-options");
     field.appendChild(input);
     area.appendChild(field);
   }
+  const modelDatalist = el("datalist", "");
+  modelDatalist.id = "cline-model-options";
+  area.appendChild(modelDatalist);
+  renderModelSuggestions(settings.provider);
+
+  const customHeading = el("h4", "cline-workflow-section-title", "自定义 Provider");
+  const customList = el("div", "cline-custom-provider-list");
+  const customs = customProviderItems();
+  if (!customs.length) customList.appendChild(el("p", "cline-hint", "暂无自定义 Provider。"));
+  for (const item of customs) {
+    const row = el("div", "cline-custom-provider-row");
+    row.append(el("strong", "", item.label), el("span", "cline-hint", ` ${item.api_base_url}`));
+    const remove = button("删除", "cline-secondary");
+    remove.onclick = () => {
+      const next = customs
+        .filter((entry) => entry.id !== item.id)
+        .map((entry) => ({ name: entry.name, api_base_url: entry.api_base_url, models: entry.models }));
+      saveCustomProviders(next, row);
+    };
+    row.appendChild(remove);
+    customList.appendChild(row);
+  }
+  const addRow = el("div", "cline-custom-provider-row");
+  const customName = document.createElement("input");
+  customName.placeholder = "名称，例如 vLLM 内网";
+  const customUrl = document.createElement("input");
+  customUrl.placeholder = "https://host/v1";
+  const customModels = document.createElement("input");
+  customModels.placeholder = "模型（逗号分隔，可选）";
+  const addCustom = button("添加", "cline-secondary");
+  addCustom.onclick = async () => {
+    const models = customModels.value.split(/[,，]/).map((model) => model.trim()).filter(Boolean);
+    const existing = customs.map((entry) => ({ name: entry.name, api_base_url: entry.api_base_url, models: entry.models }));
+    existing.push({ name: customName.value.trim(), api_base_url: customUrl.value.trim(), models });
+    await saveCustomProviders(existing, addRow);
+  };
+  addRow.append(customName, customUrl, customModels, addCustom);
+  area.append(customHeading, customList, addRow);
+  area.appendChild(el("p", "cline-hint", "复用本机浏览器需以调试端口启动，例如：open -na \"Google Chrome\" --args --remote-debugging-port=9222 --user-data-dir=\"$HOME/.chrome-cdp\"。检测不到时自动回退内置无头浏览器。"));
+
+  const securityHeading = el("h4", "cline-workflow-section-title", "安全检测（Skill 与节点项目）");
+  area.appendChild(securityHeading);
+  const securityModeField = el("label", "cline-field");
+  securityModeField.appendChild(el("span", "", "检测方式"));
+  const securityMode = document.createElement("select");
+  securityMode.name = "skill_security_mode";
+  for (const [value, label] of [
+    ["static", "静态规则检测（不调用模型）"],
+    ["ai", "AI 模型审核（每次保存/安装调用一次模型）"],
+    ["hybrid", "静态 + AI（结论取更严格）"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    if (value === (settings.skill_security_mode || "static")) option.selected = true;
+    securityMode.appendChild(option);
+  }
+  securityModeField.appendChild(securityMode);
+  area.appendChild(securityModeField);
+  const reviewModelField = el("label", "cline-field");
+  reviewModelField.appendChild(el("span", "", "AI 审核模型（留空使用上方模型）"));
+  const reviewModel = document.createElement("input");
+  reviewModel.name = "skill_security_model";
+  reviewModel.value = settings.skill_security_model || "";
+  reviewModel.setAttribute("list", "cline-model-options");
+  reviewModelField.appendChild(reviewModel);
+  area.appendChild(reviewModelField);
+  area.appendChild(el("p", "cline-hint", "同一个开关同时用于 Skill 与 custom_nodes 项目检测：AI 审核把内容当作不可信数据交给模型判断风险，不会执行其中的指令；模型不可用时自动回退静态检测。AI/静态+AI 每次保存、接管或单项目检测会产生一次模型调用，「全部检测（不消耗模型）」始终只用静态规则。改完记得点击页面底部的「保存设置」。"));
+
   const stats = state.contextStats;
   const contextLabel = el("p", stats?.above_compaction_threshold ? "cline-hint cline-error" : "cline-hint", contextSummaryText(stats));
   const hint = el("p", "cline-hint cline-settings-status", settings.api_key_configured
@@ -931,6 +1522,10 @@ function renderSettings() {
     save.disabled = true;
     try {
       const values = Object.fromEntries([...area.querySelectorAll("input")].map((input) => [input.name, input.value]));
+      const provider = area.querySelector("select[name=provider]");
+      if (provider) values.provider = provider.value;
+      const securityMode = area.querySelector("select[name=skill_security_mode]");
+      if (securityMode) values.skill_security_mode = securityMode.value;
       state.settings = await request("/cline/settings", { method: "POST", body: JSON.stringify(values) });
       await loadContextStats();
       renderSettings();
@@ -957,6 +1552,87 @@ function resetSkillEditor() {
   renderSkills();
 }
 
+const SECURITY_LABELS = { clean: "安全", review: "需复核", blocked: "已阻止" };
+const SEVERITY_LABELS = { critical: "严重", high: "高危", medium: "中危", low: "提示" };
+
+function securityEngineText(security) {
+  const engine = String(security?.engine || "");
+  const model = security?.ai_model || security?.model || "";
+  if (engine.includes("-review-ai") && engine.includes("-security")) return `检测方式：静态规则 + AI 模型${model ? `（${model}）` : ""}`;
+  if (engine.includes("-review-ai")) return `检测方式：AI 模型${model ? `（${model}）` : ""}`;
+  if (engine.includes("-security")) return "检测方式：静态规则";
+  return "";
+}
+
+function securityVerdict(security) {
+  return SECURITY_LABELS[security?.verdict] || "未检测";
+}
+
+function securityReport(security) {
+  const box = el("div", "cline-security-report");
+  const engine = securityEngineText(security);
+  if (engine) box.appendChild(el("p", "cline-hint", engine));
+  if (security?.fallback) box.appendChild(el("p", "cline-hint cline-error", security.fallback));
+  if (security?.files_scanned !== undefined) {
+    box.appendChild(el("p", "cline-hint", `覆盖：${security.files_scanned}/${security.files_total || 0} 个文件${security.truncated ? "（已截断）" : ""}`));
+  }
+  const domains = security?.domains || [];
+  const findings = security?.findings || [];
+  for (const finding of findings) {
+    const item = el("div", "cline-security-finding");
+    item.appendChild(el("span", `cline-severity ${finding.severity}`, SEVERITY_LABELS[finding.severity] || finding.severity));
+    item.appendChild(el("strong", "", finding.title || finding.rule));
+    if (finding.advice) item.appendChild(el("p", "", finding.advice));
+    for (const evidence of finding.evidence || []) item.appendChild(el("code", "", evidence));
+    box.appendChild(item);
+  }
+  if (domains.length) box.appendChild(el("p", "cline-hint", `外部域名：${domains.join("、")}`));
+  if (!findings.length && !domains.length) box.appendChild(el("p", "cline-hint", "未发现风险项。"));
+  return box;
+}
+
+function skillSecurityControl(security) {
+  const wrap = el("span", "cline-security");
+  const badge = el("span", `cline-security-badge ${security?.verdict || "unknown"}`, securityVerdict(security));
+  wrap.appendChild(badge);
+  if (!security?.verdict || security.verdict === "clean") return wrap;
+  const details = securityReport(security);
+  details.hidden = true;
+  badge.title = "点击查看安全检测详情";
+  badge.onclick = (event) => {
+    event.stopPropagation();
+    details.hidden = !details.hidden;
+  };
+  wrap.appendChild(details);
+  return wrap;
+}
+
+function securityConfirmation(error, action = "保存") {
+  const security = error?.payload?.security || {};
+  const findings = (security.findings || []).filter((item) => item.severity !== "low");
+  const list = findings.length ? findings.map((item) => `· ${item.title}`).join("\n") : error.message;
+  const engine = securityEngineText(security);
+  return window.confirm(`安全检测阻止${action}：\n${list}\n\n${engine ? `${engine}\n` : ""}确认来源可信并要求仍然${action}？`);
+}
+
+function securityStatusText(security) {
+  const risky = (security?.findings || []).filter((item) => item.severity !== "low").length;
+  return `检测完成：${securityVerdict(security)}${risky ? `，${risky} 项需要关注` : ""}。`;
+}
+
+async function rescanSkills(ids) {
+  if (!ids.length) {
+    const result = await request("/cline/skills/rescan", { method: "POST" });
+    return result.skills || [];
+  }
+  const refreshed = [];
+  for (const id of ids) {
+    const result = await request(`/cline/skills/${encodeURIComponent(id)}/rescan`, { method: "POST" });
+    refreshed.push(result.skill);
+  }
+  return refreshed;
+}
+
 function renderSkills() {
   const area = document.querySelector(`#${PANEL_ID} .cline-skills-area`);
   if (!area) return;
@@ -980,30 +1656,56 @@ function renderSkills() {
   editor.appendChild(enabledField);
   const editorActions = el("div", "cline-inline-actions");
   const save = button(editing ? "保存修改" : "创建 Skill", "cline-primary");
+  const scanDraft = button("立即检测", "cline-secondary");
   const cancel = button("清空", "cline-secondary");
   const output = el("span", "cline-hint cline-skill-status");
+  const values = () => Object.fromEntries([...editor.querySelectorAll("input[name], textarea[name]")].map((input) => [input.name, input.type === "checkbox" ? input.checked : input.value]));
+  const send = async (payload) => editing
+    ? request(`/cline/skills/${encodeURIComponent(editing.id)}`, { method: "PATCH", body: JSON.stringify(payload) })
+    : request("/cline/skills", { method: "POST", body: JSON.stringify(payload) });
+  scanDraft.onclick = async () => {
+    scanDraft.disabled = true;
+    output.textContent = "正在检测…";
+    try {
+      const result = await request("/cline/skills/scan", { method: "POST", body: JSON.stringify(values()) });
+      output.replaceChildren(el("span", "", securityStatusText(result.security)), securityReport(result.security));
+    } catch (error) {
+      output.textContent = `检测失败：${error.message}`;
+    } finally { scanDraft.disabled = false; }
+  };
   save.onclick = async () => {
     save.disabled = true;
     try {
-      const values = Object.fromEntries([...editor.querySelectorAll("input[name], textarea[name]")].map((input) => [input.name, input.type === "checkbox" ? input.checked : input.value]));
-      if (editing) {
-        await request(`/cline/skills/${encodeURIComponent(editing.id)}`, { method: "PATCH", body: JSON.stringify(values) });
-        output.textContent = "已保存。";
-      } else {
-        await request("/cline/skills", { method: "POST", body: JSON.stringify(values) });
-        output.textContent = "已创建。";
-      }
-      await loadSkills();
-      await loadContextStats().catch(() => {});
-      state.editingSkillId = "";
-      renderSkills();
-      renderPanel();
+      await send(values());
+      output.textContent = editing ? "已保存。" : "已创建。";
     } catch (error) {
-      output.textContent = `保存失败：${error.message}`;
-    } finally { save.disabled = false; }
+      if (error.status !== 409) {
+        output.textContent = `保存失败：${error.message}`;
+        save.disabled = false;
+        return;
+      }
+      if (!securityConfirmation(error)) {
+        output.replaceChildren(el("span", "", "已取消保存。"), securityReport(error.payload?.security));
+        save.disabled = false;
+        return;
+      }
+      try {
+        await send({ ...values(), acknowledge_security: true });
+        output.textContent = "已保存，并标记为你人工确认可信。";
+      } catch (retryError) {
+        output.textContent = `保存失败：${retryError.message}`;
+        save.disabled = false;
+        return;
+      }
+    }
+    await loadSkills();
+    await loadContextStats().catch(() => {});
+    state.editingSkillId = "";
+    renderSkills();
+    renderPanel();
   };
   cancel.onclick = resetSkillEditor;
-  editorActions.append(save, cancel, output);
+  editorActions.append(save, scanDraft, cancel, output);
   editor.appendChild(editorActions);
   area.appendChild(editor);
 
@@ -1017,17 +1719,50 @@ function renderSkills() {
   importInput.onchange = async () => {
     const file = importInput.files?.[0];
     if (!file) return;
+    let imported = null;
     try {
-      const imported = JSON.parse(await file.text());
+      imported = JSON.parse(await file.text());
       await request("/cline/skills/import", { method: "POST", body: JSON.stringify(imported) });
-      await loadSkills();
-      await loadContextStats().catch(() => {});
-      renderSkills();
-      renderPanel();
-    } catch (error) { window.alert(`导入失败：${error.message}`); }
-    finally { importInput.value = ""; }
+    } catch (error) {
+      const blocked = String(error.message).includes("安全检测阻止导入");
+      if (!blocked || !window.confirm(`${error.message}\n\n确认全部来源可信并要求仍然导入？`)) {
+        window.alert(`导入失败：${error.message}`);
+        importInput.value = "";
+        return;
+      }
+      try {
+        await request("/cline/skills/import", { method: "POST", body: JSON.stringify({ ...imported, acknowledge_security: true }) });
+      } catch (retryError) { window.alert(`导入失败：${retryError.message}`); }
+    }
+    await loadSkills();
+    await loadContextStats().catch(() => {});
+    renderSkills();
+    renderPanel();
+    importInput.value = "";
   };
   importButton.onclick = () => importInput.click();
+  const scanAll = button("全部安全检测", "cline-secondary");
+  const scanStatus = el("span", "cline-hint cline-scan-status");
+  const showScanStatus = (message) => {
+    const live = document.querySelector(`#${PANEL_ID} .cline-scan-status`);
+    if (live) live.textContent = message;
+    else scanStatus.textContent = message;
+  };
+  scanAll.onclick = async () => {
+    scanAll.disabled = true;
+    showScanStatus(state.skills.length ? "正在检测…" : "没有可检测的 Skill。");
+    try {
+      await rescanSkills(state.skills.map((skill) => skill.id));
+      await loadSkills();
+      renderSkills();
+      renderPanel();
+      const flagged = state.skills.filter((skill) => skill.security?.verdict && skill.security.verdict !== "clean");
+      showScanStatus(flagged.length
+        ? `已检测 ${state.skills.length} 个 Skill，${flagged.length} 个需要复核：${flagged.map((skill) => skill.name).join("、")}。`
+        : `已检测 ${state.skills.length} 个 Skill，全部未发现风险。`);
+    } catch (error) { showScanStatus(`检测失败：${error.message}`); }
+    finally { scanAll.disabled = false; }
+  };
   exportButton.onclick = () => {
     const blob = new Blob([JSON.stringify({ version: 1, skills: state.skills.map(({ name, description, content, enabled }) => ({ name, description, content, enabled })) }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1037,7 +1772,7 @@ function renderSkills() {
     link.click();
     URL.revokeObjectURL(url);
   };
-  actions.append(importButton, exportButton, importInput);
+  actions.append(importButton, exportButton, scanAll, scanStatus, importInput);
   area.appendChild(actions);
 
   const list = el("div", "cline-skill-list");
@@ -1047,13 +1782,26 @@ function renderSkills() {
   for (const skill of state.skills) {
     const card = el("article", `cline-skill-card${skill.enabled ? "" : " disabled"}`);
     const heading = el("div", "cline-skill-card-heading");
-    heading.append(el("strong", "", skill.name), el("span", "cline-skill-state", skill.enabled ? "已启用" : "已停用"));
+    heading.append(el("strong", "", skill.name), el("span", "cline-skill-state", skill.enabled ? "已启用" : "已停用"), skillSecurityControl(skill.security));
     const description = el("p", "cline-hint", skill.description || "无描述");
     const preview = el("pre", "cline-action-details cline-skill-preview", skill.content);
     const cardActions = el("div", "cline-inline-actions");
     const toggle = button(skill.enabled ? "停用" : "启用", "cline-secondary");
     const edit = button("编辑", "cline-secondary");
+    const scan = button("安全检测", "cline-secondary");
     const remove = button("删除", "cline-secondary");
+    scan.onclick = async () => {
+      scan.disabled = true;
+      showScanStatus(`正在检测“${skill.name}”…`);
+      try {
+        await rescanSkills([skill.id]);
+        await loadSkills();
+        renderSkills();
+        renderPanel();
+        showScanStatus(`“${skill.name}”${securityStatusText(state.skills.find((item) => item.id === skill.id)?.security)}`);
+      } catch (error) { showScanStatus(`检测失败：${error.message}`); }
+      finally { scan.disabled = false; }
+    };
     toggle.onclick = async () => {
       try { await request(`/cline/skills/${encodeURIComponent(skill.id)}`, { method: "PATCH", body: JSON.stringify({ enabled: !skill.enabled }) }); await loadSkills(); await loadContextStats().catch(() => {}); renderSkills(); renderPanel(); }
       catch (error) { window.alert(`更新失败：${error.message}`); }
@@ -1064,7 +1812,7 @@ function renderSkills() {
        try { await request(`/cline/skills/${encodeURIComponent(skill.id)}`, { method: "DELETE" }); await loadSkills(); await loadContextStats().catch(() => {}); renderSkills(); renderPanel(); }
       catch (error) { window.alert(`删除失败：${error.message}`); }
     };
-    cardActions.append(toggle, edit, remove);
+    cardActions.append(toggle, edit, scan, remove);
     card.append(heading, description, preview, cardActions);
     list.appendChild(card);
   }
@@ -1139,7 +1887,18 @@ function buildPanel() {
   const sidebar = el("aside", "cline-task-sidebar");
   const create = button("＋ 新任务", "cline-primary cline-new-task");
   create.onclick = createTask;
-  sidebar.append(create, el("h3", "", "任务节点"), el("div", "cline-task-list"));
+  const scanNodes = button("全部检测（不消耗模型）", "cline-secondary cline-scan-nodes");
+  scanNodes.title = "用静态规则扫描 custom_nodes 下的全部项目，不调用模型";
+  scanNodes.onclick = () => scanAllProjects(scanNodes);
+  const nodeScanStatus = el("p", "cline-node-scan-status cline-hint");
+  sidebar.append(
+    create,
+    el("h3", "", "任务节点"),
+    el("div", "cline-task-list"),
+    nodeInstallControls(),
+    scanNodes,
+    nodeScanStatus,
+  );
 
   const main = el("main", "cline-main");
   const toolbar = el("div", "cline-toolbar");
@@ -1175,6 +1934,32 @@ function buildPanel() {
   textarea.placeholder = "描述你要完成的编程任务…";
   textarea.rows = 3;
   textarea.onkeydown = (event) => {
+    if (state.fileMenuOpen) {
+      const matches = matchingFiles();
+      if (event.key === "ArrowDown" && matches.length) {
+        event.preventDefault();
+        state.fileMenuIndex = (state.fileMenuIndex + 1) % matches.length;
+        renderFileMenu();
+        return;
+      }
+      if (event.key === "ArrowUp" && matches.length) {
+        event.preventDefault();
+        state.fileMenuIndex = (state.fileMenuIndex - 1 + matches.length) % matches.length;
+        renderFileMenu();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        resetFileMenu();
+        renderFileMenu();
+        return;
+      }
+      if (event.key === "Enter" && !event.metaKey && !event.ctrlKey && matches.length) {
+        event.preventDefault();
+        selectFileFromMenu(matches[state.fileMenuIndex]?.path || matches[0].path);
+        return;
+      }
+    }
     if (state.skillMenuOpen) {
       const matches = matchingSkills();
       if (event.key === "ArrowDown" && matches.length) {
@@ -1207,15 +1992,55 @@ function buildPanel() {
   };
   textarea.oninput = () => {
     const command = skillCommand(textarea.value);
+    const mention = command ? null : fileCommand(textarea.value);
     state.skillMenuOpen = !!command;
     state.skillQuery = command?.query || "";
     const matches = matchingSkills();
     state.skillMenuIndex = Math.min(state.skillMenuIndex, Math.max(0, matches.length - 1));
+    state.fileMenuOpen = !!mention;
+    state.fileQuery = mention?.query || "";
+    state.fileMenuIndex = 0;
     renderSkillSelector();
+    if (mention) loadFileList().then(() => renderFileMenu()).catch(() => {});
+    else renderFileMenu();
   };
   const send = button("发送", "cline-primary cline-send-message");
   send.onclick = sendMessage;
-  composer.append(textarea, send);
+  const actions = el("div", "cline-composer-actions");
+  const uploadButton = button("上传文件", "cline-secondary cline-upload-file");
+  uploadButton.title = "上传文件到任务工作区的 uploads/ 目录";
+  const filePicker = document.createElement("input");
+  filePicker.type = "file";
+  filePicker.multiple = true;
+  filePicker.hidden = true;
+  filePicker.onchange = () => {
+    const files = [...filePicker.files];
+    filePicker.value = "";
+    uploadFilesToTask(files);
+  };
+  uploadButton.onclick = () => filePicker.click();
+  const mentionButton = button("@", "cline-secondary cline-mention-file");
+  mentionButton.title = "引用工作区文件到当前消息";
+  mentionButton.onclick = () => {
+    const value = textarea.value;
+    const needsSpace = value && !/\s$/.test(value);
+    const command = fileCommand(value);
+    if (command) {
+      textarea.value = `${value.slice(0, command.start)}@`;
+    } else {
+      textarea.value = `${value}${needsSpace ? " " : ""}@`;
+    }
+    state.fileMenuOpen = true;
+    state.fileQuery = "";
+    state.fileMenuIndex = 0;
+    textarea.dispatchEvent(new Event("input"));
+    textarea.focus();
+  };
+  const networkButton = button("网络访问：已关闭", "cline-secondary cline-network-toggle");
+  networkButton.title = "开启后本任务允许浏览器工具和联网命令";
+  networkButton.onclick = toggleNetworkAccess;
+  actions.append(uploadButton, filePicker, mentionButton, networkButton);
+  composer.append(textarea, actions, send);
   chat.append(log, context, skillSelector, composer);
   views.append(chat, el("section", "cline-checkpoints-area cline-hidden"), el("section", "cline-files-area cline-hidden"), el("section", "cline-workflow-area cline-hidden"), el("section", "cline-mcp-area cline-hidden"), el("section", "cline-settings-area cline-hidden"), el("section", "cline-skills-area cline-hidden"));
   main.append(toolbar, tabs, views);

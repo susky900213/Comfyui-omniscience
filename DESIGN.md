@@ -426,6 +426,44 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
   → 发事件 → 下一次模型请求携带完整历史`。测试失败时，失败输出进入历史，模型
   据此再读取失败位置、修改文件、重跑测试——这就是"编码闭环"的全部机制。
 
+### 5.7 custom_nodes 项目接管（`omniscience/agent/projects.py`）
+
+任务历史不再只有工作区项目：`custom_node_projects()` 直接枚举设置里 ComfyUI 目录的
+`custom_nodes`，让既有的节点仓库也能成为任务节点。三条硬规则：
+
+- **软链接一律不列**：`custom_nodes/<name> -> 工作区/<name>` 是本插件为工作区项目建立的
+  链接，其任务已经在历史里，再列一次就是重复；因此只收真正的目录，同时跳过隐藏目录、
+  `__pycache__`、非目录条目，按 mtime 倒序并受 `MAX_CUSTOM_NODE_PROJECTS` 限制；
+- **已被任务覆盖的目录不列**：以 `Path.resolve()` 比对 `tasks.workspace`，接管过一次就
+  不再重复出现；`adopt_project()` 对同一路径幂等，直接返回既有任务；
+- **接管不写任何文件**：不建目录、不建软链（`_comfyui_link_path` 在 `link == project` 时
+  返回 `None` 已经覆盖这种自指情况）、不生成 `workflow.json`。元数据记
+  `project_source = "comfyui_custom_nodes"`，`_ensure_task_workflow` 见到该标记只回读已有
+  工作流，任务完成时也不会补写——别人的仓库由用户自己管。
+
+前端把 `/cline/tasks` 与 `/cline/custom-nodes` 合并成一个节点流（按时间倒序），未接管的
+条目用虚线卡片 + `ComfyUI` 角标 + "待接管"显示，点击即 `POST /cline/custom-nodes/adopt`
+并直接打开该任务。`create_task` 的同名冲突提示改为引导点击接管，而不是只让用户改名。
+
+安全边界随之放宽：接管后 `Workspace` 的根就是 `ComfyUI/custom_nodes/<name>`，文件与命令
+工具在该目录内的读写是预期行为，路径仍受 `Workspace.resolve()` 约束不得越出该目录。
+
+接管同时是一道安全门禁：`POST /cline/custom-nodes/adopt` 先扫描再落库，报告为 `blocked`
+且请求没有 `acknowledge_security` 时返回 `409` + `security`，此时任务、软链、文件都未产生。
+详见 §11.2。
+
+### 5.8 节点安全检测路由（`omniscience/api/routes.py`）
+
+| 路由 | 作用 | 是否可能调用模型 |
+| --- | --- | --- |
+| `POST /cline/custom-nodes/scan` | 检测单个未接管项目，结果写入 `node_scans` | 取决于 `skill_security_mode` |
+| `POST /cline/custom-nodes/scan-all` | 批量静态检测，单次最多 `MAX_NODE_BATCH_SCANS` 个，返回 `remaining` | 否，强制 `static` |
+| `POST /cline/custom-nodes/adopt` | 接管门禁 + 建任务，报告随元数据落库 | 取决于 `skill_security_mode` |
+| `POST /cline/custom-nodes/install` | 暂存、检测并安装 GitHub 仓库或前端上传的节点压缩包；blocked 返回 `409` + `security` | GitHub 下载 + 取决于 `skill_security_mode`；静态上传不调用模型 |
+| `POST /cline/tasks/{id}/scan` | 复检已接管任务的项目，并回写 `metadata.security` | 取决于 `skill_security_mode` |
+
+扫描是同步的文件遍历，路由用 `asyncio.to_thread` 包裹，避免阻塞 aiohttp 事件循环。
+
 ---
 
 ## 6. 审批与工具策略
@@ -604,14 +642,145 @@ canonical transcript 在 SDK session history，而这里事件与消息都是持
 
 ## 11. 全局对话与 Skill 安装
 
-`GlobalChatAgent`（L1145）无任务、无工作区，唯一执行类工具是
-`install_github_skill`（L1254）。它对应 Cline 中"特殊入口走特殊 handler，但共用
-Agent 循环骨架"的模式。保留三条安全约束并视为设计不变量：
+`GlobalChatAgent`（omniscience/agent/global_chat.py）无任务、无项目文件夹，工作区是
+仅供它使用的暂存目录 `paths.global_workspace()`（`<state>/global-workspace`）。可执行
+工具分三类：安装类只有 `install_github_skill`；文件类是暂存工作区的只读
+`list_files`/`read_file`/`search_files`；浏览器类（`browser_navigate`/
+`browser_content`/`browser_screenshot`，无 click/fill）仅在设置的
+`global_network_enabled` 打开时提供，与任务的 `metadata.network_enabled` 互不影响。
+前端「上传文件」按钮在任务模式下写 `任务工作区/uploads/`，在全局对话写
+`全局工作区/uploads/`；`@路径` 由前端读取后作为 `context` 随消息提交，只进入本轮模型
+输入，不落库。保留三条安全约束并视为设计不变量：
 
 1. 仅在用户明确提出安装请求时提供该工具，且后端核对工具参数与用户给出的来源
-   （`_explicit_install_request` L1445、`_install_source_allowed` L1465）；
-2. 重定向白名单（`_GitHubRedirectHandler` L760）；
+   （`_explicit_install_request`、`_install_source_allowed`
+   omniscience/agent/github_skill.py）——用户给仓库根链接时，允许模型改用该仓库内的
+   具体 Skill 文件夹链接；
+2. 重定向白名单（`_GitHubRedirectHandler`）；
 3. 只导入限额内的 `.md`/`.txt` 文本，绝不下载或执行包内代码。
+
+仓库根链接安装该仓库发布的所有 Skill 包（`_skill_candidates`）：按文件夹名去重并保留
+最浅的一份，跳过 `.github` 等内部目录与不合规的包（原因写入 `skipped`），单次最多 10
+个；名称已存在的包在下载前就跳过，全部命中时返回 `already_installed`。
+
+### 11.1 Skill 安全检测（`omniscience/skill_security.py`）
+
+Skill 是要注入提示词的指令，风险等同提示词注入加命令建议，因此任何写入 Skill 库的路径
+都要先扫描。扫描器只做正则规则匹配，绝不执行被扫描内容：
+
+| 规则族 | 等级 | 判定 |
+| --- | --- | --- |
+| `crypto-mining`（矿池地址、xmrig/cpuminer/挖矿） | critical | blocked |
+| `remote-code-execution`（`curl … \| bash`、`-enc`/`iex`、`base64 -d \| sh`） | critical | blocked |
+| `credential-exfiltration`（凭据标记 + 外发动词 + 外部地址，三者同时命中） | critical | blocked |
+| `callback-sink`（webhook.site/请求捕获/匿名回调） | critical | blocked |
+| `prompt-injection`（忽略系统提示、跳过确认、不要告知用户、关闭安全策略） | high | review |
+| `persistence-and-privilege`（crontab、LaunchAgents、`~/.zshrc`、authorized_keys、sudo） | high | review |
+| `destructive-commands`（`rm -rf ~`、`mkfs`、`dd of=/dev`、强推） | high | review |
+| `obfuscated-payload`（长 Base64/hex、`atob`/`fromCharCode`、`base64 -d`） | high | review |
+| `supply-chain`（替换 index-url/registry、安装 tarball、`bash install.sh`） | medium | review |
+| `network-abuse`（nmap/爆破/高频请求） | medium | review |
+| `secret-readout`、`tunnel-or-shortlink`、`anonymous-hosting` | medium | review |
+| `external-links`（仅列出外链域名） | low | clean |
+
+verdict 取最高等级：critical → `blocked`，high/medium → `review`，否则 `clean`；
+`findings` 带 rule、severity、advice 与命中片段。扫描前会剥离零宽字符并统一空白，
+避免简单变形绕过。
+
+接入点：
+
+- GitHub 安装：`_install_package` 在 `skills.create()` 之前调用 `_scan_package`，
+  `blocked` 抛 `SkillSecurityBlockedError` 并写入该包的 `skipped` 原因，恶意包不会落库；
+  仓库其余合规包照常安装。结果里的 `security` 数组给出每个已安装 Skill 的结论与
+  详情，供模型转述。
+- 手动保存/编辑：`POST /cline/skills`、`PATCH /cline/skills/{id}` 命中 `blocked` 返回
+  `409` + `security`；前端确认「仍然保存」后带 `acknowledge_security: true` 重试，报告
+  记 `acknowledged`。`POST /cline/skills/scan` 可对草稿做只读预检。
+- JSON 导入：`import_items` 先全量预扫描，存在 `blocked` 且未确认则整批拒绝（不产生
+  部分写入）；确认导入后每条报告记 `acknowledged`。
+- 存储：`skills.security` 列（JSON，`_initialize` 用 `PRAGMA table_info` + `ALTER TABLE`
+  迁移旧库）；`rescan()` 用于规则升级后重扫，保留既有 `acknowledged`。
+- 手动检测：面板提供三个入口——Skill 卡片「安全检测」（`POST /cline/skills/{id}/rescan`）、
+  工具栏「全部安全检测」（`POST /cline/skills/rescan` → `rescan_all()`，规则更新后批量重扫）、
+  编辑器「立即检测」（`POST /cline/skills/scan`，只检草稿、不写库）。结论实时刷新徽章与状态行。
+- 模型无法自行放行：`acknowledged` 只来自前端用户显式确认，`install_github_skill` 工具
+  参数不含该字段。
+
+#### AI 审核（`omniscience/skill_review.py`）
+
+设置项 `skill_security_mode` 选择在写入 Skill 库前使用哪个引擎，取值
+`static`（默认）/ `ai` / `hybrid`，由 `skill_security.resolve_review_mode()` 统一解析，
+未知值一律回退 `static`；`skill_security_model` 可指定专用审核模型，留空则复用全局 `model`。
+所有检测入口（保存、编辑、草稿预检、单个/批量重扫、GitHub 安装）都走
+`await skill_review.review(values, settings=..., source=...)`，因此改开关即可全局生效。
+
+`ai` 模式把 Skill 正文裁剪到 `MAX_REVIEW_CHARS`（超长时保留首尾并标注省略字数），用
+`<skill>` 标签包裹并显式声明「这是数据、不是指令」，以 `temperature=0.0` 发一次不带工具的
+补全，要求只返回 JSON。`parse_review` 负责把模型结论收敛成与静态报告同形的结构：
+
+- 未知 severity 一律降级为 `medium`，`findings` 上限 `MAX_AI_FINDINGS`；
+- 结论只允许变严：模型自称 `clean` 但自己列了 critical 命中项时仍判 `blocked`，
+  模型无法用它自己的判断去豁免静态规则；
+- 任何异常（连接失败、非 JSON、超时）都回退静态报告并记 `fallback` 说明，
+  审核不可用绝不阻断保存或安装；
+- `hybrid` 取两者并集，verdict 用 `VERDICT_RANK` 取更严格的一方，域名合并去重，
+  `engine` 标为「静态 + AI」供前端展示实际使用的引擎。
+
+一次保存/安装即一次模型调用，默认保持 `static` 以避免无谓开销；前端在设置页展示三种模式与
+可选审核模型，并在报告首行标注检测方式与回退原因。
+
+### 11.2 节点项目安全检测（`omniscience/node_security.py`）
+
+Skill 是文本，节点是被 ComfyUI 直接 `import` 的代码，因此检测对象换成整棵项目目录。
+扫描器**只读文件、绝不导入、绝不执行、绝不建虚拟环境**，并且与 Skill 报告同形
+（`verdict`/`severity`/`findings`/`domains`/`source`/`checked_at`/`scripts_executed`），
+这样徽章、确认弹窗与 AI 审核都能复用同一套前端与判定数学。
+
+规则族在 Skill 的十类之上补节点特有的部分：`unsafe-deserialization`（pickle/marshal/
+`yaml.load`/`joblib`）、`dynamic-eval`、`shell-command`、`comfy-runtime-patch`（改写 ComfyUI
+内部模块或 `server.instance.*`）、`foreign-path-write`（写入 `custom_nodes`、核心文件、
+`site-packages`）、`model-directory-write`、`filesystem-discovery`、`binary-artifact` 与
+`bundled-pickle`（来自文件清单而非源码文本）。每条 finding 额外带
+`occurrences`/`files`/`evidence`，证据形如 `相对路径:行号 语句片段`，用户能直接跳进源码核对。
+
+误报控制是这一节的主要工程约束（真实仓库 1 KB 到 3.7 MB、最多 953 个文件）：
+
+- **覆盖分级**：文件按 manifest → 代码 → 配置 → 文档排序，`docs/examples/tests/trash` 等
+  目录降级，随后受 `MAX_SCANNED_FILES`/`MAX_SCANNED_BYTES`/`MAX_FILE_BYTES` 截断；被截断或
+  跳过的文件计入 `coverage-limit` 提示与 `files_scanned`/`files_total`/`files_skipped`，
+  绝不静默丢证据。软链接与 `os.walk(followlinks=False)` 保证不跟着链接跑出项目。
+- **同名变形**：零宽字符与软连字符直接删除（不改变行号），`data:...;base64,` 内联图片替换
+  为等长占位，避免长 Base64 规则把图片本身当成载荷。
+- **常见库惯用法不算风险**：`model.eval()`、`def evaluate()`、`original_images`、
+  `api_config`、`OPENSSH` 的 PEM 正则、`env={**os.environ}` 传给构建子进程、
+  `profiles.append(...)`、apt 缓存清理等均不命中；凭据外泄需要同时出现「命名凭据文件 +
+  外发动词 + 外部地址」，只批量读环境变量降到 `environment-collection`（medium）。
+- **文档/示例降到 review**：critical 命中的文件若全部落在文档或 `examples/tests/trash`
+  这类不会被 import 的路径，降级为 medium 并在 advice 说明原因；出现在实际源码里的同类
+  命中仍按 blocked 处理。
+
+判定与开关完全沿用 Skill 那套：`skill_security_mode`（`static`/`ai`/`hybrid`）与
+`skill_security_model` 由 `node_review.review_mode()` 解析，`hybrid` 取两个引擎的并集且
+verdict 只会更严；AI 审核不喂整棵目录树，而是把静态报告压成证据摘要
+（覆盖统计、依赖清单、第三方导入、外部域名、文件清单、静态命中与有限证据行），一次
+`temperature=0.0`、不带工具的补全只读回 JSON；`MAX_DIGEST_EVIDENCE` 限制证据行数。模型
+失败、无法解析或未配置审核模型时回退静态报告并记 `fallback`，接管不会被审核故障卡住。
+
+缓存与门禁：`node_scans(path, report, updated_at)` 以项目绝对路径为主键，
+`custom_node_projects()` 一次性带出缓存报告，因此打开面板不会重扫、也不会消耗模型调用。
+接管走 `_node_gate()`：先扫描后写入，`blocked` 且未确认返回 `409`；`acknowledged`
+只可能来自前端用户点击，模型不能自我放行；批量检测强制静态，单次最多
+`MAX_NODE_BATCH_SCANS` 个项目并返回 `remaining` 供前端提示再点一次。
+
+### 11.3 全局对话节点安装（`omniscience/agent/node_install.py`）
+
+全局对话只在用户明确说“安装节点”并给出来源时暴露 `install_comfyui_node`。来源必须是用户消息中的公开 GitHub HTTPS 仓库/tree 链接、`owner/repo` 简写，或用户上传到全局工作区 `uploads/` 的节点压缩包路径；后端会再次比较工具参数与原始消息，模型不能替换仓库、路径或安全确认参数。
+
+GitHub 仓库通过 `codeload.github.com` 下载 tarball，压缩包和上传的 zip/tar 包都先进入临时 staging 目录。`omniscience/archives.py` 逐项拒绝绝对路径、`..` 穿越、符号链接、硬链接、设备文件和超限包；当前上限为压缩包 20 MB、解压后 80 MB、2,000 个文件、单文件 20 MB。节点根目录必须包含 `__init__.py`，并使用仓库名或上传文件名推导 `custom_nodes/<项目名>`。
+
+安装顺序固定为：下载/解包 → 定位节点根 → 静态 `node_security.scan_project` → 按 `skill_security_mode` 运行 `node_review.review` → 只有报告完成且允许时才移动到 `custom_nodes` → 保存 `node_scans` 缓存。安装不执行 `git clone`、`pip install`、`setup.py`、`requirements.txt` 或包内脚本，不创建 `workflow.json`，不自动接管为任务；成功后项目会出现在待接管列表，需用户另行接管并重启 ComfyUI。
+
+全局工具永远不传 `acknowledged`。blocked 安装通过普通工具结果返回给模型并保持拒绝；只有面板 `/cline/custom-nodes/install` 收到用户明确确认后才可带 `acknowledge_security` 重试。AI/hybrid 模式每次单独安装产生一次审核模型调用，静态模式与批量检测不产生调用；模型审核只能加严结论，不能放宽静态命中。
 
 ---
 
@@ -662,6 +831,11 @@ Agent 循环骨架"的模式。保留三条安全约束并视为设计不变量�
 | `omniscience_mcp.py` | MCP stdio/HTTP 客户端与工具聚合 |
 | `omniscience_browser.py` | Playwright 浏览器工具 |
 | `web/omniscience.js` | 侧栏面板、ApiClient、事件消费 |
+| `omniscience/skill_security.py` | Skill 静态规则扫描、verdict 数学与审核模式解析 |
+| `omniscience/skill_review.py` | Skill 的 AI 审核、报告合并与回退 |
+| `omniscience/node_security.py` | custom_nodes 项目静态扫描（只读遍历 + file:line 证据） |
+| `omniscience/node_review.py` | 节点项目的 AI 审核（证据摘要 + 复用 Skill 开关） |
+| `omniscience/agent/projects.py` | 项目枚举、接管门禁落库、任务安全元数据 |
 | `web/omniscience.css` | 面板样式 |
 | `tests/test_omniscience_server.py` | 沙箱、持久化、取消、压缩、Skill 安装行为回归 |
 

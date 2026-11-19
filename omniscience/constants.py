@@ -1,0 +1,45 @@
+"""Product limits and budgets shared across the package."""
+
+from __future__ import annotations
+
+PRODUCT_NAME = "Comfyui-omniscience"
+PLUGIN_NAME = PRODUCT_NAME
+
+MAX_FILE_BYTES = 1_000_000
+MAX_WRITE_BYTES = 2_000_000
+MAX_COMMAND_OUTPUT = 20_000
+MAX_SEARCH_RESULTS = 100
+MAX_SEARCH_LINE_CHARS = 500
+MAX_LIST_ENTRIES = 500
+MAX_AGENT_STEPS = 8
+MAX_MESSAGE_CHARS = 120_000
+MAX_GLOBAL_CHAT_STEPS = 4
+MAX_COMMAND_CHARS = 2_000
+MAX_BROWSER_CONTENT_CHARS = 100_000
+MAX_CURRENT_WORKFLOW_BYTES = 2_000_000
+MAX_GLOBAL_SKILL_PACKAGE_FILES = 40
+MAX_GLOBAL_SKILL_PACKAGE_BYTES = 200_000
+MAX_CUSTOM_NODE_PROJECTS = 200
+# One batch scan request walks at most this many node projects; each one reads
+# up to node_security's caps, so a larger batch would stall the panel.
+MAX_NODE_BATCH_SCANS = 25
+# A node package arrives as one GitHub tarball or an uploaded archive. The
+# compressed cap bounds the download, and the unpacked caps are what stop a
+# zip bomb from filling the disk before the security scan ever runs.
+MAX_NODE_PACKAGE_BYTES = 20_000_000
+MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES = 80_000_000
+MAX_NODE_PACKAGE_FILE_BYTES = 20_000_000
+MAX_NODE_PACKAGE_FILES = 2_000
+
+DEFAULT_MAX_CONTEXT_TOKENS = 32_000
+MIN_MAX_CONTEXT_TOKENS = 1_024
+MAX_MAX_CONTEXT_TOKENS = 1_000_000
+DEFAULT_COMPACTION_THRESHOLD_PERCENT = 80
+MIN_COMPACTION_THRESHOLD_PERCENT = 1
+MAX_COMPACTION_THRESHOLD_PERCENT = 99
+
+WORKFLOW_FILENAME = "workflow.json"
+PROJECT_RULES_FILENAME = "OMNISCIENCE.md"
+
+MODEL_TIMEOUT_SECONDS = 120
+MODEL_TEMPERATURE = 0.2

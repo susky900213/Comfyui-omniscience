@@ -6,12 +6,20 @@ This keeps it installable as a normal custom node and avoids changing the
 ComfyUI core application.
 """
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+
 WEB_DIRECTORY = "./web"
 
 try:
     from server import PromptServer
 
-    from .omniscience_server import register_routes
+    try:  # ComfyUI's pack loader may run this file without package context.
+        from .omniscience_server import register_routes
+    except ImportError:
+        from omniscience_server import register_routes
 
     register_routes(PromptServer.instance)
 except Exception as exc:  # pragma: no cover - exercised by ComfyUI startup

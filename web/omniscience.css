@@ -71,6 +71,23 @@
 .cline-task-node-mode { color: #aaa0e9; }
 .cline-task-prompt-length { overflow: hidden; color: #aaa5b8; text-overflow: ellipsis; white-space: nowrap; }
 .cline-task-node-date { white-space: nowrap; }
+.cline-task-node.external { border-style: dashed; background: #221f2b; }
+.cline-task-node-kind { flex: 0 0 auto; border: 1px solid #4d6382; border-radius: 10px; padding: 1px 6px; color: #9dc0e8; font-size: 10px; line-height: 1.4; }
+.cline-node-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.cline-node-scan { border: 1px solid #4d4766; border-radius: 6px; padding: 2px 8px; color: #c8c2da; background: #2c2939; font-size: 10px; cursor: pointer; }
+.cline-node-scan:hover { border-color: #7665e6; color: #ede9f7; }
+.cline-node-scan.busy { opacity: 0.55; cursor: progress; }
+.cline-node-delete { align-self: flex-end; border: 1px solid #684955; border-radius: 5px; padding: 2px 7px; color: #e2aab4; background: #33232b; font-size: 10px; cursor: pointer; }
+.cline-node-delete:hover, .cline-node-delete:focus { border-color: #c56d7c; color: #ffe1e5; background: #512c36; outline: none; }
+.cline-scan-nodes { width: 100%; margin-top: 10px; font-size: 11px; }
+.cline-node-scan-status { margin: 8px 5px 0; color: #a9a2bd; font-size: 11px; line-height: 1.5; }
+.cline-node-install { margin-top: 16px; border-top: 1px solid #373445; padding: 4px 5px 0; }
+.cline-node-install h3 { margin: 8px 0; }
+.cline-node-install-url { width: 100%; border: 1px solid #4a4560; border-radius: 6px; padding: 6px 7px; color: #ddd8e8; background: #24222d; font-size: 11px; }
+.cline-node-install-actions { display: flex; gap: 6px; margin-top: 7px; }
+.cline-node-install-actions button { flex: 1 1 50%; padding: 5px 6px; font-size: 11px; }
+.cline-node-install-status { margin: 8px 0 0; font-size: 11px; line-height: 1.5; }
+.cline-node-install .cline-hint { margin: 6px 0 0; font-size: 10px; line-height: 1.5; }
 .cline-task-empty { position: relative; z-index: 1; margin: 8px 4px; padding: 8px; border: 1px dashed #49435e; border-radius: 6px; background: #211f2b; text-align: center; }
 .cline-main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
 .cline-toolbar { justify-content: space-between; gap: 8px; padding: 8px 12px 0; }
@@ -95,8 +112,17 @@
 .cline-line { min-height: 1.45em; }
 .cline-status, .cline-hint, .cline-context-label, .cline-workspace-label { color: #aaa5b8; }
 .cline-context-label { padding: 7px 0; font-size: 12px; }
-.cline-composer { gap: 8px; align-items: flex-end; padding-top: 8px; border-top: 1px solid #373445; }
-.cline-composer textarea { flex: 1; resize: vertical; min-height: 58px; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: inherit; }
+.cline-composer { position: relative; flex-wrap: wrap; gap: 8px; align-items: flex-end; padding-top: 8px; border-top: 1px solid #373445; }
+.cline-composer textarea { flex: 1 1 260px; order: 1; resize: vertical; min-height: 58px; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: inherit; }
+.cline-composer .cline-send-message { order: 2; }
+.cline-composer-actions { display: flex; order: 3; flex: 1 0 100%; align-items: center; gap: 6px; }
+.cline-composer-actions button { padding: 4px 9px; font-size: 11px; }
+.cline-composer-actions .cline-network-toggle.active { border-color: #35a37a; color: #d8ffe9; background: #173d2e; }
+.cline-file-command-menu { position: absolute; bottom: calc(100% - 2px); left: 0; z-index: 6; width: 100%; border: 1px solid #5a536e; border-radius: 6px; padding: 4px; background: #24212f; box-shadow: 0 5px 15px #0007; }
+.cline-file-command-list { display: flex; max-height: 190px; flex-direction: column; overflow-y: auto; }
+.cline-file-command-item { display: flex; flex-direction: column; gap: 2px; border: 0; border-radius: 4px; padding: 7px 9px; color: #e9e7f2; background: transparent; text-align: left; cursor: pointer; }
+.cline-file-command-item:hover, .cline-file-command-item.active { background: #3b3560; }
+.cline-file-command-path { overflow: hidden; color: #aaa5b8; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .cline-skill-selector { margin: 8px 0 0; padding: 8px 0; border-top: 1px solid #373445; }
 .cline-skill-selector-heading, .cline-skill-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .cline-skill-selector-heading { color: #cfc8e4; }
@@ -116,13 +142,30 @@
 .cline-skill-form h4 { margin: 0 0 10px; }
 .cline-skill-editor { min-height: 150px; resize: vertical; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .cline-skill-toolbar { flex-wrap: wrap; }
+.cline-skill-status, .cline-scan-status { flex: 1 1 100%; }
 .cline-skill-list { flex: 1; min-height: 0; overflow-y: auto; }
 .cline-skill-card { margin-bottom: 10px; padding: 10px; border: 1px solid #49435e; border-radius: 7px; background: #272431; }
+.cline-skill-card-heading { flex-wrap: wrap; }
 .cline-skill-card.disabled { opacity: .7; }
 .cline-skill-card p { margin: 6px 0; }
 .cline-skill-state { color: #a99bf2; font-size: 11px; }
+.cline-security { display: flex; align-items: center; gap: 6px; }
+.cline-security-badge { padding: 1px 7px; border-radius: 999px; font-size: 11px; cursor: default; }
+.cline-security-badge.clean { background: #1f3d2b; color: #7ee2a8; }
+.cline-security-badge.review { background: #45381c; color: #f0c674; cursor: pointer; }
+.cline-security-badge.blocked { background: #4a2331; color: #ff9aa8; cursor: pointer; }
+.cline-security-badge.unknown { background: #33303f; color: #a9a2bd; }
+.cline-security-report { flex: 1 1 100%; margin-top: 8px; padding: 8px; border: 1px dashed #49435e; border-radius: 6px; background: #1f1d27; }
+.cline-security-finding { margin-bottom: 8px; }
+.cline-security-finding p { margin: 3px 0; color: #cfc8e0; font-size: 11px; }
+.cline-security-finding code { display: block; margin-top: 3px; padding: 4px 6px; border-radius: 4px; background: #14121a; color: #e7d8a8; font-size: 10px; word-break: break-all; }
+.cline-severity { margin-right: 6px; padding: 1px 5px; border-radius: 4px; font-size: 10px; }
+.cline-severity.critical, .cline-severity.high { background: #4a2331; color: #ff9aa8; }
+.cline-severity.medium { background: #45381c; color: #f0c674; }
+.cline-severity.low { background: #33303f; color: #a9a2bd; }
 .cline-skill-preview { max-height: 130px; overflow: auto; margin: 7px 0; }
 .cline-skills-area { overflow-y: auto; }
+.cline-settings-area { overflow-y: auto; }
 button.cline-primary, .cline-primary { border: 0; border-radius: 5px; padding: 8px 12px; color: #fff; background: #5b47ce; cursor: pointer; }
 button.cline-secondary { border: 1px solid #5a536e; border-radius: 5px; padding: 8px 12px; color: #ddd8e8; background: transparent; cursor: pointer; }
 button.cline-cancel-task { border-color: #9b5050; color: #f0b0b0; }
@@ -134,6 +177,9 @@ button:disabled { opacity: .55; cursor: wait; }
 .cline-confirm-actions { gap: 8px; }
 .cline-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .cline-field input { border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; }
+.cline-field select { border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; }
+.cline-custom-provider-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.cline-custom-provider-row input { flex: 1; min-width: 120px; border: 1px solid #504a68; border-radius: 5px; padding: 6px; color: #eee; background: #24222d; }
 .cline-json-editor { min-height: 210px; resize: vertical; border: 1px solid #504a68; border-radius: 5px; padding: 8px; color: #eee; background: #24222d; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .cline-settings-area h3, .cline-files-area h3, .cline-workflow-area h3, .cline-checkpoints-area h3, .cline-mcp-area h3, .cline-skills-area h3 { margin: 4px 0 14px; }
 .cline-workflow-editor { flex: 1; min-height: 300px; resize: vertical; }
