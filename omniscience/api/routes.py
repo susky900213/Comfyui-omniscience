@@ -15,6 +15,7 @@ from typing import Any
 
 from .. import node_review, node_security, skill_review, skill_security, uploads
 from ..agent.node_install import NodeSecurityBlockedError
+from ..region_router import RegionRouter
 from ..constants import (
     MAX_CURRENT_WORKFLOW_BYTES,
     MAX_NODE_BATCH_SCANS,
@@ -29,7 +30,7 @@ from . import deps
 logger = logging.getLogger("Comfyui-omniscience")
 
 HEALTH_VERSION = "0.3.0"
-FEATURES = ["tasks", "global_chat", "cancellation", "checkpoints", "mcp", "browser", "live_workflow", "upload", "network_switch", "global_workspace", "skill_security", "custom_node_projects", "node_security", "node_install"]
+FEATURES = ["tasks", "global_chat", "cancellation", "checkpoints", "mcp", "browser", "live_workflow", "upload", "network_switch", "global_workspace", "skill_security", "custom_node_projects", "node_security", "node_install", "workflow_node_search"]
 
 
 def _composer_workspace(request) -> Any:
@@ -73,6 +74,207 @@ def register_routes(prompt_server: Any) -> None:
             return _response({"tasks": deps.task_agent().store.list_tasks(int(request.query.get("limit", "100")))})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/search")
+    async def cline_search_workflows(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().search_runninghub_workflows(
+                    values.get("query", ""), limit=values.get("limit", 10), filters=values.get("filters")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/select")
+    async def cline_select_workflow(request):
+        try:
+            values = await _body(request)
+            return _response(
+                deps.global_chat_agent().select_workflow(values.get("job_id"), values.get("candidate_id"))
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/inspect")
+    async def cline_inspect_workflow(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().inspect_selected_workflow(
+                    values.get("job_id"), loaded_nodes=values.get("loaded_nodes")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies")
+    async def cline_workflow_dependencies(request):
+        try:
+            return _response(deps.global_chat_agent().dependency_plan(request.match_info["job_id"]))
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/search")
+    async def cline_search_workflow_node_sources(request):
+        try:
+            agent = deps.global_chat_agent()
+            job = agent.workflow_job(request.match_info["job_id"])
+            if not job.get("selected_candidate_id"):
+                raise ValueError("请先在界面中选择一个工作流，再搜索它的缺失节点。")
+            return _response(await agent.search_workflow_node_sources(request.match_info["job_id"]))
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/source")
+    async def cline_select_workflow_node_source(request):
+        try:
+            values = await _body(request)
+            return _response(
+                deps.global_chat_agent().select_workflow_node_source(
+                    request.match_info["job_id"], values.get("class_type"), values.get("source")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/search")
+    async def cline_search_workflow_model_sources(request):
+        try:
+            return _response(await deps.global_chat_agent().search_workflow_model_sources(request.match_info["job_id"]))
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/models/local")
+    async def cline_list_local_workflow_models(request):
+        try:
+            return _response(deps.global_chat_agent().local_model_inventory(request.match_info["job_id"]))
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/source")
+    async def cline_select_workflow_model_source(request):
+        try:
+            values = await _body(request)
+            return _response(
+                deps.global_chat_agent().select_workflow_model_source(
+                    request.match_info["job_id"], values.get("name"), values.get("source")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/local")
+    async def cline_select_workflow_local_model(request):
+        try:
+            values = await _body(request)
+            return _response(
+                deps.global_chat_agent().select_workflow_local_model(
+                    request.match_info["job_id"], values.get("name"), values.get("path")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/confirm")
+    async def cline_confirm_workflow_nodes(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().confirm_node_installation(
+                    request.match_info["job_id"],
+                    confirmed=bool(values.get("confirmed")),
+                    acknowledge_security_for=str(values.get("acknowledge_security_for") or ""),
+                )
+            )
+        except NodeSecurityBlockedError as exc:
+            return _response({"error": str(exc), "security": exc.report}, status=409)
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/confirm")
+    async def cline_confirm_workflow_models(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().confirm_model_download(
+                    request.match_info["job_id"],
+                    confirmed=bool(values.get("confirmed")),
+                    model_names=values.get("model_names"),
+                    wait_for_completion=False,
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/models/status")
+    async def cline_workflow_model_download_status(request):
+        try:
+            return _response(
+                deps.global_chat_agent().model_download_status(
+                    request.match_info["job_id"], request.query.get("name", "")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/cancel")
+    async def cline_cancel_workflow_model_download(request):
+        try:
+            values = await _body(request)
+            return _response(
+                deps.global_chat_agent().cancel_model_download(
+                    request.match_info["job_id"], values.get("name", "")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/confirm")
+    async def cline_confirm_workflow_dependencies(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().confirm_dependency_plan(
+                    request.match_info["job_id"], confirmed=bool(values.get("confirmed"))
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/develop")
+    async def cline_create_workflow_development_task(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().create_development_task(
+                    request.match_info["job_id"], confirmed=bool(values.get("confirmed"))
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/execute")
+    async def cline_execute_workflow(request):
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().execute_workflow(
+                    request.match_info["job_id"],
+                    confirmed=bool(values.get("confirmed")),
+                    timeout=float(values.get("timeout", 1800)),
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.get("/cline/global-chat/workflows/{job_id}")
+    async def cline_workflow_job(request):
+        try:
+            return _response(deps.global_chat_agent().workflow_job(request.match_info["job_id"]))
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=404)
 
     @routes.get("/cline/global-chat")
     async def cline_global_chat(request):

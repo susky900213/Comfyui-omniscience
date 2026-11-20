@@ -73,6 +73,83 @@ async function request(path, options = {}) {
   return data;
 }
 
+const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+function formatModelDownloadSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "0 B";
+  if (value < 1024) return `${Math.floor(value)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unit = units[0];
+  for (let index = 1; size >= 1024 && index < units.length; index += 1) {
+    size /= 1024;
+    unit = units[index];
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${unit}`;
+}
+
+function modelDownloadProgress() {
+  const container = el("div", "cline-workflow-download-progress");
+  const bar = el("progress", "cline-workflow-download-progress-bar");
+  bar.max = 100;
+  bar.value = 0;
+  bar.setAttribute("aria-label", "模型下载进度");
+  const label = el("span", "cline-workflow-download-progress-label", "正在连接下载服务器…");
+  container.append(bar, label);
+  return { container, bar, label };
+}
+
+function updateModelDownloadProgress(progress, result) {
+  const downloaded = Number(result.downloaded_bytes) || 0;
+  const total = Number(result.total_bytes);
+  if (Number.isFinite(total) && total > 0) {
+    const percentage = Math.min(100, Math.floor((downloaded / total) * 100));
+    progress.bar.value = percentage;
+    progress.label.textContent = `${percentage}% · ${formatModelDownloadSize(downloaded)} / ${formatModelDownloadSize(total)}`;
+  } else {
+    progress.bar.removeAttribute("value");
+    progress.label.textContent = `已下载 ${formatModelDownloadSize(downloaded)} · 总大小未知`;
+  }
+}
+
+function renderLocalModelInventory(container, inventory) {
+  container.replaceChildren();
+  container.classList.toggle("warning", inventory?.status !== "ok");
+  if (inventory?.status !== "ok") {
+    container.appendChild(el("p", "", inventory?.message || "暂时无法读取本地模型。"));
+    return;
+  }
+  const heading = el("strong", "", `已存在的本地模型：${inventory.count || 0} 个`);
+  container.appendChild(heading);
+  if (!inventory.models?.length) {
+    container.appendChild(el("p", "cline-workflow-candidate-meta", "ComfyUI models 目录中暂未找到模型文件。"));
+    return;
+  }
+  const list = el("div", "cline-workflow-local-inventory-list");
+  list.textContent = inventory.models.map((model) => model.path).join("\n");
+  container.appendChild(list);
+}
+
+function modelSourceLabel(source) {
+  const type = source?.source_type === "huggingface_search" ? "搜索引擎" : "Hugging Face API";
+  const region = source?.region === "domestic" ? "国内" : source?.region === "international" ? "海外" : "";
+  return [type, region, source?.repo_id, source?.filename].filter(Boolean).join(" · ");
+}
+
+async function waitForModelDownload(jobId, name, onProgress) {
+  for (;;) {
+    await sleep(1500);
+    const result = await request(
+      `/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/status?name=${encodeURIComponent(name)}`,
+    );
+    if (result.status === "completed") return result;
+    if (result.status === "failed") throw new Error(result.error || `模型下载失败：${name}`);
+    if (result.status === "idle") throw new Error(`模型下载任务已停止，可重新点击下载并从断点继续：${name}`);
+    onProgress?.(result);
+  }
+}
+
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
   const link = document.createElement("link");
@@ -217,6 +294,434 @@ function promptLengthText(stats) {
   return `提示词：约 ${format(tokens)} Token · ${format(chars)} 字符`;
 }
 
+function workflowCandidateCard(jobId, candidate) {
+  const card = el("div", "cline-workflow-candidate");
+  card.appendChild(el("strong", "cline-workflow-candidate-title", `${candidate.title || "未命名工作流"} · ID: ${candidate.id || "未知"}`));
+  if (candidate.description) card.appendChild(el("p", "cline-workflow-candidate-description", candidate.description));
+  const meta = [candidate.author, candidate.region ? `站点：${candidate.region === "domestic" ? "国内" : "国外"}` : ""]
+    .filter(Boolean).join(" · ");
+  if (meta) card.appendChild(el("p", "cline-workflow-candidate-meta", meta));
+  const resource = candidate.resource_assessment;
+  if (resource) {
+    const resourceText = resource.feasible === true ? "本地资源匹配" : resource.feasible === false ? "本地资源不足" : "本地资源未知";
+    const remoteText = resource.recommend_remote ? "，优先推荐非本地模型/云端推理" : "";
+    card.appendChild(el("p", `cline-workflow-candidate-meta ${resource.feasible === false ? "warning" : ""}`, `资源评估：${resourceText}${remoteText}。${resource.recommendation || ""}`));
+  }
+  if (["remote", "cloud", "api", "hosted"].includes(String(candidate.execution_mode || "").toLowerCase()) || candidate.remote_endpoint) {
+    card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-remote", "非本地模型/云端推理工作流"));
+  }
+  const action = button(`选择并准备（ID: ${candidate.id || "未知"}）`, "cline-secondary cline-workflow-select");
+  action.onclick = async () => {
+    action.disabled = true;
+    try {
+      const result = await request("/cline/global-chat/workflows/select", {
+        method: "POST",
+        body: JSON.stringify({ job_id: jobId, candidate_id: candidate.id }),
+      });
+      const inspection = await request("/cline/global-chat/workflows/inspect", {
+        method: "POST",
+        body: JSON.stringify({ job_id: jobId }),
+      });
+      const report = inspection.inspection || {};
+      card.classList.add("selected");
+      const installedModels = (report.models || []).filter((model) => model.local_status === "installed").length;
+      const missingModels = (report.models || []).filter((model) => model.local_status !== "installed").length;
+      const summary = el("p", "cline-workflow-candidate-meta", `格式：${report.format || "未知"} · 节点：${report.node_count || 0} · 模型：${report.models?.length || 0}（已安装 ${installedModels}，缺失 ${missingModels}） · 已加载节点：${report.loaded_nodes_checked ? (report.loaded_nodes_count || 0) : "无法核对"}`);
+      if (report.missing_nodes?.length) {
+        summary.textContent += ` · 未加载节点：${report.missing_nodes.join("、")}`;
+      }
+      if (report.unverified_nodes?.length) {
+        summary.textContent += ` · 未核对节点：${report.unverified_nodes.length} 个`;
+      }
+      card.appendChild(summary);
+      const loadCanvas = button("加载到当前画布", "cline-secondary cline-workflow-load-canvas");
+      loadCanvas.onclick = () => {
+        try {
+          const workflow = inspection.workflow;
+          if (!workflow || typeof app.loadGraphData !== "function") throw new Error("当前 ComfyUI 不支持导入工作流画布。");
+          const graph = workflow.nodes ? workflow : workflow.prompt ? null : workflow;
+          if (!graph) throw new Error("该工作流是 API prompt 格式，请先转换为 ComfyUI 画布工作流。");
+          app.loadGraphData(graph);
+          loadCanvas.textContent = "已加载到当前画布";
+        } catch (error) {
+          showError(error);
+        }
+      };
+      card.appendChild(loadCanvas);
+      if (report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
+        if (window.confirm("工作流检查完成。是否先加载到当前 ComfyUI 画布？\n\n当前画布中的未保存内容可能会被替换。")) {
+          loadCanvas.click();
+        }
+      }
+      const plan = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
+      const planSummary = el("p", "cline-workflow-candidate-meta", `缺少节点：${(plan.nodes || []).length} · 模型依赖：${(plan.models || []).length}`);
+      card.appendChild(planSummary);
+      const modelSourceArea = el("div", "cline-workflow-node-sources cline-workflow-model-sources");
+      const localInventoryArea = el("div", "cline-workflow-local-inventory");
+      const localInventoryButton = button("查看/刷新本地模型", "cline-secondary cline-workflow-local-models");
+      const refreshLocalInventory = async () => {
+        localInventoryButton.disabled = true;
+        localInventoryButton.textContent = "正在读取 ComfyUI models…";
+        try {
+          const inventory = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/local`);
+          renderLocalModelInventory(localInventoryArea, inventory);
+          localInventoryButton.textContent = "刷新本地模型列表";
+        } catch (error) {
+          renderLocalModelInventory(localInventoryArea, { status: "error", message: error.message });
+          localInventoryButton.textContent = "重试读取本地模型";
+        } finally {
+          localInventoryButton.disabled = false;
+        }
+      };
+      const renderModelSources = async (models, candidatesByName = {}) => {
+        modelSourceArea.replaceChildren();
+        for (const model of models || []) {
+          if (["installed", "selected_local"].includes(model.status)) continue;
+          const name = model.name;
+          const group = el("div", "cline-workflow-node-source-group");
+          group.appendChild(el("strong", "", `模型文件：${name}`));
+          if (model.local_candidates?.length) {
+            const localPicker = el("select", "cline-workflow-model-picker");
+            const localPlaceholder = el("option", "", `选择 ComfyUI ${model.category || "models"} 中已有文件`);
+            localPlaceholder.value = "";
+            localPicker.appendChild(localPlaceholder);
+            model.local_candidates.forEach((path) => {
+              const option = el("option", "", path);
+              option.value = path;
+              localPicker.appendChild(option);
+            });
+            localPicker.onchange = async () => {
+              if (!localPicker.value) return;
+              localPicker.disabled = true;
+              try {
+                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/local`, {
+                  method: "POST", body: JSON.stringify({ name, path: localPicker.value }),
+                });
+                model.status = "selected_local";
+                group.replaceChildren(
+                  el("strong", "", `已选择本地模型：${name}`),
+                  el("p", "cline-workflow-candidate-meta", localPicker.value),
+                );
+                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
+              } catch (error) {
+                localPicker.disabled = false;
+                localPicker.value = "";
+                showError(error);
+              }
+            };
+            group.appendChild(localPicker);
+          }
+          const candidates = candidatesByName[name] || model.source_candidates || (model.source ? [model.source] : []);
+          if (model.source) {
+            group.appendChild(el("p", "cline-workflow-candidate-meta", `已选择：${modelSourceLabel(model.source)}`));
+            if (model.source.title || model.source.snippet) {
+              group.appendChild(el("p", "cline-workflow-candidate-meta", model.source.title || model.source.snippet));
+            }
+            const downloadGroup = el("div", "cline-workflow-model-download-group");
+            const download = button(`下载 ${name}`, "cline-secondary cline-workflow-model-download");
+            download.onclick = async () => {
+              download.disabled = true;
+              download.textContent = `正在连接下载：${name}`;
+              const progressUi = modelDownloadProgress();
+              downloadGroup.appendChild(progressUi.container);
+              try {
+                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/confirm`, {
+                  method: "POST", body: JSON.stringify({ confirmed: true, model_names: [name] }),
+                });
+                const progress = await waitForModelDownload(jobId, name, (status) => {
+                  download.textContent = `正在下载：${name}`;
+                  updateModelDownloadProgress(progressUi, status);
+                });
+                progressUi.bar.value = 100;
+                progressUi.label.textContent = "下载完成，正在准备模型…";
+                model.status = "installed";
+                group.replaceChildren(
+                  el("strong", "", `已下载：${name}`),
+                  el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(model.source)} · ${progress.model?.link?.path || model.source.filename}`),
+                );
+                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
+              } catch (error) {
+                download.disabled = false;
+                download.textContent = `重试下载：${name}`;
+                progressUi.label.textContent = `下载失败：${error.message}`;
+                progressUi.container.classList.add("error");
+                showError(error);
+              }
+            };
+            downloadGroup.appendChild(download);
+            group.appendChild(downloadGroup);
+          } else if (!candidates.length) {
+            group.appendChild(el("p", "cline-workflow-candidate-meta", "没有搜索结果；请重试搜索或改用已有模型。不会按文件名猜仓库。"));
+          }
+          if (candidates.length && !model.source) {
+            const picker = el("select", "cline-workflow-model-picker");
+            const placeholder = el("option", "", "选择包含此模型文件的 Hugging Face 仓库");
+            placeholder.value = "";
+            picker.appendChild(placeholder);
+            candidates.forEach((source, index) => {
+              const option = el("option", "", modelSourceLabel(source));
+              option.value = String(index);
+              picker.appendChild(option);
+            });
+            picker.onchange = async () => {
+              if (!picker.value) return;
+              const source = candidates[Number(picker.value)];
+              picker.disabled = true;
+              const progressUi = modelDownloadProgress();
+              group.appendChild(progressUi.container);
+              try {
+                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/source`, {
+                  method: "POST", body: JSON.stringify({ name, source }),
+                });
+                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/confirm`, {
+                  method: "POST", body: JSON.stringify({ confirmed: true, model_names: [name] }),
+                });
+                const progress = await waitForModelDownload(jobId, name, (status) => {
+                  updateModelDownloadProgress(progressUi, status);
+                });
+                progressUi.bar.value = 100;
+                progressUi.label.textContent = "下载完成，正在准备模型…";
+                model.status = "installed";
+                model.source = source;
+                group.replaceChildren(
+                  el("strong", "", `已下载：${name}`),
+                  el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(source)} · ${progress.model?.link?.path || source.filename}`),
+                );
+                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
+              } catch (error) {
+                picker.disabled = false;
+                picker.value = "";
+                progressUi.label.textContent = `下载失败：${error.message}`;
+                progressUi.container.classList.add("error");
+                showError(error);
+              }
+            };
+            group.appendChild(picker);
+          }
+          modelSourceArea.appendChild(group);
+        }
+      };
+      await renderModelSources(plan.models || []);
+      const missingSources = (plan.nodes || []).filter((node) => !node.source);
+      const sourceSearchArea = el("div", "cline-workflow-node-sources");
+      const searchButton = button("搜索缺失节点仓库（优先 GitHub）", "cline-secondary cline-workflow-node-search");
+      const modelSearchButton = button("搜索缺失模型文件（Hugging Face）", "cline-secondary cline-workflow-model-search");
+      const pendingModels = (plan.models || []).filter((model) => model.status !== "installed");
+      card.append(localInventoryButton, localInventoryArea);
+      void refreshLocalInventory();
+      if (pendingModels.length) card.appendChild(modelSourceArea);
+      if (pendingModels.some((model) => !model.source && !model.source_candidates?.length)) {
+        modelSearchButton.onclick = async () => {
+          modelSearchButton.disabled = true;
+          modelSearchButton.textContent = "正在搜索模型文件…";
+          try {
+            const searched = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/search`, {
+              method: "POST", body: "{}",
+            });
+            await renderModelSources(plan.models || [], searched.results || {});
+            if (searched.message) {
+              localInventoryArea.appendChild(el("p", "cline-workflow-candidate-meta", searched.message));
+            }
+            for (const warning of Object.values(searched.warnings || {})) {
+              localInventoryArea.appendChild(el("p", "cline-workflow-candidate-meta warning", warning));
+            }
+            modelSearchButton.textContent = "重新搜索缺失模型文件";
+          } catch (error) {
+            showError(error);
+            modelSearchButton.textContent = "重试搜索缺失模型文件";
+          } finally { modelSearchButton.disabled = false; }
+        };
+        card.appendChild(modelSearchButton);
+      }
+      if (missingSources.length) {
+        searchButton.onclick = async () => {
+          searchButton.disabled = true;
+          searchButton.textContent = "正在搜索 GitHub（失败时回退 Gitee）…";
+          try {
+            const searched = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/search`, {
+              method: "POST", body: "{}",
+            });
+            sourceSearchArea.replaceChildren();
+            for (const [classType, candidates] of Object.entries(searched.results || {})) {
+              const group = el("div", "cline-workflow-node-source-group");
+              group.appendChild(el("strong", "", `节点 ${classType}：`));
+              if (!candidates.length) {
+                group.appendChild(el("p", "cline-workflow-candidate-meta warning", "未找到候选：先搜索 GitHub，仅 GitHub 搜索失败时才会尝试 Gitee。请勿按节点名猜仓库。"));
+              }
+              for (const repo of candidates) {
+                const provider = repo.provider === "gitee" ? "Gitee" : "GitHub";
+                const option = button(`${repo.full_name} · ${provider} · ★ ${repo.stars}`, "cline-secondary cline-workflow-node-source");
+                const details = [provider, repo.description, repo.language, repo.updated_at].filter(Boolean).join(" · ");
+                if (details) group.appendChild(el("p", "cline-workflow-candidate-meta", details));
+                option.onclick = async () => {
+                  option.disabled = true;
+                  try {
+                    await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/source`, {
+                      method: "POST", body: JSON.stringify({ class_type: classType, source: repo.source }),
+                    });
+                    option.textContent = `已选择来源：${repo.full_name}`;
+                    option.classList.add("selected");
+                    const plannedNode = (plan.nodes || []).find((node) => node.class_type === classType);
+                    if (plannedNode) plannedNode.source = repo.source;
+                    const allSourcesSelected = (plan.nodes || []).every((node) => node.source);
+                    prepare.disabled = !allSourcesSelected;
+                    prepare.textContent = allSourcesSelected
+                      ? `安全检测并安装缺少节点（工作流 ID: ${candidate.id || "未知"}）`
+                      : "先选择缺少节点的仓库来源";
+                  } catch (error) { option.disabled = false; showError(error); }
+                };
+                group.appendChild(option);
+              }
+              sourceSearchArea.appendChild(group);
+            }
+            if (searched.deferred) sourceSearchArea.appendChild(el("p", "cline-workflow-candidate-meta", searched.message));
+            searchButton.textContent = "重新搜索节点仓库";
+          } catch (error) {
+            searchButton.textContent = "重试搜索缺失节点仓库";
+            showError(error);
+          } finally { searchButton.disabled = false; }
+        };
+        card.append(searchButton, sourceSearchArea);
+      }
+      const hasNodes = (plan.nodes || []).length > 0;
+      const nodesReady = hasNodes && (plan.nodes || []).every((node) => node.source);
+      const hasModels = (plan.models || []).length > 0;
+      let nodesPrepared = !hasNodes;
+      const maybeAppendExecute = () => {
+        const modelsPrepared = (plan.models || []).every((model) => ["installed", "selected_local"].includes(model.status));
+        if (nodesPrepared && modelsPrepared) appendWorkflowExecuteButton(card, jobId);
+      };
+      modelSourceArea.addEventListener("workflow-model-prepared", maybeAppendExecute);
+      const prepare = button(hasNodes ? (nodesReady ? `安全检测并安装缺少节点（工作流 ID: ${candidate.id || "未知"}）` : "先选择缺少节点的仓库来源") : "检查工作流准备状态", "cline-secondary cline-workflow-prepare");
+      prepare.disabled = hasNodes && !nodesReady;
+      const showNodeSecurityReview = (securityError) => {
+        const security = securityError?.payload?.security;
+        if (!security) return showError(securityError);
+        const report = securityReport(security);
+        const retry = button("查看报告后，单独确认仍要安装此风险节点", "cline-secondary cline-workflow-node-risk-confirm");
+        retry.onclick = () => {
+          const findings = (security.findings || []).map((finding) => `${finding.severity}: ${finding.title}`).join("\n");
+          if (!window.confirm(`安全检测报告为“${securityVerdict(security)}”。\n\n${findings}\n\n继续会把风险代码放入 ComfyUI，并可能在重启时执行。仍要继续吗？`)) return;
+          retry.disabled = true;
+          prepare.disabled = true;
+          const acknowledgeFor = security.class_type;
+          request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/confirm`, {
+            method: "POST",
+            body: JSON.stringify({ confirmed: true, acknowledge_security_for: acknowledgeFor }),
+          }).then(() => {
+            nodesPrepared = true;
+            prepare.disabled = false;
+            prepare.textContent = "已完成逐节点安全复核";
+            retry.disabled = true;
+            maybeAppendExecute();
+          }).catch((nextError) => {
+            retry.disabled = false;
+            prepare.disabled = false;
+            if (nextError?.status === 409 && nextError?.payload?.security) showNodeSecurityReview(nextError);
+            else showError(nextError);
+          });
+        };
+        card.append(report, retry);
+        showError(securityError);
+      };
+      prepare.onclick = async () => {
+        prepare.disabled = true;
+        try {
+          if (hasNodes) {
+            if (!window.confirm(`将下载并安全检测以下节点仓库，安全检测未通过的节点不会安装：\n\n${(plan.nodes || []).map((node) => `${node.class_type} ← ${node.source}`).join("\n")}\n\n继续？`)) {
+              prepare.disabled = false;
+              return;
+            }
+            await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/confirm`, {
+              method: "POST", body: JSON.stringify({ confirmed: true }),
+            });
+            nodesPrepared = true;
+            prepare.textContent = "节点安全检测通过并已安装";
+          }
+          maybeAppendExecute();
+        } catch (error) {
+          if (error?.status === 409 && error?.payload?.security) {
+            prepare.disabled = false;
+            prepare.textContent = "安全检测未通过：查看报告";
+            showNodeSecurityReview(error);
+            return;
+          }
+          prepare.disabled = false;
+          showError(error);
+        }
+      };
+      if (hasNodes) card.appendChild(prepare);
+      card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-next-step", "节点安装需单独确认；模型可搜索并选择包含目标文件的仓库，选定后会立即下载该文件。"));
+      maybeAppendExecute();
+      } catch (error) {
+      action.disabled = false;
+      showError(error);
+    }
+  };
+  card.appendChild(action);
+  return card;
+}
+
+function appendWorkflowExecuteButton(card, jobId) {
+  if (card.querySelector(".cline-workflow-execute")) return;
+  const execute = button("确认执行工作流", "cline-secondary cline-workflow-execute");
+  execute.onclick = async () => {
+    execute.disabled = true;
+    try {
+      const result = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/execute`, { method: "POST", body: JSON.stringify({ confirmed: true }) });
+      execute.textContent = `执行完成（${Object.keys(result.outputs || {}).length} 个输出节点）`;
+      card.classList.add("completed");
+    } catch (error) { execute.disabled = false; showError(error); }
+  };
+  card.appendChild(execute);
+}
+
+function appendWorkflowCandidates(content, article) {
+  let payload;
+  try { payload = JSON.parse(String(content || "")); } catch { return; }
+  if (!payload?.job_id) return;
+  if (!Array.isArray(payload.candidates) || !payload.candidates.length) {
+    const box = el("div", "cline-workflow-no-results");
+    box.appendChild(el("p", "cline-hint", payload.message || "没有找到合适的工作流。"));
+    const develop = button("创建开发任务", "cline-secondary cline-workflow-develop");
+    develop.onclick = async () => {
+      develop.disabled = true;
+      try {
+        const result = await request(`/cline/global-chat/workflows/${encodeURIComponent(payload.job_id)}/develop`, {
+          method: "POST", body: JSON.stringify({ confirmed: true }),
+        });
+        develop.textContent = `已创建任务：${result.folder || result.task_id}`;
+        if (result.task_id) await loadTask(result.task_id);
+      } catch (error) {
+        develop.disabled = false;
+        showError(error);
+      }
+    };
+    box.appendChild(develop);
+    article.appendChild(box);
+    return;
+  }
+  const list = el("div", "cline-workflow-candidates");
+  list.appendChild(el("strong", "cline-workflow-candidates-title", "找到以下工作流，请选择一个："));
+  payload.candidates.forEach((candidate) => list.appendChild(workflowCandidateCard(payload.job_id, candidate)));
+  article.appendChild(list);
+}
+
+function toolResultView(content) {
+  const text = String(content || "");
+  const limit = 2400;
+  if (text.length <= limit) return lines(text);
+  const details = document.createElement("details");
+  details.className = "cline-tool-result-details";
+  const summary = document.createElement("summary");
+  summary.textContent = `工具结果过长，已折叠（${text.length.toLocaleString()} 字符）`;
+  details.appendChild(summary);
+  const body = el("div", "cline-tool-result-body");
+  body.appendChild(lines(text));
+  details.appendChild(body);
+  return details;
+}
+
 function renderMessages() {
   const log = document.querySelector(`#${PANEL_ID} .cline-messages`);
   if (!log) return;
@@ -235,8 +740,9 @@ function renderMessages() {
     const article = el("article", `cline-message ${role}`);
     article.appendChild(el("div", "cline-message-role", role === "user" ? "你" : role === "assistant" ? "Omniscience" : "工具结果"));
     const content = el("div", "cline-message-content");
-    content.appendChild(lines(message.content || ""));
+    content.appendChild(role === "tool" ? toolResultView(message.content || "") : lines(message.content || ""));
     article.appendChild(content);
+    appendWorkflowCandidates(message.content, article);
     if (message.tool_calls?.length) {
       article.appendChild(el("div", "cline-tool-calls", `工具调用：${message.tool_calls.map((call) => call.function?.name || "未知工具").join("、")}`));
     }
@@ -1481,7 +1987,41 @@ function renderSettings() {
   };
   addRow.append(customName, customUrl, customModels, addCustom);
   area.append(customHeading, customList, addRow);
-  area.appendChild(el("p", "cline-hint", "复用本机浏览器需以调试端口启动，例如：open -na \"Google Chrome\" --args --remote-debugging-port=9222 --user-data-dir=\"$HOME/.chrome-cdp\"。检测不到时自动回退内置无头浏览器。"));
+  const workflowNetworkHeading = el("h4", "cline-workflow-section-title", "工作流搜索站点");
+  area.appendChild(workflowNetworkHeading);
+  area.appendChild(el("p", "cline-hint", "RunningHub 连接固定为官方国内站和国外站，不支持在设置中修改地址；这里只选择使用哪个站点。"));
+  area.appendChild(el("p", "cline-settings-readonly", "国内站：https://www.runninghub.cn"));
+  area.appendChild(el("p", "cline-settings-readonly", "国外站：https://www.runninghub.ai"));
+  const workflowNetworkFields = [
+    ["工作流搜索区域", "network_region", settings.network_region || "domestic"],
+    ["Hugging Face 国内模型镜像地址", "huggingface_domestic_base_url", settings.huggingface_domestic_base_url || "https://hf-mirror.com"],
+    ["Hugging Face 国外站地址", "huggingface_international_base_url", settings.huggingface_international_base_url || "https://huggingface.co"],
+    ["公网 IP 查询地址（自动区域判断，可选）", "public_ip_url", settings.public_ip_url || ""],
+    ["IP 地理服务地址（URL 中可用 {ip}，可选）", "ip_geolocation_url", settings.ip_geolocation_url || ""],
+  ];
+  for (const [label, name, value] of workflowNetworkFields) {
+    const field = el("label", "cline-field");
+    field.appendChild(el("span", "", label));
+    const input = document.createElement("input");
+    input.name = name;
+    input.value = value;
+    if (name === "network_region") {
+      const select = document.createElement("select");
+      select.name = name;
+      for (const [region, regionLabel] of [["domestic", "国内站"], ["international", "国外站"], ["auto", "自动判断本机公网 IP"]]) {
+        const option = document.createElement("option");
+        option.value = region;
+        option.textContent = regionLabel;
+        if (region === value) option.selected = true;
+        select.appendChild(option);
+      }
+      field.replaceChildren(field.firstChild, select);
+    } else {
+      field.appendChild(input);
+    }
+    area.appendChild(field);
+  }
+  area.appendChild(el("p", "cline-hint", "默认使用国内站。聊天中说“国内/国外”也可临时覆盖当前搜索请求。"));
 
   const securityHeading = el("h4", "cline-workflow-section-title", "安全检测（Skill 与节点项目）");
   area.appendChild(securityHeading);
@@ -1512,6 +2052,8 @@ function renderSettings() {
   area.appendChild(reviewModelField);
   area.appendChild(el("p", "cline-hint", "同一个开关同时用于 Skill 与 custom_nodes 项目检测：AI 审核把内容当作不可信数据交给模型判断风险，不会执行其中的指令；模型不可用时自动回退静态检测。AI/静态+AI 每次保存、接管或单项目检测会产生一次模型调用，「全部检测（不消耗模型）」始终只用静态规则。改完记得点击页面底部的「保存设置」。"));
 
+  area.appendChild(el("p", "cline-hint", "工作流搜索会使用这里的区域设置。选择国内站或国外站后，不需要依赖本机公网 IP 判断；选择自动时才会读取公网 IP 和地理服务地址。聊天中说“国内/国外”也只对当前搜索请求临时生效。"));
+
   const stats = state.contextStats;
   const contextLabel = el("p", stats?.above_compaction_threshold ? "cline-hint cline-error" : "cline-hint", contextSummaryText(stats));
   const hint = el("p", "cline-hint cline-settings-status", settings.api_key_configured
@@ -1524,6 +2066,8 @@ function renderSettings() {
       const values = Object.fromEntries([...area.querySelectorAll("input")].map((input) => [input.name, input.value]));
       const provider = area.querySelector("select[name=provider]");
       if (provider) values.provider = provider.value;
+      const region = area.querySelector("select[name=network_region]");
+      if (region) values.network_region = region.value;
       const securityMode = area.querySelector("select[name=skill_security_mode]");
       if (securityMode) values.skill_security_mode = securityMode.value;
       state.settings = await request("/cline/settings", { method: "POST", body: JSON.stringify(values) });

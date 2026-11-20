@@ -20,6 +20,14 @@ from .util import (
 from .workspace import Workspace
 
 
+DEFAULT_RUNNINGHUB_DOMESTIC = "https://www.runninghub.cn"
+DEFAULT_RUNNINGHUB_INTERNATIONAL = "https://www.runninghub.ai"
+DEFAULT_HUGGINGFACE_DOMESTIC = "https://hf-mirror.com"
+DEFAULT_HUGGINGFACE_INTERNATIONAL = "https://huggingface.co"
+DEFAULT_PUBLIC_IP_URL = "https://ipapi.co/json/"
+DEFAULT_IP_GEOLOCATION_URL = "https://ipapi.co/{ip}/json/"
+
+
 class SettingsStore:
     """Small local settings file; API keys are never returned by GET settings."""
 
@@ -61,6 +69,17 @@ class SettingsStore:
             "api_base_url": api_base_url,
             "browser_cdp_url": data.get("browser_cdp_url") or "auto",
             "global_network_enabled": bool(data.get("global_network_enabled")),
+            "network_region": str(data.get("network_region") or "domestic"),
+            "runninghub_domestic_base_url": DEFAULT_RUNNINGHUB_DOMESTIC,
+            "runninghub_international_base_url": DEFAULT_RUNNINGHUB_INTERNATIONAL,
+            "runninghub_search_path": str(data.get("runninghub_search_path") or "/api/search/workflow"),
+            "runninghub_workflow_path": str(data.get("runninghub_workflow_path") or "/api/workflow/export"),
+            "huggingface_domestic_base_url": str(data.get("huggingface_domestic_base_url") or DEFAULT_HUGGINGFACE_DOMESTIC),
+            "huggingface_international_base_url": str(
+                data.get("huggingface_international_base_url") or DEFAULT_HUGGINGFACE_INTERNATIONAL
+            ),
+            "ip_geolocation_url": str(data.get("ip_geolocation_url") or DEFAULT_IP_GEOLOCATION_URL),
+            "public_ip_url": str(data.get("public_ip_url") or DEFAULT_PUBLIC_IP_URL),
             "skill_security_mode": skill_security.resolve_review_mode(data),
             "skill_security_model": str(data.get("skill_security_model") or "").strip(),
             "model": data.get("model") or paths.DEFAULT_MODEL,
@@ -70,17 +89,37 @@ class SettingsStore:
             ),
             "workspace": workspace,
             "comfyui_directory": comfyui,
+            "comfyui_server_url": str(data.get("comfyui_server_url") or "http://127.0.0.1:8188"),
             "api_key_configured": bool(data.get("api_key") or paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
             "api_key_from_environment": bool(paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
         }
 
     def update(self, values: dict[str, Any]) -> dict[str, Any]:
         current = self.load()
-        for key in ("api_base_url", "model", "workspace", "comfyui_directory", "browser_cdp_url"):
+        for key in (
+            "api_base_url",
+            "model",
+            "workspace",
+            "comfyui_directory",
+            "comfyui_server_url",
+            "browser_cdp_url",
+            "network_region",
+            "runninghub_search_path",
+            "runninghub_workflow_path",
+            "huggingface_domestic_base_url",
+            "huggingface_international_base_url",
+            "ip_geolocation_url",
+            "public_ip_url",
+        ):
             if key in values and values[key] is not None:
                 current[key] = str(values[key]).strip()
         if "global_network_enabled" in values and values["global_network_enabled"] is not None:
             current["global_network_enabled"] = bool(values["global_network_enabled"])
+        if "network_region" in values and values["network_region"] is not None:
+            region = str(values["network_region"]).strip().lower()
+            if region not in {"auto", "domestic", "international"}:
+                raise ValueError("网络区域只能是 auto、domestic 或 international。")
+            current["network_region"] = region
         if "skill_security_mode" in values and values["skill_security_mode"] is not None:
             mode = str(values["skill_security_mode"]).strip().lower()
             if mode not in skill_security.REVIEW_MODES:

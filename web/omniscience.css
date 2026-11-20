@@ -88,6 +88,35 @@
 .cline-node-install-actions button { flex: 1 1 50%; padding: 5px 6px; font-size: 11px; }
 .cline-node-install-status { margin: 8px 0 0; font-size: 11px; line-height: 1.5; }
 .cline-node-install .cline-hint { margin: 6px 0 0; font-size: 10px; line-height: 1.5; }
+.cline-settings-readonly { margin: 4px 0; color: #8f89a5; font-size: 11px; word-break: break-all; }
+.cline-tool-result-details { margin: 4px 0; border: 1px solid #45405a; border-radius: 6px; padding: 6px 8px; color: #aaa5b8; background: #211f2b; }
+.cline-tool-result-details summary { color: #c8c2da; cursor: pointer; font-size: 11px; }
+.cline-tool-result-body { max-height: 360px; overflow: auto; margin-top: 6px; }
+.cline-tool-result-body .cline-line { white-space: pre-wrap; word-break: break-word; }
+.cline-workflow-candidates { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.cline-workflow-candidates-title { color: #d9d2ee; font-size: 12px; }
+.cline-workflow-candidate { border: 1px solid #494260; border-radius: 7px; padding: 9px; background: #25222f; }
+.cline-workflow-candidate.selected { border-color: #4d9b79; background: #21382f; }
+.cline-workflow-candidate-title { display: block; color: #eee9fa; }
+.cline-workflow-candidate-description, .cline-workflow-candidate-meta { margin: 5px 0; color: #aaa5b8; font-size: 11px; line-height: 1.45; }
+.cline-workflow-select { margin-top: 4px; padding: 4px 8px; font-size: 11px; }
+.cline-workflow-no-results { margin-top: 8px; padding: 9px; border: 1px solid #5c5068; border-radius: 7px; background: #29242f; }
+.cline-workflow-develop { padding: 5px 9px; font-size: 11px; }
+.cline-workflow-execute { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
+.cline-workflow-load-canvas { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
+.cline-workflow-candidate.completed { border-color: #4d9b79; background: #21382f; }
+.cline-workflow-candidate-meta.warning { color: #f0a8a8; }
+.cline-workflow-model-picker { width: 100%; margin: 5px 0; border: 1px solid #4a4560; border-radius: 6px; padding: 6px; color: #ddd8e8; background: #24222d; font-size: 11px; }
+.cline-workflow-model-download { margin-top: 4px; padding: 4px 8px; font-size: 11px; }
+.cline-workflow-local-inventory { margin: 6px 0; padding: 8px; border: 1px solid #49435e; border-radius: 6px; background: #24222d; }
+.cline-workflow-local-inventory-list { max-height: 180px; overflow: auto; margin-top: 5px; color: #cfc8e0; font-size: 11px; white-space: pre-wrap; }
+.cline-workflow-local-inventory.warning { border-color: #756a4c; color: #e3cd92; }
+.cline-workflow-model-download-group { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.cline-workflow-download-progress { display: flex; width: 100%; flex-direction: column; gap: 3px; color: #bdb8ca; font-size: 10px; }
+.cline-workflow-download-progress-bar { width: min(100%, 280px); height: 8px; accent-color: #6dce9b; }
+.cline-workflow-download-progress-label { overflow-wrap: anywhere; }
+.cline-workflow-download-progress.error { color: #f0a8a8; }
+.cline-workflow-remote { color: #8fd0ff; }
 .cline-task-empty { position: relative; z-index: 1; margin: 8px 4px; padding: 8px; border: 1px dashed #49435e; border-radius: 6px; background: #211f2b; text-align: center; }
 .cline-main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
 .cline-toolbar { justify-content: space-between; gap: 8px; padding: 8px 12px 0; }

@@ -26,10 +26,16 @@ class GlobalChatToolMixin:
     def chat_network_allowed(self) -> bool:
         return bool(self.settings.load().get("global_network_enabled"))
 
-    def chat_tools(self, install_requested: bool, node_install_requested: bool = False) -> list[dict[str, Any]]:
+    def chat_tools(
+        self,
+        install_requested: bool,
+        node_install_requested: bool = False,
+        workflow_requested: bool = False,
+    ) -> list[dict[str, Any]]:
         return global_chat_definitions(
             install_requested=install_requested,
             node_install_requested=node_install_requested,
+            workflow_requested=workflow_requested,
             network_enabled=self.chat_network_allowed(),
         )
 

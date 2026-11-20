@@ -105,6 +105,28 @@ class TaskStore:
                     report TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS workflow_jobs (
+                    id TEXT PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    region TEXT NOT NULL DEFAULT '{}',
+                    selected_candidate_id TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workflow_candidates (
+                    job_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    rank INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (job_id, candidate_id),
+                    FOREIGN KEY (job_id) REFERENCES workflow_jobs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS workflow_jobs_updated ON workflow_jobs(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS workflow_candidates_rank ON workflow_candidates(job_id, rank);
                 CREATE INDEX IF NOT EXISTS events_task_seq ON events(task_id, seq);
                 CREATE INDEX IF NOT EXISTS messages_task_seq ON messages(task_id, seq);
                 CREATE INDEX IF NOT EXISTS global_messages_seq ON global_messages(seq);
@@ -195,6 +217,97 @@ class TaskStore:
                 (_now(), task_id),
             )
         return self.get_task(task_id) or {}
+
+    def create_workflow_job(self, query: str, *, region: dict[str, Any] | None = None) -> dict[str, Any]:
+        job_id = uuid.uuid4().hex
+        timestamp = _now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT INTO workflow_jobs(id,query,state,region,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (job_id, str(query), "searching", _json(region or {}), timestamp, timestamp),
+            )
+        return self.get_workflow_job(job_id) or {}
+
+    def get_workflow_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute("SELECT * FROM workflow_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("region", "metadata"):
+            try:
+                value = json.loads(result.get(key) or "{}")
+                result[key] = value if isinstance(value, dict) else {}
+            except json.JSONDecodeError:
+                result[key] = {}
+        return result
+
+    def update_workflow_job(self, job_id: str, **values: Any) -> dict[str, Any]:
+        allowed = {"state", "region", "selected_candidate_id", "error", "metadata"}
+        updates: list[str] = []
+        parameters: list[Any] = []
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            if key in {"region", "metadata"}:
+                value = _json(value if isinstance(value, dict) else {})
+            updates.append(f"{key} = ?")
+            parameters.append(value)
+        if updates:
+            updates.append("updated_at = ?")
+            parameters.extend([_now(), job_id])
+            with self._lock, self._connection() as connection:
+                connection.execute(f"UPDATE workflow_jobs SET {', '.join(updates)} WHERE id = ?", parameters)
+        return self.get_workflow_job(job_id) or {}
+
+    def save_workflow_candidates(self, job_id: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        timestamp = _now()
+        with self._lock, self._connection() as connection:
+            connection.execute("DELETE FROM workflow_candidates WHERE job_id = ?", (job_id,))
+            for rank, candidate in enumerate(candidates):
+                candidate_id = str(candidate.get("id") or "").strip()
+                if not candidate_id:
+                    continue
+                connection.execute(
+                    "INSERT INTO workflow_candidates(job_id,candidate_id,payload,rank,created_at) VALUES(?,?,?,?,?)",
+                    (job_id, candidate_id, _json(candidate), rank, timestamp),
+                )
+        return self.workflow_candidates(job_id)
+
+    def workflow_candidates(self, job_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM workflow_candidates WHERE job_id = ? ORDER BY rank", (job_id,)
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                value = json.loads(row["payload"])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                result.append(value)
+        return result
+
+    def workflow_candidate(self, job_id: str, candidate_id: str) -> dict[str, Any] | None:
+        return next((item for item in self.workflow_candidates(job_id) if item.get("id") == candidate_id), None)
+
+    def latest_selected_workflow_job(self) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_jobs WHERE selected_candidate_id != '' ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("region", "metadata"):
+            try:
+                value = json.loads(result.get(key) or "{}")
+                result[key] = value if isinstance(value, dict) else {}
+            except json.JSONDecodeError:
+                result[key] = {}
+        return result
+
 
     def delete_task(self, task_id: str) -> bool:
         """Delete one task and its dependent history, never its project files."""

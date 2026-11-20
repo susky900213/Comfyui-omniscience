@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from .. import paths
@@ -24,11 +25,12 @@ from .github_skill import GitHubSkillInstaller
 from .global_tools import GlobalChatToolMixin
 from .legacy import ClineAgent
 from .node_install import NodeInstallerMixin
+from ..workflow_manager import WorkflowManagerMixin
 
 logger = logging.getLogger("Comfyui-omniscience")
 
 
-class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMixin):
+class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMixin, WorkflowManagerMixin):
     def __init__(self, settings: SettingsStore):
         self.settings = settings
         self.store = TaskStore(paths.TASK_DATABASE)
@@ -36,6 +38,43 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
         self.model = ClineAgent(settings)
         self.browser = browser_manager(self.settings.load)
         self._lock = asyncio.Lock()
+        self._model_download_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._model_download_locks: dict[str, asyncio.Lock] = {}
+        self._model_download_progress: dict[tuple[str, str], dict[str, Any]] = {}
+        self._model_download_cancel_events: dict[tuple[str, str], Any] = {}
+
+    @staticmethod
+    def _region_from_text(text: str) -> str | None:
+        if re.search(r"国内|中国站|国内站", str(text or "")):
+            return "domestic"
+        if re.search(r"国外|国际站|海外", str(text or "")):
+            return "international"
+        return None
+
+    def _workflow_region(self, text: str) -> str | None:
+        current = self._region_from_text(text)
+        if current:
+            return current
+        for message in reversed(self.store.global_messages()):
+            if message.get("role") != "user":
+                continue
+            previous = self._region_from_text(str(message.get("content") or ""))
+            if previous:
+                return previous
+        return None
+
+    @staticmethod
+    def _tool_catalog(tools: list[dict[str, Any]]) -> str:
+        lines = ["\n\n## 本轮可用工具说明", "只调用与用户请求直接相关的工具；工具返回结果是真实执行结果，不要凭空声称成功。"]
+        for tool in tools:
+            function = tool.get("function") or {}
+            name = str(function.get("name") or "unknown")
+            description = str(function.get("description") or "未提供说明").strip()
+            parameters = function.get("parameters") or {}
+            properties = parameters.get("properties") if isinstance(parameters, dict) else {}
+            arguments = ", ".join(str(key) for key in properties or {}) or "无参数"
+            lines.append(f"- {name}（参数：{arguments}）：{description}")
+        return "\n".join(lines)
 
     @staticmethod
     def _model_messages(messages: list[dict[str, Any]], context: str = "") -> list[dict[str, Any]]:
@@ -87,15 +126,30 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                 GLOBAL_CHAT_SYSTEM_PROMPT + self.chat_prompt_note() + skill_prompt(self.selected_skills(selected_skill_ids))
             )
             node_install_requested = self._explicit_node_install_request(text)
+            workflow_requested = self.workflow_search_requested(text)
             # A node request must not also offer the Skill installer: the same
             # "install <github link>" phrasing matches both, and the wrong tool
             # would write to the other library.
             install_requested = self._explicit_install_request(text) and not node_install_requested
-            tools = self.chat_tools(install_requested, node_install_requested)
+            tools = self.chat_tools(install_requested, node_install_requested, workflow_requested)
+            system_prompt += self._tool_catalog(tools)
+            tool_names = [tool.get("function", {}).get("name") for tool in tools]
+            search_injected = "search_runninghub_workflows" in tool_names
+            logger.info(
+                "[global-chat-tools] workflow_requested=%s search_runninghub_workflows_injected=%s tools=%s",
+                workflow_requested,
+                search_injected,
+                tool_names,
+            )
+            print(
+                f"[omniscience] global-chat tools: workflow_requested={workflow_requested} "
+                f"search_runninghub_workflows_injected={search_injected} tools={tool_names}",
+                flush=True,
+            )
             # "required" only forces the very first call; once a tool result
             # is in the transcript the model must answer with text, otherwise
             # providers keep re-invoking the tool until the step limit.
-            force_tool = install_requested or node_install_requested
+            force_tool = install_requested or node_install_requested or workflow_requested
             for _ in range(MAX_GLOBAL_CHAT_STEPS):
                 model_messages = self._model_messages(self.store.global_messages(), extra_context)
                 reserved = ContextManager.estimate_tokens(system_prompt) + ContextManager.estimate_tokens(
@@ -111,6 +165,23 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                 choice = (response.get("choices") or [{}])[0]
                 assistant = choice.get("message") or {}
                 calls = assistant.get("tool_calls") or []
+                if not calls and force_tool and workflow_requested:
+                    try:
+                        selected_job = self.store.latest_selected_workflow_job()
+                        inspect_request = bool(re.search(r"获取|详情|文件|依赖|下载|选定|已选择|拉取", text))
+                        if selected_job and inspect_request:
+                            result = await self.inspect_latest_selected_workflow()
+                        else:
+                            result = await self.search_runninghub_workflows(
+                                text, region=self._workflow_region(text)
+                            )
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                    self.store.append_global_message(
+                        {"role": "tool", "tool_call_id": "workflow-search-fallback", "content": json_text(result)}
+                    )
+                    force_tool = False
+                    continue
                 if not calls:
                     assistant_message = {
                         "role": "assistant",
@@ -138,8 +209,27 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                                 raise ValueError("只有在用户明确请求安装节点时才允许调用此工具。")
                             source = arguments.get("source")
                             if not self._install_node_source_allowed(text, source):
-                                raise ValueError("工具参数必须对应用户明确给出的 GitHub 地址或已上传的节点压缩包。")
+                                raise ValueError("工具参数必须对应用户明确给出的 GitHub/Gitee 地址或已上传的节点压缩包。")
                             result = await self.install_comfyui_node(source)
+                        elif tool_name == "search_runninghub_workflows":
+                            if not workflow_requested:
+                                raise ValueError("只有在用户明确请求查找工作流时才允许调用此工具。")
+                            result = await self.search_runninghub_workflows(
+                                arguments.get("query") or text,
+                                limit=arguments.get("limit", 10),
+                                filters=arguments.get("filters"),
+                                region=self._workflow_region(text),
+                            )
+                        elif tool_name == "inspect_runninghub_workflow":
+                            if not workflow_requested:
+                                raise ValueError("只有在工作流搜索上下文中才允许检查候选工作流。")
+                            job_id = str(arguments.get("job_id") or "").strip()
+                            candidate_id = str(arguments.get("candidate_id") or "").strip()
+                            job = self.store.get_workflow_job(job_id)
+                            selected = self.store.workflow_candidate(job_id, candidate_id)
+                            if selected is None or not job or job.get("selected_candidate_id") != candidate_id:
+                                raise ValueError("候选工作流不存在或尚未被用户选择。")
+                            result = await self.inspect_selected_workflow(job_id)
                         else:
                             result = await self.execute_chat_tool(tool_name, arguments)
                     except Exception as exc:

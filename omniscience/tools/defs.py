@@ -7,7 +7,7 @@ through ``build_definitions``.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -162,6 +162,29 @@ GLOBAL_CHAT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 # Read-only browsing subset for the global conversation (no click/fill).
 GLOBAL_CHAT_BROWSER_TOOL_DEFINITIONS: list[dict[str, Any]] = BROWSER_TOOL_DEFINITIONS[:3]
 
+GLOBAL_CHAT_WORKFLOW_DEFINITIONS: list[dict[str, Any]] = [
+    _function(
+        "search_runninghub_workflows",
+        "Search RunningHub domestic or international sites for ComfyUI workflow candidates. Call only when the user explicitly asks to find or recommend a workflow. Return ranked candidates and wait for the user to select one; never install before selection.",
+        {
+            "query": {"type": "string", "description": "Your chosen concise RunningHub search keywords based on the user's workflow requirement. Preserve the important project/model/task terms; omit polite wording and generic wrapper words."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            "filters": {"type": "object", "additionalProperties": True},
+        },
+        ["query"],
+    ),
+    _function(
+        "inspect_runninghub_workflow",
+        "Download and inspect a user-selected RunningHub workflow using its persisted job_id and candidate_id. Return workflow format, node classes, missing loaded nodes, and model references. Call only after the user explicitly selects a candidate; do not install dependencies or execute it.",
+        {
+            "job_id": {"type": "string"},
+            "candidate_id": {"type": "string"},
+        },
+        ["job_id", "candidate_id"],
+    ),
+]
+
+
 GLOBAL_CHAT_FILE_TOOL_DEFINITIONS: list[dict[str, Any]] = FILE_TOOL_DEFINITIONS
 
 GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
@@ -169,7 +192,7 @@ GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
         "install_comfyui_node",
         (
             "Install one ComfyUI custom node project into ComfyUI/custom_nodes. Call only when the user "
-            "explicitly asked to install a node. Pass the exact public GitHub repository or tree-folder link "
+            "explicitly asked to install a node. Pass the exact public GitHub/Gitee repository or tree-folder link "
             "they provided, or the workspace path of a node archive they uploaded (for example "
             "uploads/my-node.zip). The package is staged outside custom_nodes, security-scanned with the "
             "engine the user configured, then copied in; the result carries the verdict and findings. "
@@ -181,7 +204,7 @@ GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
         {
             "source": {
                 "type": "string",
-                "description": "The user's https://github.com/OWNER/REPO (or /tree/REF/FOLDER) link, or an uploaded archive path such as uploads/name.zip.",
+                "description": "The user's https://github.com/OWNER/REPO or https://gitee.com/OWNER/REPO (optionally /tree/REF/FOLDER), or an uploaded archive path such as uploads/name.zip.",
             }
         },
         ["source"],
@@ -194,6 +217,7 @@ def global_chat_definitions(
     install_requested: bool,
     network_enabled: bool,
     node_install_requested: bool = False,
+    workflow_requested: bool = False,
 ) -> list[dict[str, Any]]:
     """Tool surface for the task-independent conversation."""
     tools: list[dict[str, Any]] = list(GLOBAL_CHAT_FILE_TOOL_DEFINITIONS)
@@ -201,6 +225,8 @@ def global_chat_definitions(
         tools += GLOBAL_CHAT_TOOL_DEFINITIONS
     if node_install_requested:
         tools += GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS
+    if workflow_requested:
+        tools += GLOBAL_CHAT_WORKFLOW_DEFINITIONS
     if network_enabled:
         tools += GLOBAL_CHAT_BROWSER_TOOL_DEFINITIONS
     return tools

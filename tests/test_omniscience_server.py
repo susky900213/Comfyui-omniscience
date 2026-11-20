@@ -10,6 +10,7 @@ import stat
 import sys
 import tarfile
 import zipfile
+from threading import Event
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -23,6 +24,7 @@ from omniscience_server import (
     apply_unified_patch,
 )
 from omniscience import archives, node_review, node_security, skill_review, skill_security
+from omniscience import model_downloader, model_source, node_search, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
 from omniscience_mcp import MCPManager
@@ -199,6 +201,31 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(store.public()["browser_cdp_url"], "auto")
             public = store.update({"workspace": str(workspace), "browser_cdp_url": "http://127.0.0.1:9222"})
             self.assertEqual(public["browser_cdp_url"], "http://127.0.0.1:9222")
+
+    def test_huggingface_domestic_mirror_is_default_and_configurable(self):
+        from omniscience.region_router import RegionRouter
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "config.json")
+            public = store.public()
+            self.assertEqual(public["huggingface_domestic_base_url"], "https://hf-mirror.com")
+            endpoint, decision = RegionRouter(store).endpoint("huggingface", region="domestic")
+            self.assertEqual(endpoint, "https://hf-mirror.com")
+            self.assertEqual(decision.selected_region, "domestic")
+            self.assertEqual(public["huggingface_international_base_url"], "https://huggingface.co")
+            endpoint, decision = RegionRouter(store).endpoint("huggingface", region="international")
+            self.assertEqual(endpoint, "https://huggingface.co")
+            self.assertEqual(decision.selected_region, "international")
+
+            public = store.update({"huggingface_domestic_base_url": "https://models.example"})
+            self.assertEqual(public["huggingface_domestic_base_url"], "https://models.example")
+            endpoint, _decision = RegionRouter(store).endpoint("huggingface", region="domestic")
+            self.assertEqual(endpoint, "https://models.example")
+
+            public = store.update({"huggingface_international_base_url": "https://hf.example"})
+            self.assertEqual(public["huggingface_international_base_url"], "https://hf.example")
+            endpoint, _decision = RegionRouter(store).endpoint("huggingface", region="international")
+            self.assertEqual(endpoint, "https://hf.example")
 
     def test_browser_manager_reads_live_settings(self):
         from omniscience_browser import BrowserManager
@@ -1403,6 +1430,46 @@ class NodeInstallerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sorted(agent.store.node_scans()), [str(target.resolve())])
             self.assertEqual(list(Path(tempfile.gettempdir()).glob("omniscience-node-*")), [])
 
+    def test_requirements_are_never_installed_implicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, nodes = self._agent(Path(directory))
+            package = self._tar({"__init__.py": self.CLEAN, "requirements.txt": "not-a-real-package\n"})
+            with self._github(package):
+                result = asyncio.run(agent.install_comfyui_node("https://github.com/acme/requirements-node"))
+            self.assertEqual(result["status"], "installed")
+            self.assertTrue((nodes / "requirements-node" / "requirements.txt").is_file())
+
+    def test_workflow_node_source_must_export_requested_class(self):
+        valid = "NODE_CLASS_MAPPINGS = {'LoadMoss': LoadMoss}\n"
+        invalid = "NODE_CLASS_MAPPINGS = {'OtherNode': OtherNode}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "__init__.py").write_text(valid, encoding="utf-8")
+            self.assertTrue(node_install.NodeInstallerMixin._exports_node_class(root, "LoadMoss"))
+            self.assertFalse(node_install.NodeInstallerMixin._exports_node_class(root, "MissingNode"))
+            (root / "__init__.py").write_text(invalid, encoding="utf-8")
+            self.assertFalse(node_install.NodeInstallerMixin._exports_node_class(root, "LoadMoss"))
+
+    def test_workflow_source_pin_requires_a_commit_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _nodes = self._agent(Path(directory))
+            with patch.object(node_install.NodeInstallerMixin, "_github_default_branch", return_value="main"):
+                with self.assertRaisesRegex(ValueError, "固定的 40 位"):
+                    asyncio.run(agent.install_comfyui_node("https://github.com/acme/demo", pin_commit=True))
+
+    def test_review_verdict_is_blocked_before_writing_to_custom_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, nodes = self._agent(Path(directory))
+            package = self._tar({"__init__.py": self.CLEAN})
+            review = {"verdict": "review", "severity": "medium", "findings": [{"title": "需要复核", "severity": "medium"}]}
+            with self._github(package), patch.object(node_review, "review_mode", return_value="ai"), patch.object(
+                node_review, "review", AsyncMock(return_value=review)
+            ):
+                with self.assertRaises(node_install.NodeSecurityBlockedError) as caught:
+                    asyncio.run(agent.install_comfyui_node("https://github.com/acme/review-node"))
+            self.assertEqual(caught.exception.report["verdict"], "review")
+            self.assertEqual(list(nodes.iterdir()), [])
+
     def test_blocked_package_is_refused_and_nothing_is_written(self):
         with tempfile.TemporaryDirectory() as directory:
             agent, nodes = self._agent(Path(directory))
@@ -1534,6 +1601,56 @@ class NodeInstallerTests(unittest.IsolatedAsyncioTestCase):
             ("Acme", "Demo", "sub", "v1.2"),
         )
 
+    def test_gitee_links_are_validated_and_github_parser_rejects_them(self):
+        self.assertEqual(
+            node_install.NodeInstallerMixin._node_repository_source("https://gitee.com/Acme/Demo.git/tree/v1.2/sub"),
+            ("gitee.com", "Acme", "Demo", "sub", "v1.2"),
+        )
+        with self.assertRaises(ValueError):
+            node_install.NodeInstallerMixin._github_node_source("https://gitee.com/Acme/Demo")
+        for source in (
+            "http://gitee.com/acme/demo",
+            "https://evil.example/acme/demo",
+            "https://user:pw@gitee.com/acme/demo",
+            "https://gitee.com/acme/demo/tree/main/../secret",
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                node_install.NodeInstallerMixin._node_repository_source(source)
+
+    def test_gitee_commit_uses_only_the_top_level_commit_sha(self):
+        commit = "a" * 40
+        with patch.object(node_install.NodeInstallerMixin, "_gitee_json", return_value={"sha": commit}) as request:
+            self.assertEqual(
+                node_install.NodeInstallerMixin._repository_commit("gitee.com", "acme", "demo", "main"),
+                commit,
+            )
+        self.assertIn("/repos/acme/demo/commits/main", request.call_args.args[0])
+        with patch.object(
+            node_install.NodeInstallerMixin,
+            "_gitee_json",
+            return_value={"commit": {"tree": {"sha": commit}}},
+        ):
+            with self.assertRaisesRegex(ValueError, "没有返回有效提交哈希"):
+                node_install.NodeInstallerMixin._repository_commit("gitee.com", "acme", "demo", "main")
+
+    def test_gitee_archive_uses_validated_archive_endpoint_and_redirect_handler(self):
+        response = unittest.mock.MagicMock()
+        response.geturl.return_value = "https://gitee.com/acme/demo/repository/archive/" + "a" * 40 + ".zip"
+        response.read.return_value = b"archive"
+        response.__enter__.return_value = response
+        with patch.object(node_install, "build_opener") as build:
+            build.return_value.open.return_value.__enter__.return_value = response
+            package = node_install.NodeInstallerMixin._repository_archive("gitee.com", "acme", "demo", "a" * 40)
+        self.assertEqual(package, b"archive")
+        archive_url = build.return_value.open.call_args.args[0].full_url
+        self.assertEqual(archive_url, "https://gitee.com/acme/demo/repository/archive/" + "a" * 40 + ".zip")
+        handler = build.call_args.args[0]
+        self.assertIsInstance(handler, node_install._GiteeRedirectHandler)
+        redirect_request = unittest.mock.Mock()
+        for url in ("https://evil.example/archive.zip", "http://gitee.com/archive.zip"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                handler.redirect_request(redirect_request, None, 302, "Found", {}, url)
+
 
 class NodeInstallRequestTests(unittest.TestCase):
     """The install tool is offered only for an explicit node request, on the named source."""
@@ -1560,6 +1677,10 @@ class NodeInstallRequestTests(unittest.TestCase):
             GlobalChatAgent._requested_node_source("安装节点 acme/demo-node"),
             "https://github.com/acme/demo-node",
         )
+        self.assertEqual(
+            GlobalChatAgent._requested_node_source("安装节点 https://gitee.com/acme/demo-node"),
+            "https://gitee.com/acme/demo-node",
+        )
 
     def test_the_model_cannot_choose_a_different_source(self):
         text = "安装节点 https://github.com/acme/demo-node"
@@ -1567,10 +1688,949 @@ class NodeInstallRequestTests(unittest.TestCase):
         self.assertTrue(GlobalChatAgent._install_node_source_allowed(text, "https://github.com/acme/demo-node/tree/main/tools"))
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(text, "https://github.com/evil/other"))
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(text, "uploads/anything.zip"))
+        gitee_text = "安装节点 https://gitee.com/acme/demo-node"
+        self.assertTrue(GlobalChatAgent._install_node_source_allowed(gitee_text, "https://gitee.com/acme/demo-node"))
+        self.assertFalse(GlobalChatAgent._install_node_source_allowed(gitee_text, "https://github.com/acme/demo-node"))
         self.assertTrue(GlobalChatAgent._install_node_source_allowed("安装节点 uploads/a.zip", "uploads/a.zip"))
         archive = "安装节点 @uploads/pkg.zip 这个压缩包"
         self.assertTrue(GlobalChatAgent._install_node_source_allowed(archive, "uploads/pkg.zip"))
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(archive, "uploads/other.zip"))
+
+
+class GitHubNodeSearchTests(unittest.TestCase):
+    def test_search_returns_only_canonical_github_repository_candidates(self):
+        payload = {
+            "items": [
+                {
+                    "full_name": "Acme/Comfy-Node",
+                    "html_url": "https://github.com/Acme/Comfy-Node",
+                    "description": "A node",
+                    "stargazers_count": 12,
+                    "language": "Python",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "full_name": "attacker/other",
+                    "html_url": "https://evil.example/attacker/other",
+                },
+                {
+                    "full_name": "acme/strange",
+                    "html_url": "https://github.com/acme/strange/tree/main/subdir",
+                },
+            ]
+        }
+        with patch.object(node_search.GitHubSkillInstaller, "_github_request", return_value=payload) as request:
+            results = node_search.GitHubNodeSearcher.search("LoadMoss", limit=99)
+        self.assertEqual([item["source"] for item in results], ["https://github.com/Acme/Comfy-Node"])
+        self.assertEqual(results[0]["stars"], 12)
+        query = request.call_args.args[0]
+        self.assertTrue(query.startswith("https://api.github.com/search/repositories?"))
+        self.assertIn("per_page=8", query)
+
+    def test_search_rejects_invalid_class_names(self):
+        for value in ("", "\nmalicious", "x" * 161):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                node_search.GitHubNodeSearcher.search(value)
+
+    def test_gitee_search_returns_only_canonical_public_repository_candidates(self):
+        payload = [
+            {
+                "path_with_namespace": "Acme/Comfy-Node",
+                "html_url": "https://gitee.com/Acme/Comfy-Node",
+                "description": "国内节点",
+                "stars_count": 12,
+                "language": "Python",
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+            {"path_with_namespace": "attacker/other", "html_url": "https://evil.example/attacker/other"},
+            {"path_with_namespace": "Acme/subdir", "html_url": "https://gitee.com/Acme/subdir/tree/main/folder"},
+        ]
+        with patch.object(node_search.GiteeNodeSearcher, "_request", return_value=payload) as request:
+            results = node_search.GiteeNodeSearcher.search("LoadMoss", limit=99)
+        self.assertEqual([item["source"] for item in results], ["https://gitee.com/Acme/Comfy-Node"])
+        self.assertEqual(results[0]["provider"], "gitee")
+        self.assertEqual(results[0]["stars"], 12)
+        self.assertIn("https://gitee.com/api/v5/search/repositories?", request.call_args.args[0])
+        self.assertIn("per_page=8", request.call_args.args[0])
+
+
+class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from omniscience import paths
+
+        self.paths = paths
+        self.previous = (paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        paths.TASK_DATABASE = root / "tasks.sqlite3"
+        paths.SKILL_DATABASE = root / "skills.sqlite3"
+        paths.STATE_DIRECTORY = root / "state"
+        self.agent = GlobalChatAgent(SettingsStore(root / "settings.json"))
+        self.job = self.agent.store.create_workflow_job("workflow needs LoadMoss")
+        self.agent.store.save_workflow_candidates(
+            self.job["id"], [{"id": "candidate", "title": "test", "node_sources": [], "model_sources": []}]
+        )
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            selected_candidate_id="candidate",
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {"missing_nodes": ["LoadMoss"], "unverified_nodes": [], "models": []},
+            },
+        )
+        self.addCleanup(self._restore_paths)
+
+    def _restore_paths(self):
+        self.paths.TASK_DATABASE, self.paths.SKILL_DATABASE, self.paths.STATE_DIRECTORY = self.previous
+
+    async def test_search_and_explicit_source_selection_are_persisted(self):
+        candidates = [{"full_name": "acme/load-moss", "source": "https://github.com/acme/load-moss"}]
+        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=candidates) as search:
+            result = await self.agent.search_workflow_node_sources(self.job["id"])
+        search.assert_called_once_with("LoadMoss")
+        self.assertEqual(result["results"]["LoadMoss"], candidates)
+        with self.assertRaisesRegex(ValueError, "不在本次 Gitee/GitHub 搜索结果"):
+            self.agent.select_workflow_node_source(self.job["id"], "LoadMoss", "https://github.com/evil/repo")
+        selected = self.agent.select_workflow_node_source(
+            self.job["id"], "LoadMoss", "https://github.com/acme/load-moss"
+        )
+        self.assertEqual(selected["status"], "source_selected")
+        plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["nodes"][0]["source"], "https://github.com/acme/load-moss")
+
+    async def test_github_failure_falls_back_to_gitee(self):
+        candidates = [{"full_name": "acme/load-moss", "source": "https://gitee.com/acme/load-moss"}]
+        with patch.object(node_search.GitHubNodeSearcher, "search", side_effect=ValueError("GitHub unavailable")) as github_search, patch.object(
+            node_search.GiteeNodeSearcher, "search", return_value=candidates
+        ) as gitee_search:
+            result = await self.agent.search_workflow_node_sources(self.job["id"])
+        github_search.assert_called_once_with("LoadMoss")
+        gitee_search.assert_called_once_with("LoadMoss")
+        self.assertEqual(result["results"]["LoadMoss"], candidates)
+
+    async def test_github_empty_results_do_not_trigger_gitee_fallback(self):
+        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=[]) as github_search, patch.object(
+            node_search.GiteeNodeSearcher, "search"
+        ) as gitee_search:
+            result = await self.agent.search_workflow_node_sources(self.job["id"])
+        github_search.assert_called_once_with("LoadMoss")
+        gitee_search.assert_not_called()
+        self.assertEqual(result["results"]["LoadMoss"], [])
+
+    async def test_both_search_failures_report_both_providers(self):
+        with patch.object(node_search.GitHubNodeSearcher, "search", side_effect=ValueError("github offline")), patch.object(
+            node_search.GiteeNodeSearcher, "search", side_effect=ValueError("gitee offline")
+        ):
+            with self.assertRaisesRegex(ValueError, "GitHub 搜索失败：github offline；Gitee 搜索失败：gitee offline"):
+                await self.agent.search_workflow_node_sources(self.job["id"])
+
+    async def test_node_search_batches_classes_and_does_not_starve_after_empty_results(self):
+        classes = [f"Node{index}" for index in range(7)]
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {"missing_nodes": classes, "unverified_nodes": [], "models": []},
+            },
+        )
+        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=[]) as search:
+            first = await self.agent.search_workflow_node_sources(self.job["id"])
+            self.assertEqual(search.call_count, 5)
+            self.assertEqual(first["deferred"], 2)
+            second = await self.agent.search_workflow_node_sources(self.job["id"])
+            self.assertEqual(search.call_count, 7)
+            self.assertEqual(set(second["results"]), set(classes))
+            for _ in range(2):
+                await self.agent.search_workflow_node_sources(self.job["id"])
+            self.assertEqual(search.call_count, 17)
+
+    async def test_install_confirmation_requires_source_and_pins_commit(self):
+        with self.assertRaisesRegex(ValueError, "尚未选择 Gitee/GitHub 来源"):
+            await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {"missing_nodes": ["LoadMoss"], "unverified_nodes": [], "models": []},
+                "node_search_results": {
+                    "LoadMoss": [{"full_name": "acme/load-moss", "source": "https://github.com/acme/load-moss"}]
+                },
+            },
+        )
+        self.agent.select_workflow_node_source(self.job["id"], "LoadMoss", "https://github.com/acme/load-moss")
+        self.agent.dependency_plan(self.job["id"])
+        installed = {"status": "installed", "folder": "load-moss", "security": {"verdict": "clean"}}
+        with patch.object(node_install.NodeInstallerMixin, "_repository_default_branch", return_value="main"), patch.object(
+            node_install.NodeInstallerMixin, "_repository_commit", return_value="a" * 40
+        ), patch.object(self.agent, "install_comfyui_node", AsyncMock(return_value=installed)) as install:
+            result = await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+        self.assertEqual(result["nodes"], [installed])
+        install.assert_awaited_once_with(
+            "https://github.com/acme/load-moss/tree/" + "a" * 40,
+            pin_commit=True,
+            acknowledged=False,
+            expected_class_type="LoadMoss",
+        )
+
+    async def test_security_override_is_scoped_to_one_named_node(self):
+        with patch.object(self.agent, "install_comfyui_node", AsyncMock(side_effect=[
+            node_install.NodeSecurityBlockedError("risk", {"verdict": "review", "findings": []}),
+            {"status": "installed", "security": {"verdict": "clean"}},
+        ])) as install:
+            self.agent.store.update_workflow_job(
+                self.job["id"],
+                metadata={
+                    "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                    "inspection": {"missing_nodes": ["LoadMoss"], "unverified_nodes": [], "models": []},
+                    "node_source_selections": {"LoadMoss": {"source": "https://github.com/acme/load-moss", "commit": "a" * 40}},
+                    "dependency_plan": {"nodes": [{"class_type": "LoadMoss", "source": "https://github.com/acme/load-moss/tree/" + "a" * 40}], "models": []},
+                },
+            )
+            with self.assertRaises(node_install.NodeSecurityBlockedError):
+                await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+            self.agent.store.update_workflow_job(
+                self.job["id"],
+                metadata={
+                    "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                    "inspection": {"missing_nodes": ["LoadMoss"], "unverified_nodes": [], "models": []},
+                    "node_source_selections": {"LoadMoss": {"source": "https://github.com/acme/load-moss", "commit": "a" * 40}},
+                    "dependency_plan": {"nodes": [{"class_type": "LoadMoss", "source": "https://github.com/acme/load-moss/tree/" + "a" * 40}], "models": []},
+                },
+            )
+            result = await self.agent.confirm_node_installation(
+                self.job["id"], confirmed=True, acknowledge_security_for="LoadMoss"
+            )
+        self.assertEqual(result["nodes"][0]["security"]["verdict"], "clean")
+        self.assertEqual(install.await_count, 2)
+        self.assertFalse(install.await_args_list[0].kwargs["acknowledged"])
+        self.assertTrue(install.await_args_list[1].kwargs["acknowledged"])
+
+
+class WorkflowExecutorTests(unittest.TestCase):
+    def test_folder_paths_accepts_string_lists_and_discards_malformed_entries(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(
+            executor,
+            "_json",
+            return_value={"vae": ["/models/vae", "", 123], "invalid": "not-a-list", "empty": []},
+        ):
+            self.assertEqual(
+                executor.folder_paths(),
+                {"vae": ["/models/vae"], "empty": []},
+            )
+
+    def test_folder_paths_rejects_non_object_response(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(executor, "_json", return_value=["/models/vae"]), self.assertRaisesRegex(
+            workflow_executor.WorkflowExecutionError, "返回格式无效"
+        ):
+            executor.folder_paths()
+
+    def test_folder_paths_rejects_non_list_values_when_payload_is_not_empty(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(executor, "_json", return_value={"vae": "not-a-list"}), self.assertRaisesRegex(
+            workflow_executor.WorkflowExecutionError, "目录列表格式无效"
+        ):
+            executor.folder_paths()
+
+    def test_folder_paths_allows_empty_response_for_manager_fallback(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(executor, "_json", return_value={}):
+            self.assertEqual(executor.folder_paths(), {})
+
+
+class SearchEngineModelSourceTests(unittest.TestCase):
+    def test_search_engine_is_selected_by_region_and_hf_result_is_normalized(self):
+        from types import SimpleNamespace
+
+        searcher = model_source.ModelSourceSearcher({})
+        html = """
+        <html><body>
+          <a href="https://evil.example/acme/flux/blob/main/flux2-vae.safetensors">untrusted</a>
+          <a href="https://huggingface.co/acme/flux/blob/main/vae/flux2-vae.safetensors">Flux VAE</a>
+          <a href="https://huggingface.co/acme/flux/blob/main/other.safetensors">other</a>
+        </body></html>
+        """
+        requested_urls = []
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://hf-mirror.com", SimpleNamespace(selected_region="domestic")),
+        ), patch.object(searcher, "_request_html", side_effect=lambda url: requested_urls.append(url) or html), patch.object(
+            searcher, "_request_json", side_effect=AssertionError("web result should avoid API fallback")
+        ):
+            results = searcher.search("flux2-vae.safetensors")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source_type"], "huggingface_search")
+        self.assertEqual(results[0]["region"], "domestic")
+        self.assertEqual(results[0]["repo_id"], "acme/flux")
+        self.assertEqual(results[0]["filename"], "vae/flux2-vae.safetensors")
+        self.assertTrue(results[0]["source_url"].startswith("https://hf-mirror.com/acme/flux/resolve/main/"))
+        self.assertIn("cn.bing.com/search", requested_urls[0])
+        self.assertIn("first=1", requested_urls[0])
+        self.assertNotIn("site%3Ahuggingface.co", requested_urls[0])
+        self.assertIn("q=flux2-vae.safetensors", requested_urls[0])
+
+    def test_bing_exact_filename_result_and_redirect_are_supported(self):
+        from types import SimpleNamespace
+        from urllib.parse import quote
+
+        searcher = model_source.ModelSourceSearcher({})
+        target = "https://huggingface.co/Qwen/Qwen3.5-9B-GPTQ/blob/main/qwen3.5_9b_w4a8_gptq.safetensors"
+        encoded = base64.urlsafe_b64encode(target.encode("utf-8")).decode("ascii").rstrip("=")
+        html = f'<a href="https://www.bing.com/ck/a?u={quote("a1" + encoded)}">Qwen model</a>'
+        requested_urls = []
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://hf-mirror.com", SimpleNamespace(selected_region="domestic")),
+        ), patch.object(searcher, "_request_html", side_effect=lambda url: requested_urls.append(url) or html), patch.object(
+            searcher, "_request_json", side_effect=AssertionError("web result should avoid API fallback")
+        ):
+            results = searcher.search("qwen3.5_9b_w4a8_gptq.safetensors")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["repo_id"], "Qwen/Qwen3.5-9B-GPTQ")
+        self.assertEqual(results[0]["filename"], "qwen3.5_9b_w4a8_gptq.safetensors")
+        self.assertEqual(results[0]["source_type"], "huggingface_search")
+        self.assertIn("q=qwen3.5_9b_w4a8_gptq.safetensors", requested_urls[0])
+
+    def test_bing_retries_with_huggingface_query_when_general_results_are_irrelevant(self):
+        from types import SimpleNamespace
+
+        searcher = model_source.ModelSourceSearcher({})
+        html = '<a href="https://huggingface.co/Qwen/Qwen3.5-9B-GPTQ/blob/main/qwen3.5_9b_w4a8_gptq.safetensors">Qwen</a>'
+        requested_urls = []
+        responses = ["<html><body><a href=\"https://example.com\">unrelated</a></body></html>", html]
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://hf-mirror.com", SimpleNamespace(selected_region="domestic")),
+        ), patch.object(searcher, "_request_html", side_effect=lambda url: requested_urls.append(url) or responses.pop(0)), patch.object(
+            searcher, "_request_json", side_effect=AssertionError("focused web search should find the file")
+        ):
+            results = searcher.search("qwen3.5_9b_w4a8_gptq.safetensors")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["repo_id"], "Qwen/Qwen3.5-9B-GPTQ")
+        self.assertEqual(len(requested_urls), 2)
+        self.assertIn("q=qwen3.5_9b_w4a8_gptq.safetensors", requested_urls[0])
+        self.assertIn("site%3Ahuggingface.co", requested_urls[1])
+
+    def test_google_and_bing_redirect_unwrapping_keeps_untrusted_hosts_rejected(self):
+        from urllib.parse import quote
+
+        hf_url = "https://huggingface.co/acme/flux/blob/main/flux2-vae.safetensors"
+        google = "https://www.google.com/url?q=" + quote(hf_url)
+        bing = "https://cn.bing.com/ck/a?u=" + quote(hf_url)
+        for redirect in (google, bing, "/ck/a?u=" + quote(hf_url)):
+            with self.subTest(redirect=redirect):
+                source = model_source.ModelSourceSearcher._source_from_huggingface_url(
+                    redirect,
+                    "flux2-vae.safetensors",
+                    endpoint="https://hf-mirror.com",
+                    region="domestic",
+                    source_type="huggingface_search",
+                )
+                self.assertEqual(source["repo_id"], "acme/flux")
+
+        self.assertIsNone(
+            model_source.ModelSourceSearcher._source_from_huggingface_url(
+                "https://www.bing.com/ck/a?u=" + quote("https://evil.example/acme/flux/blob/main/flux2-vae.safetensors"),
+                "flux2-vae.safetensors",
+                endpoint="https://hf-mirror.com",
+                region="domestic",
+                source_type="huggingface_search",
+            )
+        )
+        self.assertIsNone(
+            model_source.ModelSourceSearcher._source_from_huggingface_url(
+                "https://huggingface.co/acme/flux/tree/main/flux2-vae.safetensors",
+                "flux2-vae.safetensors",
+                endpoint="https://hf-mirror.com",
+                region="domestic",
+                source_type="huggingface_search",
+            )
+        )
+
+    def test_search_engine_uses_google_abroad_and_falls_back_to_hf_api(self):
+        from types import SimpleNamespace
+
+        searcher = model_source.ModelSourceSearcher({})
+        requested_urls = []
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://huggingface.co", SimpleNamespace(selected_region="international")),
+        ), patch.object(searcher, "_request_html", side_effect=lambda url: requested_urls.append(url) or "<html></html>"), patch.object(
+            searcher,
+            "_request_json",
+            return_value=[{"id": "acme/flux", "siblings": [{"rfilename": "vae/flux2-vae.safetensors"}]}],
+        ):
+            results = searcher.search("flux2-vae.safetensors")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source_type"], "huggingface_api")
+        self.assertEqual(results[0]["region"], "international")
+        self.assertIn("www.google.com/search", requested_urls[0])
+        self.assertIn("num=8", requested_urls[0])
+        self.assertIn("start=0", requested_urls[0])
+
+
+class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from omniscience import paths
+
+        self.paths = paths
+        self.previous = (paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        paths.TASK_DATABASE = root / "tasks.sqlite3"
+        paths.SKILL_DATABASE = root / "skills.sqlite3"
+        paths.STATE_DIRECTORY = root / "state"
+        self.agent = GlobalChatAgent(SettingsStore(root / "settings.json"))
+        # Do not let these filesystem tests read a real ComfyUI instance that
+        # may be running on the developer machine.
+        self.agent.settings.update({"comfyui_server_url": "http://127.0.0.1:1"})
+        self.job = self.agent.store.create_workflow_job("workflow needs model files")
+        self.agent.store.save_workflow_candidates(
+            self.job["id"], [{"id": "candidate", "title": "test", "node_sources": [], "model_sources": []}]
+        )
+        self.agent.store.update_workflow_job(self.job["id"], selected_candidate_id="candidate")
+        self.addCleanup(self._restore_paths)
+
+    def _restore_paths(self):
+        self.paths.TASK_DATABASE, self.paths.SKILL_DATABASE, self.paths.STATE_DIRECTORY = self.previous
+
+    def _add_missing_models(self, models, model_sources=None):
+        metadata = dict(self.agent.workflow_job(self.job["id"]).get("metadata") or {})
+        metadata["candidate"] = {
+            "id": "candidate", "node_sources": [], "model_sources": model_sources or [],
+        }
+        metadata["inspection"] = {
+            "missing_nodes": [], "unverified_nodes": [],
+            "models": [{"name": name, "field": field, "local_status": "missing"} for name, field in models],
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+    def test_registered_folder_paths_are_preferred_with_category_level_legacy_fallback(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        legacy_vae = comfyui / "models" / "vae"
+        legacy_checkpoints = comfyui / "models" / "checkpoints"
+        registered_vae = Path(self.directory.name) / "shared-models" / "vae"
+        legacy_vae.mkdir(parents=True)
+        legacy_checkpoints.mkdir(parents=True)
+        registered_vae.mkdir(parents=True)
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "folder_paths",
+            return_value={"vae": [str(registered_vae)], "text_encoders": ["relative-is-invalid"]},
+        ):
+            folders, source, warning = self.agent._model_folders(str(comfyui))
+        self.assertEqual(source, "comfyui")
+        self.assertEqual(warning, "")
+        self.assertEqual(folders["vae"], [registered_vae.resolve(), legacy_vae.resolve()])
+        self.assertEqual(folders["checkpoints"], [legacy_checkpoints.resolve()])
+
+    def test_local_model_match_accepts_category_prefix_case_difference_and_default_folder(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        legacy_vae = comfyui / "models" / "vae"
+        legacy_vae.mkdir(parents=True)
+        model_file = legacy_vae / "Flux-VAE.SAFETENSORS"
+        model_file.write_bytes(b"model")
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "folder_paths",
+            return_value={"vae": [str(Path(self.directory.name) / "shared-models" / "vae")]},
+        ):
+            folders, _source, _warning = self.agent._model_folders(str(comfyui))
+        matches = self.agent._local_model_matches(folders, "vae", "models/vae/flux-vae.safetensors")
+        self.assertEqual(matches, [model_file.resolve()])
+
+    def test_local_model_inventory_preserves_symlinked_model_outside_registered_folder(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        registered_vae = Path(self.directory.name) / "shared-models" / "vae"
+        cached_model = Path(self.directory.name) / "model-cache" / "moss-vae.safetensors"
+        comfyui.mkdir()
+        registered_vae.mkdir(parents=True)
+        cached_model.parent.mkdir(parents=True)
+        cached_model.write_bytes(b"cached model")
+        model_link = registered_vae / cached_model.name
+        try:
+            model_link.symlink_to(cached_model)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks are not available in this environment")
+
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "folder_paths",
+            return_value={"vae": [str(registered_vae)]},
+        ):
+            inventory = self.agent.local_model_inventory(self.job["id"])
+            folders, _source, _warning = self.agent._model_folders(str(comfyui))
+
+        self.assertEqual(inventory["count"], 1)
+        self.assertEqual(inventory["by_category"]["vae"], [f"vae/{cached_model.name}"])
+        registered_model_path = registered_vae.resolve() / cached_model.name
+        self.assertEqual(self.agent._local_model_matches(folders, "vae", cached_model.name), [registered_model_path])
+        self.assertEqual(self.agent._selected_local_file(folders, "vae", cached_model.name), registered_model_path)
+
+    def test_local_model_selection_rejects_traversal_even_when_target_exists_outside_folder(self):
+        registered_vae = Path(self.directory.name) / "shared-models" / "vae"
+        cached_model = Path(self.directory.name) / "model-cache" / "outside.safetensors"
+        registered_vae.mkdir(parents=True)
+        cached_model.parent.mkdir(parents=True)
+        cached_model.write_bytes(b"outside model")
+        model_link = registered_vae / cached_model.name
+        try:
+            model_link.symlink_to(cached_model)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks are not available in this environment")
+
+        folders = {"vae": [registered_vae]}
+        self.assertIsNone(
+            self.agent._selected_local_file(folders, "vae", f"../model-cache/{cached_model.name}")
+        )
+
+    def test_sft_models_are_discovered_and_parsed(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        model_file = model_dir / "flux-vae.sft"
+        model_file.write_bytes(b"sft model")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        inventory = self.agent.local_model_inventory(self.job["id"])
+        self.assertEqual(inventory["by_category"]["vae"], ["vae/flux-vae.sft"])
+
+        inspection = inspect_workflow(
+            {"prompt": {"1": {"class_type": "CustomLoader", "inputs": {"weights": "flux-vae.sft"}}}}
+        )
+        self.assertEqual(inspection["models"][0]["name"], "flux-vae.sft")
+
+    def test_empty_registered_folder_response_falls_back_to_legacy_layout(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        (comfyui / "models" / "vae").mkdir(parents=True)
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "folder_paths", return_value={}):
+            folders, source, warning = self.agent._model_folders(str(comfyui))
+        self.assertEqual(source, "legacy")
+        self.assertIn("回退默认 models 目录", warning)
+        self.assertEqual(folders["vae"], [(comfyui / "models" / "vae").resolve()])
+
+    def test_unavailable_registered_folder_endpoint_falls_back_to_legacy_layout(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        (comfyui / "models" / "vae").mkdir(parents=True)
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "folder_paths",
+            side_effect=workflow_executor.WorkflowExecutionError("endpoint unavailable"),
+        ):
+            folders, source, warning = self.agent._model_folders(str(comfyui))
+        self.assertEqual(source, "legacy")
+        self.assertIn("endpoint unavailable", warning)
+        self.assertEqual(folders["vae"], [(comfyui / "models" / "vae").resolve()])
+
+    async def test_model_source_search_requires_exact_file_and_selection_is_whitelisted(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        candidates = [{"repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors", "sha256": "b" * 64}]
+        with patch.object(model_source.ModelSourceSearcher, "search", return_value=candidates) as search:
+            result = await self.agent.search_workflow_model_sources(self.job["id"])
+        search.assert_called_once_with("flux2-vae.safetensors")
+        self.assertEqual(result["results"]["flux2-vae.safetensors"], candidates)
+        with self.assertRaisesRegex(ValueError, "不在本次 Hugging Face 搜索结果"):
+            self.agent.select_workflow_model_source(
+                self.job["id"], "flux2-vae.safetensors",
+                {"repo_id": "evil/fake", "filename": "flux2-vae.safetensors"},
+            )
+        selected = self.agent.select_workflow_model_source(self.job["id"], "flux2-vae.safetensors", candidates[0])
+        self.assertEqual(selected["source"]["category"], "vae")
+        plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["models"][0]["source"]["repo_id"], "acme/flux")
+        self.assertTrue(plan["model_download_ready"])
+
+    async def test_local_model_inventory_is_available_before_remote_search(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "existing-vae.safetensors").write_bytes(b"local model")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        inventory = self.agent.local_model_inventory(self.job["id"])
+        self.assertEqual(inventory["status"], "ok")
+        self.assertEqual(inventory["count"], 1)
+        self.assertEqual(inventory["models"][0]["path"], "vae/existing-vae.safetensors")
+
+        with patch.object(model_source.ModelSourceSearcher, "search") as search:
+            result = await self.agent.search_workflow_model_sources(self.job["id"])
+        search.assert_not_called()
+        self.assertEqual(result["local_results"]["flux2-vae.safetensors"], ["vae/existing-vae.safetensors"])
+        self.assertEqual(result["results"]["flux2-vae.safetensors"], [])
+
+    async def test_remote_model_search_rate_limit_is_non_fatal(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        (comfyui / "models").mkdir(parents=True)
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        with patch.object(
+            model_source.ModelSourceSearcher,
+            "search",
+            side_effect=ValueError("Hugging Face 模型来源搜索失败：HTTP Error 429: Too Many Requests"),
+        ):
+            result = await self.agent.search_workflow_model_sources(self.job["id"])
+        self.assertEqual(result["results"]["flux2-vae.safetensors"], [])
+        self.assertIn("429", result["warnings"]["flux2-vae.safetensors"])
+        self.assertIn("不影响查看和选择本地模型", result["message"])
+
+    async def test_model_download_accepts_one_selected_file_and_preserves_other_models(self):
+        self._add_missing_models([
+            ("moss_image_sft_int8_convrot.safetensors", "model"),
+            ("flux2-vae.safetensors", "vae_name"),
+        ])
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_source_selections"] = {
+            "moss_image_sft_int8_convrot.safetensors": {
+                "repo_id": "acme/moss", "filename": "moss_image_sft_int8_convrot.safetensors",
+                "category": "checkpoints", "sha256": "",
+            },
+            "flux2-vae.safetensors": {
+                "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors",
+                "category": "vae", "sha256": "",
+                "source_url": "https://hf-mirror.com/acme/flux/resolve/main/vae/flux2-vae.safetensors?download=true",
+            },
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+        Path(self.directory.name, "ComfyUI").mkdir()
+        self.agent.settings.update({"comfyui_directory": str(Path(self.directory.name) / "ComfyUI")})
+        paths_old = workflow_manager.paths.STATE_DIRECTORY
+        workflow_manager.paths.STATE_DIRECTORY = Path(self.directory.name) / "state"
+        self.addCleanup(setattr, workflow_manager.paths, "STATE_DIRECTORY", paths_old)
+        downloads = []
+        registered_vae = Path(self.directory.name) / "shared-models" / "vae"
+        link_calls = []
+
+        def fake_download(_self, *, repo_id, filename, category, source_url, **_kwargs):
+            downloads.append((repo_id, filename, category, source_url))
+            cache_path = Path(self.directory.name) / "cache" / filename
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"model")
+            return {"path": str(cache_path), "repo_id": repo_id, "filename": filename, "category": category}
+
+        def fake_link(_self, model_path, **kwargs):
+            link_calls.append({"model_path": model_path, **kwargs})
+            return {"path": "/models/vae/flux2-vae.safetensors"}
+
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "folder_paths", return_value={"vae": [str(registered_vae)]}), patch.object(
+            workflow_manager.ModelDownloader, "download", fake_download
+        ), patch.object(workflow_manager.ModelDownloader, "link_to_comfyui", fake_link):
+            result = await self.agent.confirm_model_download(
+                self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"]
+            )
+        self.assertEqual(downloads, [(
+            "acme/flux", "vae/flux2-vae.safetensors", "vae",
+            "https://hf-mirror.com/acme/flux/resolve/main/vae/flux2-vae.safetensors?download=true",
+        )])
+        self.assertEqual(Path(link_calls[0]["target_root"]).resolve(), registered_vae.resolve())
+        self.assertEqual(result["models"][0]["name"], "flux2-vae.safetensors")
+        self.assertEqual(result["remaining_models"], ["moss_image_sft_int8_convrot.safetensors"])
+
+    async def test_model_download_is_queued_and_status_reports_completion(self):
+        self._add_missing_models(
+            [("flux2-vae.safetensors", "vae_name")],
+        )
+        self.agent.store.update_workflow_job(self.job["id"], metadata={
+            **self.agent.workflow_job(self.job["id"])["metadata"],
+            "model_search_results": {"flux2-vae.safetensors": [{
+                "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors", "sha256": "b" * 64,
+            }]},
+        })
+        self.agent.select_workflow_model_source(self.job["id"], "flux2-vae.safetensors", {
+            "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors",
+        })
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        comfyui.mkdir()
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        paths_old = workflow_manager.paths.STATE_DIRECTORY
+        workflow_manager.paths.STATE_DIRECTORY = Path(self.directory.name) / "state"
+        self.addCleanup(setattr, workflow_manager.paths, "STATE_DIRECTORY", paths_old)
+        lock = asyncio.Lock()
+        await lock.acquire()
+        self.agent._model_download_locks[self.job["id"]] = lock
+
+        def fake_download(_self, *, repo_id, filename, category, **_kwargs):
+            cache_path = Path(self.directory.name) / "cache" / filename
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"model")
+            return {"path": str(cache_path), "repo_id": repo_id, "filename": filename, "category": category}
+
+        with patch.object(workflow_manager.ModelDownloader, "download", fake_download
+        ), patch.object(
+            workflow_manager.ModelDownloader, "link_to_comfyui", return_value={"path": "/models/vae/flux2-vae.safetensors"}
+        ):
+            queued = await self.agent.confirm_model_download(
+                self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"], wait_for_completion=False
+            )
+            self.assertEqual(queued["status"], "downloading")
+            repeated = await self.agent.confirm_model_download(
+                self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"], wait_for_completion=False
+            )
+            self.assertEqual(repeated["status"], "downloading")
+            self.assertEqual(len(self.agent._model_download_tasks), 1)
+            self.assertEqual(self.agent.model_download_status(self.job["id"], "flux2-vae.safetensors")["status"], "downloading")
+            self.agent._model_download_progress[(self.job["id"], "flux2-vae.safetensors")] = {
+                "downloaded_bytes": 5 * 1024 * 1024, "total_bytes": 20 * 1024 * 1024,
+            }
+            status = self.agent.model_download_status(self.job["id"], "flux2-vae.safetensors")
+            self.assertEqual(status["downloaded_bytes"], 5 * 1024 * 1024)
+            self.assertEqual(status["total_bytes"], 20 * 1024 * 1024)
+            lock.release()
+            task = self.agent._model_download_tasks[(self.job["id"], "flux2-vae.safetensors")]
+            await task
+
+        status = self.agent.model_download_status(self.job["id"], "flux2-vae.safetensors")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["model"]["link"]["path"], "/models/vae/flux2-vae.safetensors")
+
+    async def test_model_download_queue_failure_can_be_retried(self):
+        self._add_missing_models(
+            [("flux2-vae.safetensors", "vae_name")],
+        )
+        self.agent.store.update_workflow_job(self.job["id"], metadata={
+            **self.agent.workflow_job(self.job["id"])["metadata"],
+            "model_search_results": {"flux2-vae.safetensors": [{
+                "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors", "sha256": "b" * 64,
+            }]},
+        })
+        self.agent.select_workflow_model_source(self.job["id"], "flux2-vae.safetensors", {
+            "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors",
+        })
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        comfyui.mkdir()
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        result = await self.agent.confirm_model_download(
+            self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"], wait_for_completion=False
+        )
+        task = self.agent._model_download_tasks[(self.job["id"], "flux2-vae.safetensors")]
+        with patch.object(workflow_manager.ModelDownloader, "download", side_effect=OSError("network down")):
+            with self.assertRaises(OSError):
+                await task
+        status = self.agent.model_download_status(self.job["id"], "flux2-vae.safetensors")
+        self.assertEqual(result["status"], "downloading")
+        self.assertEqual(status["status"], "failed")
+
+    async def test_local_model_picker_can_satisfy_dependency_without_download(self):
+        self._add_missing_models([("missing-model.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "existing-vae.safetensors").write_bytes(b"local model")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["workflow"] = {
+            "prompt": {
+                "7": {"class_type": "VAELoader", "inputs": {"vae_name": "missing-model.safetensors"}}
+            }
+        }
+        metadata["inspection"]["models"][0]["nodes"] = ["7"]
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["models"][0]["local_candidates"], ["vae/existing-vae.safetensors"])
+        selected = self.agent.select_workflow_local_model(
+            self.job["id"], "missing-model.safetensors", "vae/existing-vae.safetensors"
+        )
+        self.assertEqual(selected["status"], "local_model_selected")
+        job = self.agent.workflow_job(self.job["id"])
+        self.assertEqual(job["metadata"]["workflow"]["prompt"]["7"]["inputs"]["vae_name"], "existing-vae.safetensors")
+        self.assertEqual(job["metadata"]["local_model_selections"]["missing-model.safetensors"]["category"], "vae")
+        refreshed_plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(refreshed_plan["models"][0]["status"], "selected_local")
+        self.assertEqual(refreshed_plan["missing_models"], [])
+
+    async def test_model_download_refuses_when_no_trusted_source_is_selected(self):
+        self._add_missing_models([("missing-model.safetensors", "model")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        comfyui.mkdir()
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        with self.assertRaisesRegex(ValueError, "没有可信下载来源"):
+            await self.agent.confirm_model_download(
+                self.job["id"], confirmed=True, model_names=["missing-model.safetensors"]
+            )
+
+
+class ModelDownloaderTests(unittest.TestCase):
+    class Response(io.BytesIO):
+        def __init__(self, body, *, status, headers):
+            super().__init__(body)
+            self.status = status
+            self.headers = headers
+
+        def getcode(self):
+            return self.status
+
+    class InterruptedResponse(Response):
+        def __init__(self):
+            super().__init__(b"", status=200, headers={"Content-Length": "6"})
+            self.read_count = 0
+
+        def read(self, size=-1):
+            self.read_count += 1
+            if self.read_count == 1:
+                return b"abc"
+            raise OSError("connection interrupted")
+
+    def test_link_to_comfyui_uses_registered_target_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cache" / "model.safetensors"
+            registered = root / "registered" / "vae"
+            legacy = root / "ComfyUI" / "models"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"model")
+            result = model_downloader.ModelDownloader({}).link_to_comfyui(
+                source,
+                category="vae",
+                models_root=legacy,
+                target_root=registered,
+            )
+            target = registered / source.name
+            self.assertEqual(Path(result["path"]).resolve(), target.resolve())
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(target.resolve(), source.resolve())
+            self.assertFalse((legacy / "vae" / source.name).exists())
+
+    def test_direct_download_resumes_partial_file_with_range_request(self):
+        import hashlib
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory) / "cache"
+            partial = cache_root / "acme" / "model" / "vae.safetensors.part"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"abc")
+            requests = []
+            progress = []
+
+            def opener(request, timeout):
+                requests.append(request)
+                self.assertEqual(timeout, 60)
+                return self.Response(b"def", status=206, headers={
+                    "Content-Range": "bytes 3-5/6", "Content-Length": "3",
+                })
+
+            downloader = model_downloader.ModelDownloader({}, opener=opener)
+            decision = SimpleNamespace(selected_region="international")
+            with patch.object(downloader.router, "endpoint", return_value=("https://huggingface.co", decision)):
+                result = downloader.download(
+                    repo_id="acme/model", filename="vae.safetensors", category="vae",
+                    cache_root=cache_root, expected_sha256=hashlib.sha256(b"abcdef").hexdigest(),
+                    on_progress=lambda downloaded, total: progress.append((downloaded, total)),
+                )
+
+            self.assertEqual(requests[0].get_header("Range"), "bytes=3-")
+            self.assertIn("/acme/model/resolve/main/vae.safetensors", requests[0].full_url)
+            self.assertEqual(Path(result["path"]).read_bytes(), b"abcdef")
+            self.assertFalse(partial.exists())
+            self.assertEqual(progress, [(3, 6), (6, 6)])
+
+    def test_interrupted_download_keeps_partial_for_retry_without_hf_cli(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory) / "cache"
+            requests = []
+            responses = [
+                self.InterruptedResponse(),
+                self.Response(b"def", status=206, headers={
+                    "Content-Range": "bytes 3-5/6", "Content-Length": "3",
+                }),
+            ]
+
+            def opener(request, timeout):
+                requests.append(request)
+                return responses.pop(0)
+
+            downloader = model_downloader.ModelDownloader({}, opener=opener)
+            decision = SimpleNamespace(selected_region="international")
+            with patch.object(downloader.router, "endpoint", return_value=("https://huggingface.co", decision)):
+                with self.assertRaisesRegex(ValueError, "已保留可续传的部分文件"):
+                    downloader.download(
+                        repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                        cache_root=cache_root,
+                    )
+                partial = cache_root / "acme" / "model" / "model.safetensors.part"
+                self.assertEqual(partial.read_bytes(), b"abc")
+                result = downloader.download(
+                    repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                    cache_root=cache_root,
+                )
+
+            self.assertIsNone(requests[0].get_header("Range"))
+            self.assertEqual(requests[1].get_header("Range"), "bytes=3-")
+            self.assertEqual(Path(result["path"]).read_bytes(), b"abcdef")
+            self.assertFalse(partial.exists())
+
+    def test_cancelled_download_keeps_partial_for_range_retry(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory) / "cache"
+            cancel_event = Event()
+            requests = []
+            responses = [
+                self.Response(b"abc", status=200, headers={"Content-Length": "6"}),
+                self.Response(b"def", status=206, headers={
+                    "Content-Range": "bytes 3-5/6", "Content-Length": "3",
+                }),
+            ]
+
+            def opener(request, timeout):
+                requests.append(request)
+                return responses.pop(0)
+
+            downloader = model_downloader.ModelDownloader({}, opener=opener)
+            decision = SimpleNamespace(selected_region="international")
+            with patch.object(downloader.router, "endpoint", return_value=("https://huggingface.co", decision)):
+                with self.assertRaisesRegex(ValueError, "模型下载已取消"):
+                    downloader.download(
+                        repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                        cache_root=cache_root, cancel_event=cancel_event,
+                        on_progress=lambda downloaded, total: cancel_event.set() if downloaded == 3 else None,
+                    )
+                partial = cache_root / "acme" / "model" / "model.safetensors.part"
+                self.assertEqual(partial.read_bytes(), b"abc")
+                result = downloader.download(
+                    repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                    cache_root=cache_root,
+                )
+
+            self.assertEqual(requests[1].get_header("Range"), "bytes=3-")
+            self.assertEqual(Path(result["path"]).read_bytes(), b"abcdef")
+            self.assertFalse(partial.exists())
+
+
+class ModelSourceSearcherTests(unittest.TestCase):
+    def test_only_returns_repositories_containing_exact_basename(self):
+        searcher = model_source.ModelSourceSearcher({})
+        with patch.object(searcher.router, "endpoint", return_value=("https://huggingface.co", object())), patch.object(
+            searcher, "_request_json", side_effect=[
+                [{"id": "acme/flux"}, {"id": "acme/other"}],
+                {"siblings": [{"rfilename": "vae/flux2-vae.safetensors", "lfs": {"sha256": "c" * 64}}]},
+                {"siblings": [{"rfilename": "flux2-vae.safetensors.backup"}]},
+            ],
+        ):
+            results = searcher.search("flux2-vae.safetensors")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["repo_id"], "acme/flux")
+        self.assertEqual(results[0]["filename"], "vae/flux2-vae.safetensors")
+        self.assertEqual(results[0]["sha256"], "c" * 64)
 
 
 class NodeInstallRouteTests(unittest.IsolatedAsyncioTestCase):

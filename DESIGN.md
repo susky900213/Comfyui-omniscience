@@ -774,9 +774,11 @@ verdict 只会更严；AI 审核不喂整棵目录树，而是把静态报告压
 
 ### 11.3 全局对话节点安装（`omniscience/agent/node_install.py`）
 
-全局对话只在用户明确说“安装节点”并给出来源时暴露 `install_comfyui_node`。来源必须是用户消息中的公开 GitHub HTTPS 仓库/tree 链接、`owner/repo` 简写，或用户上传到全局工作区 `uploads/` 的节点压缩包路径；后端会再次比较工具参数与原始消息，模型不能替换仓库、路径或安全确认参数。
+全局对话只在用户明确说“安装节点”并给出来源时暴露 `install_comfyui_node`。来源必须是用户消息中的公开 GitHub/Gitee HTTPS 仓库/tree 链接、`owner/repo` 简写，或用户上传到全局工作区 `uploads/` 的节点压缩包路径；后端会再次比较工具参数与原始消息，模型不能替换仓库、路径或安全确认参数。
 
-GitHub 仓库通过 `codeload.github.com` 下载 tarball，压缩包和上传的 zip/tar 包都先进入临时 staging 目录。`omniscience/archives.py` 逐项拒绝绝对路径、`..` 穿越、符号链接、硬链接、设备文件和超限包；当前上限为压缩包 20 MB、解压后 80 MB、2,000 个文件、单文件 20 MB。节点根目录必须包含 `__init__.py`，并使用仓库名或上传文件名推导 `custom_nodes/<项目名>`。
+GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gitee 仓库归档接口下载 zip，下载重定向仅允许停留在 Gitee HTTPS 主机。压缩包和上传的 zip/tar 包都先进入临时 staging 目录。`omniscience/archives.py` 逐项拒绝绝对路径、`..` 穿越、符号链接、硬链接、设备文件和超限包；当前上限为压缩包 20 MB、解压后 80 MB、2,000 个文件、单文件 20 MB。节点根目录必须包含 `__init__.py`，并使用仓库名或上传文件名推导 `custom_nodes/<项目名>`。
+
+工作流缺失节点仓库搜索优先查询 GitHub；只有 GitHub 搜索请求失败时才回退 Gitee，GitHub 正常返回空候选时不触发回退。两端候选均须通过仓库主机和仓库根路径校验，用户只能显式选择本次搜索返回的来源。开始安装前从所选仓库解析默认分支并固定为 40 位 commit；归档暂存后仍按下述流程运行安全扫描，任何下载来源都不会绕过安装门禁。
 
 安装顺序固定为：下载/解包 → 定位节点根 → 静态 `node_security.scan_project` → 按 `skill_security_mode` 运行 `node_review.review` → 只有报告完成且允许时才移动到 `custom_nodes` → 保存 `node_scans` 缓存。安装不执行 `git clone`、`pip install`、`setup.py`、`requirements.txt` 或包内脚本，不创建 `workflow.json`，不自动接管为任务；成功后项目会出现在待接管列表，需用户另行接管并重启 ComfyUI。
 
