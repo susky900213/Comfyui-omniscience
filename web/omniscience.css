@@ -118,6 +118,20 @@
 .cline-workflow-execution-error summary { color: #e4b7bd; cursor: pointer; font-size: 11px; }
 .cline-workflow-execution-details { max-height: 260px; overflow: auto; margin: 6px 0 0; color: #f0d8d8; font: 10px/1.4 ui-monospace, SFMono-Regular, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cline-workflow-candidate-meta.warning { color: #f0a8a8; }
+.cline-workflow-repair-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.cline-workflow-repair-actions strong { color: #f0d99a; }
+.cline-workflow-repair { padding: 5px 9px; font-size: 11px; }
+.cline-workflow-ai-repair-actions strong { color: #cfc4ff; }
+.cline-workflow-ai-repair-open { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
+.cline-workflow-repair-progress { margin-top: 8px; padding: 8px; border: 1px solid #5b4e83; border-radius: 6px; background: #27233b; }
+.cline-workflow-repair-progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #e2dcff; }
+.cline-workflow-repair-status { flex: 0 0 auto; border-radius: 10px; padding: 2px 7px; color: #ddd8e8; background: #494260; font-size: 10px; }
+.cline-workflow-repair-status.running { color: #d9f3ff; background: #28516a; }
+.cline-workflow-repair-status.completed { color: #d8f5e5; background: #286046; }
+.cline-workflow-repair-status.failed { color: #ffd1d1; background: #713b46; }
+.cline-workflow-repair-status.cancelled { color: #e4d9b8; background: #665633; }
+.cline-workflow-repair-events { max-height: 150px; overflow-y: auto; margin: 6px 0 0 18px; padding: 0; color: #c9c2da; font-size: 11px; }
+.cline-workflow-repair-events li { margin: 3px 0; overflow-wrap: anywhere; }
 .cline-workflow-model-picker { width: 100%; margin: 5px 0; border: 1px solid #4a4560; border-radius: 6px; padding: 6px; color: #ddd8e8; background: #24222d; font-size: 11px; }
 .cline-workflow-model-manual-input { width: 100%; box-sizing: border-box; margin: 5px 0; border: 1px solid #4a4560; border-radius: 6px; padding: 7px; color: #ddd8e8; background: #24222d; font-size: 11px; }
 .cline-workflow-model-manual-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 3px 0; }

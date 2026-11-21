@@ -32,7 +32,7 @@ from . import deps
 logger = logging.getLogger("Comfyui-omniscience")
 
 HEALTH_VERSION = "0.3.0"
-FEATURES = ["tasks", "global_chat", "cancellation", "checkpoints", "mcp", "browser", "live_workflow", "upload", "network_switch", "global_workspace", "skill_security", "custom_node_projects", "node_security", "node_install", "workflow_node_search"]
+FEATURES = ["tasks", "global_chat", "cancellation", "checkpoints", "mcp", "browser", "live_workflow", "upload", "network_switch", "global_workspace", "skill_security", "custom_node_projects", "node_security", "node_install", "workflow_node_search", "workflow_diagnostics"]
 
 
 def _composer_workspace(request) -> Any:
@@ -301,6 +301,36 @@ def register_routes(prompt_server: Any) -> None:
                 )
             diagnostic = execution_diagnostic(job, exc, "preflight_error")
             return _response({"error": str(exc), "workflow": job, "diagnostic": diagnostic}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/repair")
+    async def cline_repair_workflow(request):
+        """Execute one explicitly confirmed, server-side repair action."""
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().repair_workflow(
+                    request.match_info["job_id"],
+                    action_id=values.get("action_id"),
+                    confirmed=bool(values.get("confirmed")),
+                    timeout=float(values.get("timeout", 1800)),
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.post("/cline/global-chat/workflows/{job_id}/repair-ai")
+    async def cline_ai_repair_workflow(request):
+        """Hand a persisted workflow failure to the confirmed ACT coding agent."""
+        try:
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().create_ai_repair_task(
+                    request.match_info["job_id"], confirmed=bool(values.get("confirmed"))
+                ),
+                status=202,
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
 
     @routes.get("/cline/global-chat/workflows/{job_id}")
     async def cline_workflow_job(request):

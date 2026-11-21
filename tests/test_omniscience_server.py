@@ -24,7 +24,7 @@ from omniscience_server import (
     _project_folder_name,
     apply_unified_patch,
 )
-from omniscience import archives, node_review, node_security, skill_review, skill_security
+from omniscience import archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
 from omniscience import model_downloader, model_source, node_search, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
@@ -157,6 +157,48 @@ class SettingsTests(unittest.TestCase):
             )
             self.assertEqual(public["api_base_url"], "http://proxy.example/v1")
             self.assertEqual(public["model"], "my-model")
+
+
+class EnvironmentDiagnosticsTests(unittest.TestCase):
+    def test_diagnosis_is_generic_and_never_changes_workflow(self):
+        workflow = {"prompt": {"1": {"class_type": "ExampleLoader", "inputs": {"path": "keep"}}}}
+        original = json.loads(json.dumps(workflow))
+        report = environment_diagnostics.diagnose_environment(
+            error_text="Unknown node type: ExampleLoader",
+            code="prompt_rejected",
+            details={"node_id": "1", "node_type": "ExampleLoader"},
+            workflow=workflow,
+        )
+        self.assertEqual(report["category"], "node")
+        self.assertEqual(report["kind"], "workflow_failure")
+        self.assertTrue(report["workflow_unchanged"])
+        self.assertFalse(report["external_files_changed"])
+        self.assertEqual(workflow, original)
+        self.assertEqual(report["repair_actions"][0]["id"], "manual_review")
+
+    def test_common_error_categories_have_specific_solutions(self):
+        cases = [
+            ("CheckpointLoaderSimple: model not found", "model"),
+            ("CUDA out of memory", "memory"),
+            ("POST /prompt: connection refused", "connection"),
+            ("Node validation failed: missing input", "parameters"),
+        ]
+        for message, category in cases:
+            with self.subTest(category=category):
+                report = environment_diagnostics.diagnose_environment(error_text=message)
+                self.assertEqual(report["category"], category)
+                self.assertIn(report["cause"], [report["cause"]])
+                self.assertTrue(report["actions"])
+
+    def test_retry_is_offered_only_before_a_prompt_id(self):
+        retryable = environment_diagnostics.diagnose_environment(
+            error_text="ComfyUI connection refused", retryable=True
+        )
+        self.assertEqual(retryable["repair_actions"][0]["id"], "retry_execution")
+        after_submission = environment_diagnostics.diagnose_environment(
+            error_text="ComfyUI connection reset", retryable=True, prompt_id="prompt-id"
+        )
+        self.assertEqual(after_submission["repair_actions"][0]["id"], "manual_review")
 
     def test_custom_provider_can_be_registered_selected_and_removed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2120,6 +2162,127 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         plan = self.agent.dependency_plan(self.job["id"])
         self.assertEqual(plan["nodes"][0]["source"], "https://github.com/acme/load-moss")
 
+    async def test_repair_route_requires_authorized_action_and_keeps_workflow(self):
+        from omniscience.api import deps
+
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {"prompt": {"1": {"class_type": "ExampleLoader", "inputs": {"path": "keep"}}}},
+            "execution_diagnostic": {
+                "message": "ComfyUI connection refused",
+                "code": "execution_error",
+                "category": "connection",
+                "repair_actions": [
+                    {"id": "retry_execution", "automatic": True, "requires_confirmation": True}
+                ],
+            },
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"], state="failed", error=metadata["execution_diagnostic"]["message"], metadata=metadata
+        )
+        with self.assertRaisesRegex(ValueError, "无效或不支持"):
+            await self.agent.repair_workflow(self.job["id"], action_id="run_shell", confirmed=True)
+        with patch.object(self.agent, "execute_workflow", AsyncMock(return_value={"status": "completed"})) as execute:
+            result = await self.agent.repair_workflow(self.job["id"], action_id="retry_execution", confirmed=True)
+        self.assertEqual(result["status"], "repaired")
+        execute.assert_awaited_once()
+        saved = self.agent.workflow_job(self.job["id"])
+        self.assertEqual(saved["metadata"]["workflow"]["prompt"]["1"]["inputs"]["path"], "keep")
+
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        deps._GLOBAL_CHAT_AGENT = self.agent
+        try:
+            with patch.object(self.agent, "execute_workflow", AsyncMock(return_value={"status": "completed"})):
+                recorder = _registered_routes()
+                response = await recorder.handlers[("POST", "/cline/global-chat/workflows/{job_id}/repair")](
+                    _FakeRequest(
+                        body={"action_id": "retry_execution", "confirmed": True},
+                        match_info={"job_id": self.job["id"]},
+                    )
+                )
+            self.assertEqual(response.status, 200)
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
+    async def test_ai_repair_creates_confirmed_act_task_with_failure_context(self):
+        from omniscience.api import deps
+
+        workflow = {"prompt": {"1": {"class_type": "ExampleLoader", "inputs": {"path": "keep"}}}}
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": workflow,
+            "inspection": {"format": "api", "node_count": 1, "missing_nodes": [], "models": []},
+            "execution_diagnostic": {
+                "message": "节点参数校验失败",
+                "code": "prompt_invalid",
+                "category": "parameters",
+                "repair_actions": [{"id": "manual_review", "automatic": False}],
+            },
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"], state="failed", error="节点参数校验失败", metadata=metadata
+        )
+        previous_agent = deps._TASK_AGENT
+        previous_controller = deps._CONTROLLER
+        task_root = Path(self.directory.name) / "workspace"
+        task_root.mkdir()
+        task_settings = SettingsStore(Path(self.directory.name) / "task-settings.json")
+        task_settings.update({"workspace": str(task_root)})
+        task_agent = PersistentClineAgent(task_settings)
+        deps._TASK_AGENT = task_agent
+        submitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        controller = type(
+            "Controller",
+            (),
+            {
+                "submit": lambda _self, *args, **kwargs: (
+                    submitted.append((args, kwargs)) or {"accepted": True, "task_id": args[0]}
+                )
+            },
+        )()
+        deps._CONTROLLER = controller
+        try:
+            with self.assertRaisesRegex(ValueError, "明确确认"):
+                await self.agent.create_ai_repair_task(self.job["id"], confirmed=False)
+            result = await self.agent.create_ai_repair_task(self.job["id"], confirmed=True)
+            self.assertEqual(result["status"], "task_created")
+            task = task_agent.task(result["task_id"])
+            self.assertEqual(task["mode"], "act")
+            self.assertTrue(task["metadata"]["workflow_repair"])
+            self.assertEqual(task_agent.store.current_workflow(task["id"])["workflow"], workflow)
+            self.assertEqual(len(submitted), 1)
+            self.assertIn("节点参数校验失败", submitted[0][0][1])
+            self.assertIn("不要自行安装依赖", submitted[0][0][1])
+            saved_job = self.agent.workflow_job(self.job["id"])
+            self.assertEqual(saved_job["metadata"]["ai_repair_task_id"], task["id"])
+            self.assertEqual(saved_job["metadata"]["ai_repair_status"], "submitted")
+            repeated = await self.agent.create_ai_repair_task(self.job["id"], confirmed=True)
+            self.assertEqual(repeated["status"], "already_started")
+            self.assertEqual(repeated["task_id"], task["id"])
+        finally:
+            deps._TASK_AGENT = previous_agent
+            deps._CONTROLLER = previous_controller
+
+    async def test_ai_repair_route_requires_a_persisted_failure(self):
+        from omniscience.api import deps
+
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        deps._GLOBAL_CHAT_AGENT = self.agent
+        try:
+            recorder = _registered_routes()
+            route = recorder.handlers[("POST", "/cline/global-chat/workflows/{job_id}/repair-ai")]
+            unconfirmed = await route(
+                _FakeRequest(body={"confirmed": False}, match_info={"job_id": self.job["id"]})
+            )
+            self.assertEqual(unconfirmed.status, 400)
+            self.assertIn("明确确认", json.loads(unconfirmed.text)["error"])
+            missing = await route(
+                _FakeRequest(body={"confirmed": True}, match_info={"job_id": "missing"})
+            )
+            self.assertEqual(missing.status, 400)
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
     async def test_github_failure_falls_back_to_gitee(self):
         candidates = [{"full_name": "acme/load-moss", "source": "https://gitee.com/acme/load-moss"}]
         with patch.object(node_search.GitHubNodeSearcher, "search", side_effect=ValueError("GitHub unavailable")) as github_search, patch.object(
@@ -2252,6 +2415,41 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostic["prompt_id"], "prompt-id")
         self.assertEqual(diagnostic["details"]["node_id"], "7")
         self.assertEqual(diagnostic["hint"], "请降低分辨率/批量大小。")
+
+    async def test_workflow_job_normalizes_legacy_execution_failure_state(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "execution_error": "ComfyUI connection refused",
+            "execution_diagnostic": {
+                "message": "ComfyUI connection refused",
+                "category": "connection",
+            },
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"], state="selected", error=metadata["execution_error"], metadata=metadata
+        )
+
+        restored = self.agent.workflow_job(self.job["id"])
+
+        self.assertEqual(restored["state"], "failed")
+        self.assertEqual(self.agent.store.get_workflow_job(self.job["id"])["state"], "failed")
+        self.assertEqual(restored["selected_candidate_id"], "candidate")
+        self.assertEqual(restored["candidates"][0]["id"], "candidate")
+
+    async def test_restoring_selected_candidate_does_not_hide_execution_failure(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "execution_error": "ComfyUI connection refused",
+            "execution_diagnostic": {"message": "ComfyUI connection refused", "category": "connection"},
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"], state="failed", error=metadata["execution_error"], metadata=metadata
+        )
+
+        restored = self.agent.select_workflow(self.job["id"], "candidate")
+
+        self.assertEqual(restored["job"]["state"], "failed")
+        self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "failed")
 
     async def test_ui_workflow_is_converted_before_execution(self):
         metadata = {
@@ -2573,7 +2771,7 @@ class WorkflowExecutorTests(unittest.TestCase):
                                         "prompt_id": "prompt-id",
                                         "node_id": "28",
                                         "node_type": "TextGenerate",
-                                        "exception_message": "_clip_generate() got an unexpected keyword argument 'mtp'",
+                                        "exception_message": "generate() got an unexpected keyword argument 'backend_option'",
                                     },
                                 ]
                             ],
@@ -2587,7 +2785,7 @@ class WorkflowExecutorTests(unittest.TestCase):
                 executor.wait("prompt-id", timeout=1, interval=0.1)
         self.assertEqual(caught.exception.code, "execution_error")
         self.assertEqual(caught.exception.prompt_id, "prompt-id")
-        self.assertIn("unexpected keyword argument 'mtp'", str(caught.exception))
+        self.assertIn("unexpected keyword argument 'backend_option'", str(caught.exception))
 
     def test_wait_rejects_completed_history_without_outputs(self):
         executor = workflow_executor.ComfyUIWorkflowExecutor({})
@@ -5494,6 +5692,65 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn('if (!currentTaskId())', send_message)
         self.assertIn("requestProjectFolder()", send_message)
         self.assertIn('/messages', send_message)
+
+    def test_failed_workflow_card_offers_ai_repair_without_automatic_action(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+        failure_start = source.index("function appendWorkflowExecutionFailure")
+        failure_end = source.index("async function repairWorkflowFailure", failure_start)
+        failure = source[failure_start:failure_end]
+        self.assertIn('button("调用 AI 修复"', failure)
+        self.assertIn("createAIRepairTask(card, jobId, aiRepair)", failure)
+        self.assertIn("if (jobId)", failure)
+        self.assertIn("缺少工作流任务 ID", failure)
+        self.assertNotIn("if (automaticActions.length) {\n    const aiRepairs", failure)
+
+        repair_start = source.index("async function createAIRepairTask")
+        repair_end = source.index("function workflowCandidateCard", repair_start)
+        repair = source[repair_start:repair_end]
+        self.assertIn("/repair-ai", repair)
+        self.assertIn("confirmed: true", repair)
+        self.assertIn("renderWorkflowRepairProgress(card, taskId", repair)
+        self.assertNotIn("await loadTask(taskId)", repair)
+
+        self.assertIn("function renderWorkflowRepairProgress(card, taskId", source)
+        self.assertIn("/events?after=${record.cursor}", source)
+        self.assertIn("function pollWorkflowRepairCards()", source)
+        self.assertIn("await pollWorkflowRepairCards();", source)
+        self.assertIn("AI 修复过程", source)
+        self.assertIn("function workflowJobHasExecutionFailure(job)", source)
+        self.assertIn("!!metadata.execution_error", source)
+        self.assertIn('execute.insertAdjacentElement("afterend", box)', failure)
+        execute_start = source.index("function appendWorkflowExecuteButton")
+        execute_end = source.index("function appendWorkflowCandidates", execute_start)
+        execute = source[execute_start:execute_end]
+        self.assertIn("card.appendChild(execute)", execute)
+        self.assertIn('execute.insertAdjacentElement("afterend", failure)', execute)
+        self.assertNotIn("insertBefore(execute, failure)", execute)
+        self.assertIn('job?.state === "failed"', source)
+        self.assertIn("function workflowFailureBelongsToCandidate(job, candidate)", source)
+        self.assertIn("job?.metadata?.candidate?.id", source)
+        self.assertGreaterEqual(
+            source.count("workflowJobHasExecutionFailure(job) && workflowFailureBelongsToCandidate(job, candidate)"),
+            2,
+        )
+        self.assertIn("card.dataset.workflowJobId = String(jobId || \"\").trim()", source)
+        self.assertIn("if (workflowJobHasExecutionFailure(job) && card.isConnected)", source)
+        restore_start = source.index("void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)")
+        restore_end = source.index("return card;", restore_start)
+        restore = source[restore_start:restore_end]
+        self.assertIn("workflowFailureBelongsToCandidate(job, candidate)", restore)
+        self.assertIn("appendWorkflowExecutionFailure(card, job);", restore)
+        self.assertIn("// attached to the document", restore)
+        self.assertLess(restore.index("workflowFailureBelongsToCandidate(job, candidate)"), restore.index("if (!card.isConnected"))
+        self.assertIn('String(job?.selected_candidate_id || "") !== String(candidate.id || "")', restore)
+        self.assertLess(
+            restore.index("workflowFailureBelongsToCandidate(job, candidate)"),
+            restore.index("String(job?.selected_candidate_id ||")
+        )
+        self.assertIn("cline-workflow-repair-progress", style)
+        self.assertIn("cline-workflow-repair-events", style)
 
     def test_current_task_displays_prompt_length(self):
         source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")

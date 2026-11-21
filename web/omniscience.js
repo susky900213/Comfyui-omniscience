@@ -38,6 +38,8 @@ const state = {
   cancelling: false,
   error: "",
   polling: false,
+  workflowRepairCards: [],
+  workflowRepairPolling: false,
   projectFolderRequest: null,
   currentWorkflow: null,
   currentWorkflowSignature: "",
@@ -467,9 +469,42 @@ function workflowExecutionDiagnostic(errorOrJob) {
     || null;
 }
 
+function workflowJobHasExecutionFailure(job) {
+  const metadata = job?.metadata || {};
+  return job?.state === "failed" && (
+    !!job?.error
+    || !!job?.diagnostic
+    || !!job?.execution_diagnostic
+    || !!metadata.execution_error
+    || !!metadata.execution_diagnostic
+  );
+}
+
+function workflowFailureBelongsToCandidate(job, candidate) {
+  const candidateId = String(candidate?.id ?? "").trim();
+  if (!candidateId) return false;
+  const selectedId = String(job?.selected_candidate_id ?? "").trim();
+  if (selectedId) return selectedId === candidateId;
+  // Older jobs may not have selected_candidate_id, but select_workflow
+  // persisted the selected candidate in metadata before execution.
+  const persistedId = String(
+    job?.metadata?.candidate?.id
+      ?? job?.metadata?.candidate_id
+      ?? job?.candidate?.id
+      ?? "",
+  ).trim();
+  return !!persistedId && persistedId === candidateId;
+}
+
 function appendWorkflowExecutionFailure(card, errorOrJob) {
   const diagnostic = workflowExecutionDiagnostic(errorOrJob) || {};
-  const message = diagnostic.message || errorOrJob?.message || errorOrJob?.error || "工作流执行失败。";
+  const payload = errorOrJob?.payload || errorOrJob || {};
+  const metadata = payload?.metadata || payload?.workflow?.metadata || {};
+  const message = diagnostic.message
+    || payload.message
+    || payload.error
+    || metadata.execution_error
+    || "工作流执行失败。";
   const phaseLabels = { preflight: "执行前检查", execution: "ComfyUI 执行" };
   const categoryLabels = {
     node: "节点缺失或未加载", model: "模型/权重", memory: "显存或内存",
@@ -516,11 +551,216 @@ function appendWorkflowExecutionFailure(card, errorOrJob) {
     details.append(summary, body);
     box.appendChild(details);
   }
-  card.appendChild(box);
+  const repairActions = Array.isArray(diagnostic.repair_actions) ? diagnostic.repair_actions : [];
+  const jobId = card.dataset.workflowJobId
+    || errorOrJob?.job_id
+    || errorOrJob?.workflow?.id
+    || errorOrJob?.id
+    || "";
+  const automaticActions = repairActions.filter((action) => action?.automatic && action?.id);
+  if (automaticActions.length) {
+    const repairs = el("div", "cline-workflow-repair-actions");
+    repairs.appendChild(el("strong", "", "可自动处理："));
+    for (const action of automaticActions.slice(0, 3)) {
+      const control = button(action.label || "解决", "cline-primary cline-workflow-repair");
+      control.onclick = () => repairWorkflowFailure(card, jobId, action, control);
+      control.disabled = !jobId;
+      repairs.appendChild(control);
+    }
+    box.appendChild(repairs);
+  }
+  if (diagnostic.repair_blocker && !automaticActions.length) {
+    box.appendChild(el("p", "cline-workflow-candidate-meta warning", `当前不能自动解决：${diagnostic.repair_blocker}`));
+  }
+  if (jobId) {
+    const aiRepairs = el("div", "cline-workflow-repair-actions cline-workflow-ai-repair-actions");
+    aiRepairs.appendChild(el("strong", "", "代码级修复："));
+    const aiRepair = button("调用 AI 修复", "cline-primary cline-workflow-ai-repair");
+    aiRepair.onclick = () => createAIRepairTask(card, jobId, aiRepair);
+    aiRepairs.appendChild(aiRepair);
+    box.appendChild(aiRepairs);
+    box.appendChild(el("p", "cline-workflow-candidate-meta", "这会创建一个隔离的 Act 任务，让 AI 检查工作区并尝试修改代码；节点、模型和 ComfyUI 服务不会被自动更改。"));
+  } else {
+    box.appendChild(el("p", "cline-workflow-candidate-meta warning", "当前失败卡片缺少工作流任务 ID，无法安全创建 AI 修复任务；请重新打开工作流卡片后重试。"));
+  }
+  const execute = card.querySelector(".cline-workflow-execute");
+  if (execute) {
+    execute.insertAdjacentElement("afterend", box);
+  } else {
+    card.appendChild(box);
+  }
+  const existingRepairTaskId = errorOrJob?.metadata?.ai_repair_task_id
+    || diagnostic.ai_repair_task_id
+    || card.dataset.workflowRepairTaskId
+    || "";
+  if (existingRepairTaskId) renderWorkflowRepairProgress(card, existingRepairTaskId);
+}
+
+async function repairWorkflowFailure(card, jobId, action, control) {
+  if (!jobId || control.disabled) return;
+  if (!window.confirm(`确定执行“${action.label || "自动处理"}”吗？服务只会执行该错误报告授权的安全动作。`)) return;
+  control.disabled = true;
+  const originalLabel = control.textContent;
+  control.textContent = "处理中…";
+  try {
+    const result = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/repair`, {
+      method: "POST", body: JSON.stringify({ action_id: action.id, confirmed: true }),
+    });
+    const box = card.querySelector(".cline-workflow-execution-error");
+    const status = result.message || (result.status === "repaired" ? "已处理，请查看执行结果。" : "已完成处理。");
+    if (box) box.appendChild(el("p", "cline-workflow-candidate-meta", `处理结果：${status}`));
+    const execution = result.execution || result.result?.result;
+    if (execution?.status === "completed") {
+      card.classList.add("completed");
+      card.classList.remove("failed");
+      card.querySelector(".cline-workflow-execution-error")?.remove();
+      card.appendChild(el("p", "cline-workflow-candidate-meta", "自动处理完成，工作流已重新执行。"));
+    } else {
+      control.textContent = "已处理";
+    }
+  } catch (error) {
+    control.disabled = false;
+    control.textContent = originalLabel;
+    showError(error);
+  }
+}
+
+async function createAIRepairTask(card, jobId, control) {
+  if (!jobId || control.disabled) return;
+  if (!window.confirm("确定调用 AI 修复吗？这会创建一个 Act 任务，让 AI 在隔离项目工作区检查并修改代码；不会自动安装节点、下载模型或伪造修复结果。")) return;
+  control.disabled = true;
+  const originalLabel = control.textContent;
+  control.textContent = "正在启动 AI…";
+  try {
+    const result = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/repair-ai`, {
+      method: "POST", body: JSON.stringify({ confirmed: true }),
+    });
+    const box = card.querySelector(".cline-workflow-execution-error");
+    const taskId = result.task_id || result.task?.id || "";
+    const label = result.status === "already_started" ? "AI 修复任务已存在" : "AI 修复任务已启动";
+    control.textContent = taskId ? `${label}：${result.folder || taskId.slice(0, 10)}` : label;
+    if (box) box.appendChild(el("p", "cline-workflow-candidate-meta", `${label}。AI 将在任务面板中报告检查、修改和验证过程。`));
+    if (taskId) {
+      card.dataset.workflowRepairTaskId = taskId;
+      renderWorkflowRepairProgress(card, taskId, result.task || null);
+      await loadTasks();
+    }
+  } catch (error) {
+    control.disabled = false;
+    control.textContent = originalLabel;
+    showError(error);
+  }
+}
+
+function workflowRepairEventText(event) {
+  const payload = event?.payload || {};
+  const compact = (value, limit = 240) => String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
+  if (event?.kind === "task_started") return "AI 已开始检查隔离修复工作区。";
+  if (event?.kind === "assistant_text") return `AI：${compact(payload.text) || "正在分析修复方案。"}`;
+  if (event?.kind === "tool_result") {
+    const tool = compact(payload.tool, 80) || "工具";
+    const result = payload.result;
+    if (result && typeof result === "object" && result.error) return `${tool}：${compact(result.error)}`;
+    return `已完成：${tool}`;
+  }
+  if (event?.kind === "context_compacted") return "AI 正在整理任务上下文。";
+  if (event?.kind === "task_finished") return "AI 修复任务已完成，请查看验证结果。";
+  if (event?.kind === "task_failed") return `AI 修复任务失败：${compact(payload.error) || "未知错误"}`;
+  if (event?.kind === "task_cancelled") return "AI 修复任务已取消。";
+  return compact(event?.kind, 100) || "修复任务有新的进展。";
+}
+
+function workflowRepairStatus(record) {
+  const terminal = record.events.find((event) => ["task_finished", "task_failed", "task_cancelled"].includes(event.kind));
+  if (terminal) {
+    if (terminal.kind === "task_finished") return { text: "已完成", className: "completed" };
+    if (terminal.kind === "task_cancelled") return { text: "已取消", className: "cancelled" };
+    return { text: "失败", className: "failed" };
+  }
+  if (record.running) return { text: "进行中", className: "running" };
+  if (record.queued) return { text: "排队中", className: "queued" };
+  if (record.events.length) return { text: "等待下一步", className: "queued" };
+  return { text: "已提交，等待 AI 开始", className: "queued" };
+}
+
+function workflowRepairRecord(card, taskId, task = null) {
+  const normalizedId = String(taskId || "").trim();
+  if (!normalizedId) return null;
+  let record = state.workflowRepairCards.find((item) => item.card === card);
+  if (!record || record.taskId !== normalizedId) {
+    record = { card, taskId: normalizedId, cursor: -1, events: [], running: false, queued: false, task };
+    state.workflowRepairCards = state.workflowRepairCards.filter((item) => item.card !== card);
+    state.workflowRepairCards.push(record);
+  } else if (task) {
+    record.task = task;
+  }
+  card.dataset.workflowRepairTaskId = normalizedId;
+  return record;
+}
+
+function renderWorkflowRepairProgress(card, taskId, task = null) {
+  const record = workflowRepairRecord(card, taskId, task);
+  if (!record) return;
+  card.querySelector(".cline-workflow-repair-progress")?.remove();
+  const progress = el("div", "cline-workflow-repair-progress");
+  const heading = el("div", "cline-workflow-repair-progress-heading");
+  heading.appendChild(el("strong", "", "AI 修复过程"));
+  const status = workflowRepairStatus(record);
+  heading.appendChild(el("span", `cline-workflow-repair-status ${status.className}`, status.text));
+  progress.appendChild(heading);
+  if (record.events.length) {
+    const list = el("ol", "cline-workflow-repair-events");
+    record.events.slice(-6).forEach((event) => list.appendChild(el("li", "", workflowRepairEventText(event))));
+    progress.appendChild(list);
+  } else {
+    progress.appendChild(el("p", "cline-workflow-candidate-meta", status.text));
+  }
+  const open = button("打开 AI 修复任务", "cline-secondary cline-workflow-ai-repair-open");
+  open.onclick = async () => {
+    await loadTask(record.taskId);
+    setView("chat");
+  };
+  progress.appendChild(open);
+  card.querySelector(".cline-workflow-execution-error")?.appendChild(progress);
+}
+
+async function refreshWorkflowRepairProgress(record) {
+  if (!record?.card?.isConnected || record.terminal) return;
+  try {
+    const result = await request(`/cline/tasks/${encodeURIComponent(record.taskId)}/events?after=${record.cursor}`);
+    const events = result.events || [];
+    if (events.length) {
+      record.events.push(...events);
+      record.cursor = Math.max(record.cursor, ...events.map((event) => Number(event.seq ?? -1)));
+      record.terminal = events.some((event) => ["task_finished", "task_failed", "task_cancelled"].includes(event.kind));
+    }
+    record.running = !!result.running;
+    record.queued = !!result.queued;
+    renderWorkflowRepairProgress(record.card, record.taskId, record.task);
+  } catch (error) {
+    if (error.status === 404) record.terminal = true;
+    console.warn("[Comfyui-omniscience] workflow repair progress refresh failed", error);
+  }
+}
+
+async function pollWorkflowRepairCards() {
+  if (state.workflowRepairPolling) return;
+  state.workflowRepairCards = state.workflowRepairCards.filter((record) => record.card?.isConnected);
+  if (!state.workflowRepairCards.length) return;
+  state.workflowRepairPolling = true;
+  try {
+    await Promise.all(state.workflowRepairCards.filter((record) => !record.terminal).map(refreshWorkflowRepairProgress));
+  } finally {
+    state.workflowRepairPolling = false;
+  }
 }
 
 function workflowCandidateCard(jobId, candidate) {
   const card = el("div", "cline-workflow-candidate");
+  // Keep the persisted workflow job identity on the card from the moment it
+  // is rendered.  A failure can happen before dependency preparation adds the
+  // execute button, and the repair area must not depend on that button.
+  card.dataset.workflowJobId = String(jobId || "").trim();
   card.appendChild(el("strong", "cline-workflow-candidate-title", `${candidate.title || "未命名工作流"} · ID: ${candidate.id || "未知"}`));
   if (candidate.description) card.appendChild(el("p", "cline-workflow-candidate-description", candidate.description));
   const meta = [candidate.author, candidate.region ? `站点：${candidate.region === "domestic" ? "国内" : "国外"}` : ""]
@@ -550,6 +790,13 @@ function workflowCandidateCard(jobId, candidate) {
         // the user switched task nodes or changed settings.
         const job = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`);
         const metadata = job.metadata || {};
+        // Render the persisted failure before trying to refresh inspection.
+        // A failed workflow must still expose its repair controls when the
+        // provider is temporarily unavailable or an older job has no cached
+        // inspection report.
+        if (workflowJobHasExecutionFailure(job) && workflowFailureBelongsToCandidate(job, candidate)) {
+          appendWorkflowExecutionFailure(card, job);
+        }
         inspection = metadata.inspection && metadata.workflow
           ? { inspection: metadata.inspection, workflow: metadata.workflow }
           : await request("/cline/global-chat/workflows/inspect", {
@@ -946,7 +1193,17 @@ function workflowCandidateCard(jobId, candidate) {
   // instead of asking the user to select it again.
   void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)
     .then((job) => {
-      if (job?.selected_candidate_id !== candidate.id || !card.isConnected || card.classList.contains("selected")) return;
+      // A failed job must be rendered even when the selected candidate field
+      // was not persisted, or when an older payload used a numeric candidate
+      // id.  Render it even if the request completed before the card was
+      // attached to the document; detached DOM nodes are attached by the
+      // caller immediately after this function returns.
+      if (workflowJobHasExecutionFailure(job) && workflowFailureBelongsToCandidate(job, candidate)) {
+        appendWorkflowExecutionFailure(card, job);
+      }
+      if (!card.isConnected
+        || String(job?.selected_candidate_id || "") !== String(candidate.id || "")
+        || card.classList.contains("selected")) return;
       action.dataset.restore = "true";
       action.click();
     })
@@ -955,6 +1212,7 @@ function workflowCandidateCard(jobId, candidate) {
 }
 
 function appendWorkflowExecuteButton(card, jobId) {
+  card.dataset.workflowJobId = jobId;
   if (card.querySelector(".cline-workflow-execute")) return;
   const execute = button("确认执行工作流", "cline-secondary cline-workflow-execute");
   execute.onclick = async () => {
@@ -971,15 +1229,22 @@ function appendWorkflowExecuteButton(card, jobId) {
       appendWorkflowExecutionFailure(card, error);
       try {
         const job = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`);
-        if (job?.metadata?.execution_diagnostic && card.isConnected) appendWorkflowExecutionFailure(card, job);
+        if (workflowJobHasExecutionFailure(job) && card.isConnected) appendWorkflowExecutionFailure(card, job);
       } catch { /* the original execution error is already visible on the card */ }
       showError(error);
     }
   };
+  // Keep the execute button at its normal insertion point.  If the failure
+  // card was restored before this asynchronous button creation completed,
+  // move only the failure card below the button.
   card.appendChild(execute);
+  const failure = card.querySelector(".cline-workflow-execution-error");
+  if (failure && execute.nextElementSibling !== failure) {
+    execute.insertAdjacentElement("afterend", failure);
+  }
   void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)
     .then((job) => {
-      if (job?.metadata?.execution_diagnostic && card.isConnected) {
+      if (workflowJobHasExecutionFailure(job) && card.isConnected) {
         appendWorkflowExecutionFailure(card, job);
         execute.textContent = "重新确认执行工作流";
       }
@@ -1819,6 +2084,7 @@ async function loadSkills() {
 }
 
 async function pollEvents() {
+  await pollWorkflowRepairCards();
   if (state.polling || state.globalChatActive || !currentTaskId()) return;
   state.polling = true;
   try {
