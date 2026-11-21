@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -10,18 +11,20 @@ from threading import Event
 from pathlib import Path
 from typing import Any
 
-from .workflow_parser import inspect_workflow
+from .workflow_parser import WorkflowParseError, inspect_workflow, to_api_workflow
 from .workflow_provider import RunningHubProvider
-from .workflow_executor import ComfyUIWorkflowExecutor
+from .workflow_executor import ComfyUIWorkflowExecutor, WorkflowExecutionError
 from .model_downloader import CATEGORIES, ModelDownloader
-from .model_downloader import ModelDownloadCancelled
+from .model_downloader import ModelDownloadCancelled, ModelDownloadRetryableError
 from .model_source import ModelSourceSearcher
 from . import paths
 from .resource_assessor import assess, local_snapshot, rank_resource
+from .workflow_diagnostics import diagnose_execution_failure, static_diagnostic
 from .node_search import GiteeNodeSearcher, GitHubNodeSearcher
 
 MAX_WORKFLOW_NODE_SEARCHES = 5
 MODEL_SUFFIXES = {".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".pkl"}
+MODEL_HASH_CHUNK_SIZE = 1024 * 1024
 
 # The names used by workflow fields are not always the names registered by
 # ComfyUI.  For example, the built-in CLIP loader uses the ``text_encoders``
@@ -51,6 +54,140 @@ class WorkflowManagerMixin:
         # A named workflow request such as “Moss 工作流” should expose the
         # search tool even when the user did not use a verb like “搜索”.
         return not bool(re.search(r"不要|无需|不需要|别|禁止|don't|do not", text))
+
+    def _record_workflow_execution_failure(
+        self,
+        job_id: str,
+        error: BaseException,
+        *,
+        code: str = "unexpected_error",
+        details: Any = None,
+        retryable: bool = False,
+        prompt_id: str = "",
+        hint: str = "",
+        recovery: str = "",
+        phase: str = "execution",
+    ) -> None:
+        """Keep an actionable execution diagnosis without losing job metadata."""
+        if isinstance(error, WorkflowExecutionError):
+            code = error.code
+            details = error.details
+            retryable = error.retryable
+            prompt_id = error.prompt_id
+            hint = error.hint
+        if details is None:
+            parser_diagnostic = getattr(error, "diagnostic", None)
+            if isinstance(parser_diagnostic, dict) and parser_diagnostic:
+                details = parser_diagnostic
+        job = self.store.get_workflow_job(str(job_id))
+        if job is None:
+            return
+        metadata = dict(job.get("metadata") or {})
+        diagnostic = static_diagnostic(
+            code=code,
+            message=str(error),
+            details=details,
+            retryable=retryable,
+            prompt_id=prompt_id,
+            hint=hint,
+            recovery=recovery,
+        )
+        diagnostic["phase"] = phase
+        metadata["execution_error"] = str(error)
+        metadata["execution_diagnostic"] = diagnostic
+        self.store.update_workflow_job(str(job_id), state="failed", error=str(error), metadata=metadata)
+
+    async def _enrich_workflow_execution_failure(self, job_id: Any) -> None:
+        """Ask the configured model for a read-only explanation of one failure.
+
+        The persisted static diagnosis is written before this call, so a model
+        timeout, malformed response, or missing provider can never hide the
+        original ComfyUI error.
+        """
+        job = self.store.get_workflow_job(str(job_id))
+        if job is None:
+            return
+        metadata = dict(job.get("metadata") or {})
+        diagnostic = metadata.get("execution_diagnostic")
+        if not isinstance(diagnostic, dict):
+            return
+        candidate = metadata.get("candidate") or {}
+        inspection = metadata.get("inspection") or {}
+        workflow = metadata.get("workflow") or {}
+        prompt = workflow.get("prompt") if isinstance(workflow, dict) else None
+        context = {
+            "phase": diagnostic.get("phase") or "execution",
+            "candidate": {
+                "title": candidate.get("title"),
+                "execution_mode": candidate.get("execution_mode"),
+                "resource_assessment": candidate.get("resource_assessment"),
+            },
+            "workflow": {
+                "format": inspection.get("format"),
+                "node_count": inspection.get("node_count"),
+                "missing_nodes": inspection.get("missing_nodes") or [],
+                "models": [
+                    {"name": item.get("name"), "local_status": item.get("local_status")}
+                    for item in (inspection.get("models") or [])
+                    if isinstance(item, dict)
+                ][:40],
+                "prompt_nodes": list(prompt.keys())[:120] if isinstance(prompt, dict) else [],
+            },
+        }
+        enriched = await diagnose_execution_failure(
+            self.settings,
+            diagnostic=diagnostic,
+            workflow_context=context,
+        )
+        latest = self.store.get_workflow_job(str(job_id)) or job
+        latest_metadata = dict(latest.get("metadata") or {})
+        # Do not overwrite a newer failure if a future execution path updates it
+        # while the provider request is in flight.
+        current = latest_metadata.get("execution_diagnostic") or {}
+        if current.get("message") != diagnostic.get("message"):
+            return
+        latest_metadata["execution_diagnostic"] = enriched
+        self.store.update_workflow_job(str(job_id), metadata=latest_metadata)
+
+    async def _refresh_workflow_resource_assessment(
+        self, job_id: Any, metadata: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Refresh advisory resource information immediately before execution.
+
+        Candidate cards are persisted for search ranking and can be minutes or
+        hours old by the time preparation finishes.  The result is advisory:
+        ComfyUI remains the authority during actual execution and a stale
+        assessment must not replace its error.
+        """
+        candidate = dict(metadata.get("candidate") or {})
+        if not candidate:
+            return metadata, None
+        requirements = candidate.get("resource_requirements")
+        if not isinstance(requirements, dict) or not requirements:
+            previous = candidate.get("resource_assessment")
+            if isinstance(previous, dict):
+                candidate["resource_assessment"] = {
+                    **previous,
+                    "stale": True,
+                    "source": "search_time_stale",
+                    "recommendation": "该工作流未声明可量化的资源需求；此评估仅用于搜索排序，执行时以 ComfyUI 返回的真实错误为准。",
+                }
+                metadata["candidate"] = candidate
+            return metadata, None
+        try:
+            stats = await asyncio.to_thread(
+                ComfyUIWorkflowExecutor(self.settings, request_timeout=2.0).system_stats
+            )
+        except Exception:
+            stats = None
+        settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
+        snapshot = local_snapshot(storage_root=settings_data.get("workspace"), comfy_stats=stats)
+        assessment = assess(snapshot, requirements).as_dict()
+        assessment["checked_at"] = time.time()
+        assessment["source"] = "execution_preflight"
+        candidate["resource_assessment"] = assessment
+        metadata["candidate"] = candidate
+        return metadata, assessment
 
     @staticmethod
     def simplify_workflow_query(query: str) -> str:
@@ -146,11 +283,17 @@ class WorkflowManagerMixin:
         candidate = self.store.workflow_candidate(job_key, candidate_key)
         if candidate is None:
             raise ValueError("工作流候选不存在或已过期。")
+        # Selecting the same candidate again is also how the UI restores a
+        # workflow card after it has been rebuilt.  Do not throw away the
+        # inspection, source selections, or resumable download snapshot when
+        # that happens.
+        metadata = dict(job.get("metadata") or {})
+        metadata["candidate"] = candidate
         updated = self.store.update_workflow_job(
             job_key,
             state="selected",
             selected_candidate_id=candidate_key,
-            metadata={"candidate": candidate},
+            metadata=metadata,
         )
         return {"status": "selected", "job": updated, "candidate": candidate}
 
@@ -162,17 +305,33 @@ class WorkflowManagerMixin:
         if candidate is None:
             raise ValueError("请先选择一个工作流候选。")
         provider = RunningHubProvider(self.settings)
+        node_info = None
         if loaded_nodes is None:
             loaded_nodes_error = ""
             try:
-                loaded_nodes = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).loaded_nodes)
+                comfy_executor = ComfyUIWorkflowExecutor(self.settings)
+                node_info = await asyncio.to_thread(comfy_executor.object_info)
+                loaded_nodes = sorted(str(name) for name in node_info if name)
             except Exception as exc:
                 loaded_nodes = None
                 loaded_nodes_error = str(exc)
         else:
             loaded_nodes_error = ""
         workflow = await asyncio.to_thread(provider.get_workflow, candidate)
+        if node_info is None:
+            try:
+                node_info = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).object_info)
+            except Exception:
+                # An explicitly supplied loaded-node list is still useful for
+                # dependency reporting.  Conversion will provide the precise
+                # object_info/schema error only if this workflow needs widget
+                # values that cannot be inferred from its own inputs.
+                node_info = None
         report = inspect_workflow(workflow, loaded_nodes=loaded_nodes, loaded_nodes_error=loaded_nodes_error)
+        # Normalize UI canvas exports immediately after download.  Keep the
+        # original nodes/links in the envelope so the panel can still load the
+        # graph, while execution uses the generated prompt below.
+        workflow = to_api_workflow(workflow, node_info=node_info)
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
@@ -214,7 +373,7 @@ class WorkflowManagerMixin:
             for item in prepared_models
             if isinstance(item, dict) and item.get("selection_type") != "local"
         }
-        local_model_selections = (job.get("metadata") or {}).get("local_model_selections") or {}
+        local_model_selections = dict((job.get("metadata") or {}).get("local_model_selections") or {})
         models = [
             model for model in (inspection.get("models") or [])
             if model.get("local_status") != "installed" and str(model.get("name") or "") not in prepared_names
@@ -267,8 +426,11 @@ class WorkflowManagerMixin:
             )
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
         planned_models = []
-        model_source_selections = job_metadata.get("model_source_selections") or {}
+        model_source_selections = dict(job_metadata.get("model_source_selections") or {})
         model_search_results = job_metadata.get("model_search_results") or {}
+        candidate_model_sources = candidate.get("model_sources") or []
+        if not isinstance(candidate_model_sources, list):
+            candidate_model_sources = []
         for model in models:
             model_name = str(model.get("name") or "")
             basename = Path(model_name.replace("\\", "/")).name
@@ -290,6 +452,20 @@ class WorkflowManagerMixin:
             category = self._model_category(model, job_metadata.get("workflow"))
             local_matches = self._local_model_matches(folders, category, model.get("name"))
             local_candidates = self._local_model_candidates(folders, category)
+            source_candidates = model_search_results.get(model_name, [])
+            if not isinstance(source_candidates, list):
+                source_candidates = []
+            expected_hashes = {
+                digest
+                for item in [source, *source_candidates, *candidate_model_sources]
+                if isinstance(item, dict)
+                and self._model_source_matches_name(item, basename)
+                for digest in [self._valid_model_hash(item.get("sha256"))]
+                if digest
+            }
+            matching_local_candidates = self._local_model_candidates_with_hash(
+                folders, category, expected_hashes, basename
+            )
             local_selection = local_model_selections.get(model_name)
             if isinstance(local_selection, dict):
                 selected_path = str(local_selection.get("workflow_path") or "").replace("\\", "/")
@@ -297,7 +473,40 @@ class WorkflowManagerMixin:
                 selected_file = self._selected_local_file(folders, selected_category, selected_path)
                 if selected_category != category or selected_file is None:
                     local_selection = None
-            planned = {**model, "status": "selected_local" if local_selection else "installed" if local_matches else "ready" if source else "source_required", "source": source, "source_candidates": model_search_results.get(model_name, []), "local_paths": [str(item) for item in local_matches], "local_candidates": local_candidates, "local_selection": local_selection, "category": category, "download_allowed": bool(source)}
+            if not local_selection and not local_matches and matching_local_candidates:
+                selected_path = matching_local_candidates[0]
+                selected_category, separator, category_relative_path = selected_path.partition("/")
+                selected_file = self._selected_local_file(
+                    folders, selected_category, category_relative_path
+                )
+                if (
+                    separator
+                    and selected_category == category
+                    and selected_file is not None
+                    and isinstance(job_metadata.get("workflow"), dict)
+                    and self._replace_workflow_model_reference(
+                        job_metadata["workflow"], model, category_relative_path
+                    )
+                ):
+                    local_selection = {
+                        "path": str(selected_file),
+                        "workflow_path": category_relative_path,
+                        "category": category,
+                    }
+                    local_model_selections[model_name] = local_selection
+                    model_source_selections.pop(model_name, None)
+                    source = None
+            planned = {
+                **model,
+                "status": "selected_local" if local_selection else "installed" if local_matches else "ready" if source else "source_required",
+                "source": source,
+                "source_candidates": source_candidates,
+                "local_paths": [str(item) for item in local_matches],
+                "local_candidates": local_candidates,
+                "local_selection": local_selection,
+                "category": category,
+                "download_allowed": bool(source),
+            }
             planned_models.append(planned)
         plan = {
             "job_id": job["id"],
@@ -322,6 +531,10 @@ class WorkflowManagerMixin:
             "message": "节点仓库候选仅供参考；必须由你选择来源并确认安装。安全检测通过前不会写入 custom_nodes。",
         }
         metadata = dict(job.get("metadata") or {})
+        if local_model_selections != (metadata.get("local_model_selections") or {}):
+            metadata["local_model_selections"] = local_model_selections
+            metadata["model_source_selections"] = model_source_selections
+            metadata["workflow"] = job_metadata.get("workflow")
         metadata["dependency_plan"] = plan
         self.store.update_workflow_job(job["id"], state="selected", metadata=metadata)
         return plan
@@ -502,6 +715,55 @@ class WorkflowManagerMixin:
                     candidates.append(value)
         return candidates
 
+    @staticmethod
+    def _valid_model_hash(value: Any) -> str:
+        digest = str(value or "").strip().lower()
+        return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+
+    @classmethod
+    def _model_source_matches_name(cls, source: dict[str, Any], basename: str) -> bool:
+        filename = str(source.get("filename") or "").replace("\\", "/")
+        return bool(filename) and Path(filename).name.casefold() == str(basename).casefold() and ".." not in Path(filename).parts
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(MODEL_HASH_CHUNK_SIZE), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _local_model_candidates_with_hash(
+        cls,
+        folders: dict[str, list[Path]],
+        category: str,
+        expected_hashes: set[str],
+        workflow_basename: str,
+    ) -> list[str]:
+        """Return only differently named local files with a trusted matching hash."""
+        if not expected_hashes:
+            return []
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for folder in folders.get(category, []):
+            for path, relative in cls._local_model_files(folder):
+                # An exact filename is already handled as an installed model;
+                # it must never be presented as a warning or alternate choice.
+                if path.name.casefold() == workflow_basename.casefold():
+                    continue
+                try:
+                    digest = cls._file_sha256(path)
+                except (OSError, PermissionError):
+                    continue
+                if digest not in expected_hashes:
+                    continue
+                value = f"{category}/{relative}"
+                if value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+        return candidates
+
     @classmethod
     def _selected_local_file(
         cls, folders: dict[str, list[Path]], category: Any, relative_path: Any
@@ -579,6 +841,7 @@ class WorkflowManagerMixin:
         results: dict[str, list[dict[str, Any]]] = {}
         local_results: dict[str, list[str]] = {}
         warnings: dict[str, str] = {}
+        search_urls: dict[str, str] = {}
         for model in plan.get("models", []):
             name = str(model.get("name") or "")
             if model.get("source") or model.get("status") in {"installed", "selected_local"} or name in selections:
@@ -586,24 +849,34 @@ class WorkflowManagerMixin:
             local_candidates = [str(path) for path in model.get("local_candidates") or [] if str(path).strip()]
             if local_candidates:
                 local_results[name] = local_candidates
-                prior_results[name] = []
-                results[name] = []
-                continue
+            searcher = ModelSourceSearcher(self.settings)
+            basename = Path(name.replace("\\", "/")).name
             try:
-                candidates = await asyncio.to_thread(ModelSourceSearcher(self.settings).search, Path(name.replace("\\", "/")).name)
+                candidates = await asyncio.to_thread(searcher.search, basename)
             except ValueError as exc:
                 candidates = []
                 warnings[name] = str(exc)
+            if not isinstance(candidates, list):
+                candidates = []
+            if candidates and local_candidates:
+                try:
+                    candidates = await asyncio.to_thread(searcher.enrich_sha256, candidates)
+                except ValueError as exc:
+                    warnings.setdefault(name, str(exc))
+            if basename:
+                search_urls[name] = searcher.bing_search_url(basename)
             prior_results[name] = candidates
             results[name] = candidates
         metadata["model_search_results"] = prior_results
         self.store.update_workflow_job(job["id"], metadata=metadata)
-        message = "已先检查 ComfyUI 本地模型；仅对没有本地候选的文件先搜索 Bing/Google 中的 Hugging Face 第一页结果，再回退 Hugging Face API。选择远程来源后仍需单独确认下载。"
+        refreshed_plan = self.dependency_plan(job["id"])
+        message = "已先检查 ComfyUI 本地模型，并搜索未解决模型的 Bing/Google Hugging Face 第一页结果，再回退 Hugging Face API；本地存在相同 SHA-256 的模型时会自动替换工作流中的模型文件名，只有没有本地匹配时才需要选择远程来源。选择远程来源后仍需单独确认下载。"
         if warnings:
             message += " 部分远程搜索受限或失败，不影响查看和选择本地模型。"
         return {
             "job_id": job["id"], "results": results, "local_results": local_results,
-            "warnings": warnings, "message": message,
+            "models": refreshed_plan.get("models", []),
+            "warnings": warnings, "search_urls": search_urls, "message": message,
         }
 
     def select_workflow_model_source(self, job_id: Any, model_name: Any, source: Any) -> dict[str, Any]:
@@ -618,11 +891,19 @@ class WorkflowManagerMixin:
         if not name or name in {".", ".."}:
             raise ValueError("模型名称无效。")
         candidates = (metadata.get("model_search_results") or {}).get(name, [])
+        manual_url = str((source or {}).get("url") or "").strip() if isinstance(source, dict) else ""
         repo_id = str((source or {}).get("repo_id") or "") if isinstance(source, dict) else ""
         filename = str((source or {}).get("filename") or "") if isinstance(source, dict) else ""
-        selected = next((item for item in candidates if item.get("repo_id") == repo_id and item.get("filename") == filename), None)
-        if selected is None:
-            raise ValueError("模型来源不在本次 Hugging Face 搜索结果中，请重新搜索并从列表中选择。")
+        if manual_url:
+            selected = ModelSourceSearcher(self.settings).manual_source(manual_url, Path(name.replace("\\", "/")).name)
+        else:
+            selected = next((item for item in candidates if item.get("repo_id") == repo_id and item.get("filename") == filename), None)
+            if selected is None:
+                raise ValueError("模型来源不在本次 Hugging Face 搜索结果中，请重新搜索并从列表中选择。")
+            repo_id = str(selected.get("repo_id") or "")
+            filename = str(selected.get("filename") or "")
+        repo_id = str(selected.get("repo_id") or repo_id)
+        filename = str(selected.get("filename") or filename)
         normalized_filename = filename.replace("\\", "/")
         if Path(normalized_filename).name != Path(name.replace("\\", "/")).name or ".." in Path(normalized_filename).parts:
             raise ValueError("所选仓库中的模型文件名与工作流依赖不匹配。")
@@ -689,34 +970,52 @@ class WorkflowManagerMixin:
 
     @staticmethod
     def _replace_workflow_model_reference(workflow: dict[str, Any], model: dict[str, Any], selected_path: str) -> bool:
-        source = workflow.get("prompt") if isinstance(workflow.get("prompt"), dict) else workflow.get("nodes")
-        if isinstance(source, dict):
-            entries = [(str(node_id), node) for node_id, node in source.items() if isinstance(node, dict)]
-        elif isinstance(source, list):
-            entries = [(str(node.get("id") or index), node) for index, node in enumerate(source) if isinstance(node, dict)]
-        else:
-            return False
+        sources: list[Any] = []
+        if isinstance(workflow.get("prompt"), dict):
+            sources.append(workflow["prompt"])
+        if isinstance(workflow.get("nodes"), list):
+            sources.append(workflow["nodes"])
+        if not sources:
+            sources.append(workflow.get("nodes"))
         target_nodes = {str(node_id) for node_id in (model.get("nodes") or [])}
         field = str(model.get("field") or "")
         old_value = str(model.get("name") or "")
         changed = False
-        for node_id, node in entries:
-            if node_id not in target_nodes:
-                continue
-            if field.startswith("widget_"):
-                try:
-                    index = int(field.removeprefix("widget_"))
-                    widgets = node.get("widgets_values")
-                    if isinstance(widgets, list) and index < len(widgets) and str(widgets[index]) == old_value:
-                        widgets[index] = selected_path
-                        changed = True
-                except ValueError:
-                    pass
+        for source in sources:
+            if isinstance(source, dict):
+                entries = [(str(node_id), node) for node_id, node in source.items() if isinstance(node, dict)]
+            elif isinstance(source, list):
+                entries = [(str(node.get("id") or index), node) for index, node in enumerate(source) if isinstance(node, dict)]
             else:
-                values = node.get("inputs") if isinstance(node.get("inputs"), dict) else None
-                if values is not None and str(values.get(field) or "") == old_value:
-                    values[field] = selected_path
-                    changed = True
+                continue
+            for node_id, node in entries:
+                if node_id not in target_nodes:
+                    continue
+                if field.startswith("widget_"):
+                    try:
+                        index = int(field.removeprefix("widget_"))
+                        widgets = node.get("widgets_values")
+                        if isinstance(widgets, list) and index < len(widgets) and str(widgets[index]) == old_value:
+                            widgets[index] = selected_path
+                            changed = True
+                        # The API prompt has named inputs after conversion,
+                        # while the inspection report may still identify the
+                        # original canvas value as widget_N.  Update the
+                        # matching value in the same node without guessing a
+                        # field name.
+                        values = node.get("inputs") if isinstance(node.get("inputs"), dict) else None
+                        if values is not None:
+                            for name, value in list(values.items()):
+                                if str(value) == old_value:
+                                    values[name] = selected_path
+                                    changed = True
+                    except ValueError:
+                        pass
+                else:
+                    values = node.get("inputs") if isinstance(node.get("inputs"), dict) else None
+                    if values is not None and str(values.get(field) or "") == old_value:
+                        values[field] = selected_path
+                        changed = True
         return changed
 
     async def search_workflow_node_sources(self, job_id: Any) -> dict[str, Any]:
@@ -939,8 +1238,8 @@ class WorkflowManagerMixin:
             source_filename = str(item["source"].get("filename") or item.get("name") or "").replace("\\", "/")
             if Path(source_filename).name != Path(str(item.get("name") or "").replace("\\", "/")).name or ".." in Path(source_filename).parts:
                 raise ValueError(f"模型 {item.get('name')} 的下载来源文件名不匹配。")
+        model_name = str(selected_models[0].get("name") or "")
         if not wait_for_completion:
-            model_name = str(selected_models[0].get("name") or "")
             tasks = getattr(self, "_model_download_tasks", None)
             if tasks is None:
                 tasks = {}
@@ -960,7 +1259,18 @@ class WorkflowManagerMixin:
                 cancel_events = {}
                 self._model_download_cancel_events = cancel_events
             cancel_events[key] = Event()
-            progress_by_key[key] = {"downloaded_bytes": 0, "total_bytes": None}
+            previous_snapshot = dict(
+                ((job.get("metadata") or {}).get("model_downloads") or {}).get(model_name) or {}
+            )
+            progress_by_key[key] = {
+                "downloaded_bytes": int(previous_snapshot.get("downloaded_bytes") or 0),
+                "total_bytes": previous_snapshot.get("total_bytes"),
+            }
+            self._save_model_download_snapshot(
+                job["id"], model_name, status="downloading",
+                downloaded_bytes=progress_by_key[key]["downloaded_bytes"],
+                total_bytes=progress_by_key[key]["total_bytes"], error=""
+            )
             self.store.update_workflow_job(job["id"], state="selected", error="")
             task = asyncio.create_task(
                 self._run_background_model_download(lock, job["id"], model_name, cancel_events[key])
@@ -980,10 +1290,14 @@ class WorkflowManagerMixin:
                     total_bytes: int | None,
                     model_key: tuple[str, str] = (str(job["id"]), str(item.get("name") or "")),
                 ) -> None:
-                    self._model_download_progress[model_key] = {
+                    progress = {
                         "downloaded_bytes": downloaded_bytes,
                         "total_bytes": total_bytes,
                     }
+                    self._model_download_progress[model_key] = progress
+                    self._save_model_download_snapshot(
+                        model_key[0], model_key[1], status="downloading", **progress
+                    )
 
                 if cancel_event is not None and cancel_event.is_set():
                     raise ModelDownloadCancelled("模型下载已取消；已保留部分文件，可重试并从断点继续。")
@@ -1011,10 +1325,24 @@ class WorkflowManagerMixin:
                 installed.append({"name": item.get("name"), "download": downloaded, "link": linked})
         except ModelDownloadCancelled:
             latest = self.store.get_workflow_job(job["id"]) or job
+            self._save_model_download_snapshot(
+                job["id"], model_name, status="cancelled", error="模型下载已取消，可重试并从断点继续。"
+            )
+            latest = self.store.get_workflow_job(job["id"]) or latest
             self.store.update_workflow_job(job["id"], state="selected", error="模型下载已取消，可重试并从断点继续。", metadata=latest.get("metadata") or {})
             raise
-        except Exception:
+        except ModelDownloadRetryableError as exc:
             latest = self.store.get_workflow_job(job["id"]) or job
+            self._save_model_download_snapshot(job["id"], model_name, status="paused", error=str(exc))
+            latest = self.store.get_workflow_job(job["id"]) or latest
+            self.store.update_workflow_job(job["id"], state="selected", error="", metadata=latest.get("metadata") or {})
+            raise
+        except Exception as exc:
+            latest = self.store.get_workflow_job(job["id"]) or job
+            self._save_model_download_snapshot(
+                job["id"], model_name, status="failed", error=f"模型下载失败：{exc}"
+            )
+            latest = self.store.get_workflow_job(job["id"]) or latest
             self.store.update_workflow_job(job["id"], state="selected", error="模型下载失败，请检查来源后重试。", metadata=latest.get("metadata") or {})
             raise
         latest = self.store.get_workflow_job(job["id"]) or job
@@ -1023,11 +1351,47 @@ class WorkflowManagerMixin:
         prepared_by_name = {str(item.get("name") or ""): item for item in prepared if isinstance(item, dict)}
         prepared_by_name.update({str(item.get("name") or ""): item for item in installed})
         metadata["prepared_models"] = list(prepared_by_name.values())
+        self._save_model_download_snapshot(job["id"], model_name, status="completed", error="")
+        latest = self.store.get_workflow_job(job["id"]) or latest
+        metadata = dict(latest.get("metadata") or {})
+        metadata["prepared_models"] = list(prepared_by_name.values())
         metadata.pop("dependency_plan", None)
         remaining = [item for item in plan.get("models", []) if item.get("status") not in {"installed", "selected_local"} and item.get("name") not in prepared_by_name]
         state = "ready" if not remaining else "selected"
         self.store.update_workflow_job(job["id"], state=state, error="", metadata=metadata)
         return {"status": "models_prepared", "job_id": job["id"], "models": installed, "remaining_models": [item.get("name") for item in remaining], "restart_required": bool(metadata.get("prepared_nodes"))}
+
+    def _save_model_download_snapshot(
+        self,
+        job_id: Any,
+        model_name: Any,
+        *,
+        status: str,
+        downloaded_bytes: int | None = None,
+        total_bytes: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Persist the resumable download projection alongside the workflow job."""
+        job = self.store.get_workflow_job(str(job_id))
+        if not job:
+            return
+        name = str(model_name or "").strip()
+        if not name:
+            return
+        metadata = dict(job.get("metadata") or {})
+        downloads = dict(metadata.get("model_downloads") or {})
+        previous = dict(downloads.get(name) or {})
+        snapshot = {
+            **previous,
+            "status": str(status),
+            "downloaded_bytes": previous.get("downloaded_bytes", 0) if downloaded_bytes is None else int(downloaded_bytes),
+            "total_bytes": previous.get("total_bytes") if total_bytes is None else int(total_bytes),
+        }
+        if error is not None:
+            snapshot["error"] = str(error)
+        downloads[name] = snapshot
+        metadata["model_downloads"] = downloads
+        self.store.update_workflow_job(str(job_id), metadata=metadata)
 
     async def _run_background_model_download(
         self, lock: asyncio.Lock, job_id: Any, model_name: str, cancel_event: Event
@@ -1041,8 +1405,20 @@ class WorkflowManagerMixin:
                 )
             except ModelDownloadCancelled:
                 raise
+            except ModelDownloadRetryableError as exc:
+                job = self.store.get_workflow_job(str(job_id)) or {}
+                self._save_model_download_snapshot(str(job_id), model_name, status="paused", error=str(exc))
+                job = self.store.get_workflow_job(str(job_id)) or job
+                self.store.update_workflow_job(
+                    str(job_id), state="selected", error="", metadata=job.get("metadata") or {}
+                )
+                raise
             except Exception as exc:
                 job = self.store.get_workflow_job(str(job_id)) or {}
+                self._save_model_download_snapshot(
+                    str(job_id), model_name, status="failed", error=f"模型下载失败：{exc}"
+                )
+                job = self.store.get_workflow_job(str(job_id)) or job
                 self.store.update_workflow_job(
                     str(job_id), state="selected", error=f"模型下载失败：{exc}", metadata=job.get("metadata") or {}
                 )
@@ -1066,6 +1442,9 @@ class WorkflowManagerMixin:
         if cancel_event is None:
             raise ValueError("下载任务不支持取消，请重新启动下载后再试。")
         cancel_event.set()
+        self._save_model_download_snapshot(
+            job["id"], name, status="cancelling", error=""
+        )
         return {"status": "cancelling", "job_id": job["id"], "name": name}
 
     def _discard_model_download_task(self, key: tuple[str, str], task: asyncio.Task) -> None:
@@ -1084,6 +1463,7 @@ class WorkflowManagerMixin:
         name = str(model_name or "").strip()
         job = self.workflow_job(job_id)
         metadata = dict(job.get("metadata") or {})
+        snapshot = dict((metadata.get("model_downloads") or {}).get(name) or {})
         prepared = next(
             (item for item in metadata.get("prepared_models") or [] if isinstance(item, dict) and item.get("name") == name),
             None,
@@ -1094,28 +1474,71 @@ class WorkflowManagerMixin:
         cancel_event = getattr(self, "_model_download_cancel_events", {}).get((str(job["id"]), name))
         if cancel_event is not None and cancel_event.is_set():
             status = "cancelled" if task is None or task.done() else "cancelling"
-            progress = getattr(self, "_model_download_progress", {}).get((str(job["id"]), name), {})
-            return {"status": status, "job_id": job["id"], "name": name, **progress}
+            progress = {**snapshot, **getattr(self, "_model_download_progress", {}).get((str(job["id"]), name), {})}
+            return {**progress, "status": status, "job_id": job["id"], "name": name}
         if "模型下载已取消" in str(job.get("error") or ""):
-            return {"status": "cancelled", "job_id": job["id"], "name": name, "error": job["error"]}
+            return {
+                **snapshot,
+                "status": "cancelled",
+                "job_id": job["id"],
+                "name": name,
+                "error": job["error"],
+            }
         if task is not None and task.done():
             try:
                 error = task.exception()
             except asyncio.CancelledError:
                 error = "模型下载任务已取消。"
-            if error is not None:
-                return {"status": "failed", "job_id": job["id"], "name": name, "error": str(error)}
+            if error is not None and str(snapshot.get("status") or "") != "paused":
+                if self._is_resumable_download_error(snapshot.get("error") or error):
+                    return {**snapshot, "status": "paused", "job_id": job["id"], "name": name}
+                return {
+                    **snapshot,
+                    "status": "failed",
+                    "job_id": job["id"],
+                    "name": name,
+                    "error": str(error),
+                }
         if task is not None and not task.done():
-            progress = getattr(self, "_model_download_progress", {}).get((str(job["id"]), name), {})
-            return {"status": "downloading", "job_id": job["id"], "name": name, **progress}
+            progress = {**snapshot, **getattr(self, "_model_download_progress", {}).get((str(job["id"]), name), {})}
+            return {**progress, "status": "downloading", "job_id": job["id"], "name": name}
+        if snapshot:
+            status = str(snapshot.get("status") or "idle")
+            if status == "failed" and self._is_resumable_download_error(snapshot.get("error")):
+                status = "paused"
+            if status in {"downloading", "cancelling"}:
+                # The asyncio task is an in-process projection.  After a UI
+                # reload or agent recreation the .part file is still valid,
+                # but the old task is not; expose it as resumable instead of
+                # showing a download that can never advance.
+                status = "paused"
+            return {**snapshot, "status": status, "job_id": job["id"], "name": name}
+        if self._is_resumable_download_error(job.get("error")):
+            return {
+                "status": "paused",
+                "job_id": job["id"],
+                "name": name,
+                "error": job["error"],
+            }
         if job.get("state") == "preparing_models":
             return {
                 "status": "failed", "job_id": job["id"], "name": name,
                 "error": "下载服务中断，可重新点击下载并从已下载位置继续。",
             }
         if job.get("error"):
-            return {"status": "failed", "job_id": job["id"], "name": name, "error": job["error"]}
+            return {
+                **snapshot,
+                "status": "failed",
+                "job_id": job["id"],
+                "name": name,
+                "error": job["error"],
+            }
         return {"status": "idle", "job_id": job["id"], "name": name}
+
+    @staticmethod
+    def _is_resumable_download_error(error: Any) -> bool:
+        text = str(error or "").lower()
+        return "timed out" in text or "timeout" in text or "超时" in text or "已保留可续传" in text
 
     async def create_development_task(self, job_id: Any, *, confirmed: bool = False) -> dict[str, Any]:
         if not confirmed:
@@ -1153,31 +1576,108 @@ class WorkflowManagerMixin:
     async def execute_workflow(self, job_id: Any, *, confirmed: bool = False, timeout: float = 1800.0) -> dict[str, Any]:
         if not confirmed:
             raise ValueError("必须由用户明确确认后才能执行工作流。")
-        job = self.workflow_job(job_id)
-        if job.get("state") not in {"ready", "selected", "checking_dependencies"}:
-            raise ValueError(f"当前工作流状态不能执行：{job.get('state')}")
-        metadata = dict(job.get("metadata") or {})
-        candidate = metadata.get("candidate") or {}
-        execution_mode = str(candidate.get("execution_mode") or "local").lower()
-        if execution_mode in {"remote", "cloud", "api", "hosted"} or candidate.get("remote_endpoint"):
-            raise ValueError("该工作流需要非本地模型或云端推理，请使用候选卡片显示的远程服务，不会在本机 ComfyUI 上执行。")
-        resource_assessment = metadata.get("candidate", {}).get("resource_assessment") or {}
-        if resource_assessment.get("feasible") is False:
-            raise ValueError("当前机器资源不足，不能执行该工作流：" + "；".join(resource_assessment.get("reasons") or []))
-        workflow = metadata.get("workflow")
-        if not isinstance(workflow, dict):
-            raise ValueError("工作流内容尚未下载或解析。")
-        prompt = workflow.get("prompt") if isinstance(workflow.get("prompt"), dict) else None
-        if not prompt:
-            raise ValueError("当前工作流不是可自动执行的 ComfyUI API 格式，请先转换为 API 工作流。")
+        try:
+            job = self.workflow_job(job_id)
+            metadata = dict(job.get("metadata") or {})
+            allowed_states = {"ready", "selected", "checking_dependencies"}
+            if metadata.get("execution_diagnostic"):
+                allowed_states.add("failed")
+            if job.get("state") not in allowed_states:
+                raise ValueError(f"当前工作流状态不能执行：{job.get('state')}")
+            candidate = metadata.get("candidate") or {}
+            execution_mode = str(candidate.get("execution_mode") or "local").lower()
+            if execution_mode in {"remote", "cloud", "api", "hosted"} or candidate.get("remote_endpoint"):
+                raise ValueError("该工作流需要非本地模型或云端推理，请使用候选卡片显示的远程服务，不会在本机 ComfyUI 上执行。")
+            # Resource assessments are heuristics used for search ranking.  A
+            # candidate may have been selected hours ago, and an old estimate
+            # must not turn the execute button into a generic preparation error.
+            # Refresh it for context, but let ComfyUI be the authority during
+            # the actual run (its CUDA/model/node error is more specific).
+            metadata, _resource_assessment = await self._refresh_workflow_resource_assessment(job["id"], metadata)
+            workflow = metadata.get("workflow")
+            if not isinstance(workflow, dict):
+                raise ValueError("工作流内容尚未下载或解析。")
+            try:
+                node_info = None
+                raw_nodes = workflow.get("nodes")
+                needs_schema = isinstance(raw_nodes, list) and any(
+                    isinstance(node, dict)
+                    and isinstance(node.get("inputs"), list)
+                    for node in raw_nodes
+                )
+                if needs_schema:
+                    try:
+                        node_info = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).object_info)
+                    except Exception as exc:
+                        raise ValueError(f"无法读取 ComfyUI 节点 schema，不能安全转换画布控件：{exc}") from exc
+                workflow = to_api_workflow(workflow, node_info=node_info)
+            except WorkflowParseError as exc:
+                raise WorkflowParseError(
+                    f"工作流无法自动转换为 ComfyUI API 格式：{exc}",
+                    diagnostic=getattr(exc, "diagnostic", None),
+                ) from exc
+            except ValueError as exc:
+                raise ValueError(f"工作流无法自动转换为 ComfyUI API 格式：{exc}") from exc
+            prompt = workflow.get("prompt")
+            if not isinstance(prompt, dict) or not prompt:
+                raise ValueError("自动转换后没有可执行的 ComfyUI API prompt。")
+            metadata["workflow"] = workflow
+        except (ValueError, OSError) as exc:
+            self._record_workflow_execution_failure(
+                str(job_id),
+                exc,
+                code="preflight_error",
+                hint="请根据上面的具体前置检查原因处理；不会在执行失败后自动安装节点或下载模型。",
+                phase="preflight",
+            )
+            await self._enrich_workflow_execution_failure(job_id)
+            raise
+        self.store.update_workflow_job(job["id"], metadata=metadata)
         self.store.update_workflow_job(job["id"], state="executing")
         try:
-            result = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).execute, prompt, timeout=timeout)
+            executor = ComfyUIWorkflowExecutor(self.settings)
+            attempts = 0
+            while True:
+                try:
+                    result = await asyncio.to_thread(executor.execute, prompt, timeout=timeout)
+                    break
+                except WorkflowExecutionError as exc:
+                    request_path = str((exc.details or {}).get("path") or "") if isinstance(exc.details, dict) else ""
+                    # A failed connection while submitting to /prompt is safe
+                    # to retry once.
+                    # Never replay a prompt after it has received a prompt_id.
+                    if attempts == 0 and exc.retryable and not exc.prompt_id and request_path == "/prompt":
+                        attempts += 1
+                        await asyncio.sleep(0.25)
+                        continue
+                    self._record_workflow_execution_failure(
+                        job["id"],
+                        exc,
+                        recovery="已自动重试一次提交请求。" if attempts else "",
+                        phase="execution",
+                    )
+                    await self._enrich_workflow_execution_failure(job["id"])
+                    raise
+        except WorkflowExecutionError as exc:
+            # The inner block has already persisted a structured diagnostic.
+            # This catch keeps unexpected future executor changes covered.
+            if (self.store.get_workflow_job(job["id"]) or {}).get("state") != "failed":
+                self._record_workflow_execution_failure(job["id"], exc, phase="execution")
+                await self._enrich_workflow_execution_failure(job["id"])
+            raise
         except Exception as exc:
-            self.store.update_workflow_job(job["id"], state="failed", error=str(exc), metadata={"execution_error": str(exc)})
+            self._record_workflow_execution_failure(
+                job["id"],
+                exc,
+                hint="请查看 ComfyUI 控制台日志；当前错误没有可安全自动修复的信息。",
+                phase="execution",
+            )
+            await self._enrich_workflow_execution_failure(job["id"])
             raise
         metadata["execution"] = result
         metadata["outputs"] = result.get("outputs") or {}
+        metadata.pop("execution_error", None)
+        metadata.pop("execution_diagnostic", None)
         self.store.update_workflow_job(job["id"], state="ready", metadata=metadata, error="")
         return {"status": "completed", "job_id": job["id"], "prompt_id": result["prompt_id"], "outputs": result["outputs"], "restart_required": False}
 

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import asyncio
 import base64
+import hashlib
 import contextlib
 import io
 import json
@@ -24,7 +25,7 @@ from omniscience_server import (
     apply_unified_patch,
 )
 from omniscience import archives, node_review, node_security, skill_review, skill_security
-from omniscience import model_downloader, model_source, node_search, workflow_executor, workflow_manager
+from omniscience import model_downloader, model_source, node_search, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
 from omniscience_mcp import MCPManager
@@ -1697,6 +1698,326 @@ class NodeInstallRequestTests(unittest.TestCase):
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(archive, "uploads/other.zip"))
 
 
+class WorkflowParserTests(unittest.TestCase):
+    def test_ui_canvas_is_converted_to_api_prompt_with_links_and_object_info_widgets(self):
+        from omniscience.workflow_parser import inspect_workflow, to_api_workflow
+
+        canvas = {
+            "last_node_id": 3,
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "LoadImage",
+                    "inputs": [],
+                    "widgets_values": ["input.png", "image"],
+                },
+                {
+                    "id": 2,
+                    "type": "PreviewImage",
+                    "inputs": [{"name": "images", "type": "IMAGE", "link": 7}],
+                    "widgets_values": [],
+                },
+                {"id": 3, "type": "Note", "inputs": [], "widgets_values": ["ignored"]},
+            ],
+            "links": [[7, 1, 0, 2, 0, "IMAGE"]],
+        }
+        object_info = {
+            "LoadImage": {
+                "input": {"required": {"image": ["STRING", {"image_folder": "input"}]}}
+            },
+            "PreviewImage": {"input": {"required": {"images": ["IMAGE", {}]}}},
+        }
+
+        converted = to_api_workflow(canvas, node_info=object_info)
+        self.assertEqual(converted["prompt"]["1"], {"class_type": "LoadImage", "inputs": {"image": "input.png"}})
+        self.assertEqual(converted["prompt"]["2"]["inputs"]["images"], ["1", 0])
+        self.assertNotIn("3", converted["prompt"])
+        self.assertEqual(inspect_workflow(canvas)["format"], "ui")
+        self.assertEqual(canvas["nodes"][0]["widgets_values"][0], "input.png")
+
+    def test_ui_conversion_uses_named_widgets_and_ignores_bypassed_source(self):
+        from omniscience.workflow_parser import to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "PromptEnhancer",
+                    "mode": 4,
+                    "inputs": [],
+                    "widgets_values_named": {"text": "unused"},
+                },
+                {
+                    "id": 2,
+                    "type": "NamedWidgetNode",
+                    "inputs": [{"name": "value", "type": "STRING", "widget": {"name": "value"}, "link": 7}],
+                    # The second entry is a front-end-only control state.  The
+                    # named representation is the authoritative API value.
+                    "widgets_values": ["stale", "randomize"],
+                    "widgets_values_named": {"value": "from named widgets"},
+                },
+            ],
+            "links": [[7, 1, 0, 2, 0, "STRING"]],
+        }
+        object_info = {
+            "NamedWidgetNode": {
+                "input": {"required": {"value": ["STRING", {}]}}
+            }
+        }
+
+        converted = to_api_workflow(canvas, node_info=object_info)
+
+        self.assertNotIn("1", converted["prompt"])
+        self.assertEqual(converted["prompt"]["2"]["inputs"], {"value": "from named widgets"})
+        self.assertTrue(
+            any(
+                item.get("node_id") == "1" and item.get("reason") == "bypassed_node"
+                for item in converted["conversion_diagnostics"]
+            )
+        )
+
+    def test_api_prompt_and_common_nested_provider_payload_are_normalized(self):
+        from omniscience.workflow_parser import to_api_workflow
+
+        prompt = {"4": {"class_type": "KSampler", "inputs": {"seed": 1}}}
+        self.assertEqual(to_api_workflow(prompt), {"prompt": prompt})
+        self.assertEqual(to_api_workflow({"prompt": prompt, "extra": {"client": "test"}})["prompt"], prompt)
+        self.assertEqual(to_api_workflow({"workflowJson": json.dumps({"prompt": prompt})})["prompt"], prompt)
+
+    def test_ui_conversion_rejects_widgets_without_comfyui_schema(self):
+        from omniscience.workflow_parser import WorkflowParseError, to_api_workflow
+
+        canvas = {"nodes": [{"id": 1, "type": "LoadImage", "inputs": [], "widgets_values": ["input.png"]}]}
+        with self.assertRaisesRegex(WorkflowParseError, "object_info"):
+            to_api_workflow(canvas)
+
+    def test_ui_conversion_reconstructs_node_28_preview_when_canvas_inputs_are_incomplete(self):
+        from omniscience.workflow_parser import to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 28,
+                    "type": "ResolutionSelector",
+                    # This is the observed failure shape: the front-end keeps
+                    # width/height sockets but omits the scalar preview widget.
+                    "inputs": [
+                        {"name": "width", "type": "INT"},
+                        {"name": "height", "type": "INT"},
+                    ],
+                    "widgets_values": [512, 512, "true"],
+                }
+            ]
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {"default": 512}],
+                        "height": ["INT", {"default": 512}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+
+        converted = to_api_workflow(canvas, node_info=object_info)
+
+        self.assertEqual(
+            converted["prompt"]["28"]["inputs"],
+            {"width": 512, "height": 512, "preview": "true"},
+        )
+        self.assertEqual(
+            [item["field"] for item in converted["conversion_diagnostics"] if item.get("node_id") == "28"],
+            ["width", "height", "preview"],
+        )
+
+    def test_ui_conversion_does_not_guess_missing_node_28_preview(self):
+        from omniscience.workflow_parser import WorkflowParseError, to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 28,
+                    "type": "ResolutionSelector",
+                    "inputs": [
+                        {"name": "width", "type": "INT"},
+                        {"name": "height", "type": "INT"},
+                    ],
+                    "widgets_values": [512, 512],
+                }
+            ]
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "height": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(WorkflowParseError, "节点 28.*preview") as raised:
+            to_api_workflow(canvas, node_info=object_info)
+        self.assertEqual(raised.exception.diagnostic["source_index"], 2)
+        self.assertEqual(raised.exception.diagnostic["reason"], "missing_widget_value")
+
+    def test_ui_conversion_rejects_node_28_preview_outside_object_info_choices(self):
+        from omniscience.workflow_parser import WorkflowParseError, to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 28,
+                    "type": "ResolutionSelector",
+                    "inputs": [
+                        {"name": "width", "type": "INT"},
+                        {"name": "height", "type": "INT"},
+                    ],
+                    "widgets_values": [512, 512, "typo"],
+                }
+            ]
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "height": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(WorkflowParseError, "preview.*schema") as raised:
+            to_api_workflow(canvas, node_info=object_info)
+        self.assertEqual(raised.exception.diagnostic["reason"], "invalid_enum_value")
+        self.assertEqual(raised.exception.diagnostic["allowed_values"], ["false", "true"])
+
+    def test_ui_conversion_omits_socketless_resolution_preview_from_api_inputs(self):
+        from omniscience.workflow_parser import to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 19,
+                    "type": "ResolutionSelector",
+                    "inputs": [
+                        {"name": "aspect_ratio", "type": "COMBO", "widget": {"name": "aspect_ratio"}},
+                        {"name": "megapixels", "type": "FLOAT", "widget": {"name": "megapixels"}},
+                        {"name": "multiple", "type": "INT", "widget": {"name": "multiple"}},
+                        # The real canvas export includes this widget metadata
+                        # even though /object_info marks the input socketless.
+                        {"name": "preview", "type": "RESOLUTION_PREVIEW", "widget": {"name": "preview"}},
+                    ],
+                    "widgets_values_named": {
+                        "aspect_ratio": "1:1 (Square)",
+                        "megapixels": 1.0,
+                        "multiple": 8,
+                    },
+                }
+            ]
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "aspect_ratio": ["COMBO", {"options": ["1:1 (Square)"]}],
+                        "megapixels": ["FLOAT", {"default": 1.0}],
+                        "multiple": ["INT", {"default": 8}],
+                    },
+                    "optional": {
+                        "preview": [
+                            "RESOLUTION_PREVIEW",
+                            {"socketless": True},
+                        ],
+                    },
+                }
+            }
+        }
+
+        converted = to_api_workflow(canvas, node_info=object_info)
+
+        self.assertEqual(
+            converted["prompt"]["19"]["inputs"],
+            {
+                "aspect_ratio": "1:1 (Square)",
+                "megapixels": 1.0,
+                "multiple": 8,
+            },
+        )
+        self.assertNotIn(
+            "preview",
+            [item.get("field") for item in converted["conversion_diagnostics"] if item.get("node_id") == "19"],
+        )
+
+    def test_ui_conversion_rejects_node_28_invalid_scalar_type(self):
+        from omniscience.workflow_parser import WorkflowParseError, to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 28,
+                    "type": "ResolutionSelector",
+                    "inputs": [
+                        {"name": "width", "type": "INT"},
+                        {"name": "height", "type": "INT"},
+                    ],
+                    "widgets_values": ["512", 512, "true"],
+                }
+            ]
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "height": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(WorkflowParseError, "width.*类型") as raised:
+            to_api_workflow(canvas, node_info=object_info)
+        self.assertEqual(raised.exception.diagnostic["reason"], "invalid_input_type")
+        self.assertEqual(raised.exception.diagnostic["expected_type"], "INT")
+
+    def test_converted_canvas_is_rebuilt_instead_of_reusing_stale_prompt(self):
+        from omniscience.workflow_parser import to_api_workflow
+
+        canvas = {
+            "nodes": [
+                {
+                    "id": 28,
+                    "type": "ResolutionSelector",
+                    "inputs": [{"name": "width", "type": "INT"}],
+                    "widgets_values": [640, "true"],
+                }
+            ],
+            "prompt": {"28": {"class_type": "ResolutionSelector", "inputs": {"width": 1}}},
+        }
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+
+        converted = to_api_workflow(canvas, node_info=object_info)
+
+        self.assertEqual(converted["prompt"]["28"]["inputs"], {"width": 640, "preview": "true"})
+
+
 class GitHubNodeSearchTests(unittest.TestCase):
     def test_search_returns_only_canonical_github_repository_candidates(self):
         payload = {
@@ -1906,8 +2227,388 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(install.await_args_list[0].kwargs["acknowledged"])
         self.assertTrue(install.await_args_list[1].kwargs["acknowledged"])
 
+    async def test_workflow_execution_failure_is_persisted_with_diagnostic(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {"prompt": {"7": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}},
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        failure = workflow_manager.WorkflowExecutionError(
+            "工作流执行失败：节点 7：CUDA out of memory",
+            code="execution_error",
+            details={"node_id": "7", "exception_message": "CUDA out of memory"},
+            prompt_id="prompt-id",
+            hint="请降低分辨率/批量大小。",
+        )
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "execute", side_effect=failure):
+            with self.assertRaisesRegex(workflow_manager.WorkflowExecutionError, "CUDA out of memory"):
+                await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        job = self.agent.workflow_job(self.job["id"])
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("CUDA out of memory", job["error"])
+        diagnostic = job["metadata"]["execution_diagnostic"]
+        self.assertEqual(diagnostic["code"], "execution_error")
+        self.assertEqual(diagnostic["prompt_id"], "prompt-id")
+        self.assertEqual(diagnostic["details"]["node_id"], "7")
+        self.assertEqual(diagnostic["hint"], "请降低分辨率/批量大小。")
+
+    async def test_ui_workflow_is_converted_before_execution(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {
+                "nodes": [
+                    {"id": 1, "type": "LoadImage", "inputs": {"image": "input.png"}},
+                    {"id": 2, "type": "PreviewImage", "inputs": {"images": ["1", 0]}},
+                ],
+                "links": [],
+            },
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        result = {"prompt_id": "prompt-id", "outputs": {"2": {"images": []}}, "history": {}, "status": "completed"}
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "system_stats", return_value={}), patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor, "execute", return_value=result
+        ) as execute:
+            completed = await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        self.assertEqual(completed["status"], "completed")
+        submitted_prompt = execute.call_args.args[0]
+        self.assertEqual(
+            submitted_prompt,
+            {
+                "1": {"class_type": "LoadImage", "inputs": {"image": "input.png"}},
+                "2": {"class_type": "PreviewImage", "inputs": {"images": ["1", 0]}},
+            },
+        )
+        saved_workflow = self.agent.workflow_job(self.job["id"])["metadata"]["workflow"]
+        self.assertIn("nodes", saved_workflow)
+        self.assertIn("prompt", saved_workflow)
+
+    async def test_node_28_preview_is_in_submitted_prompt_after_object_info_conversion(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {
+                "nodes": [
+                    {
+                        "id": 28,
+                        "type": "ResolutionSelector",
+                        "inputs": [
+                            {"name": "width", "type": "INT"},
+                            {"name": "height", "type": "INT"},
+                        ],
+                        "widgets_values": [512, 512, "true"],
+                    }
+                ],
+                "links": [],
+            },
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        result = {"prompt_id": "prompt-id", "outputs": {"28": {"images": []}}, "history": {}, "status": "completed"}
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "height": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value=object_info) as info, patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor, "execute", return_value=result
+        ) as execute:
+            await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        info.assert_called_once()
+        self.assertEqual(
+            execute.call_args.args[0]["28"]["inputs"],
+            {"width": 512, "height": 512, "preview": "true"},
+        )
+
+    async def test_node_28_missing_preview_fails_preflight_before_execution(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {
+                "nodes": [
+                    {
+                        "id": 28,
+                        "type": "ResolutionSelector",
+                        "inputs": [
+                            {"name": "width", "type": "INT"},
+                            {"name": "height", "type": "INT"},
+                        ],
+                        "widgets_values": [512, 512],
+                    }
+                ],
+                "links": [],
+            },
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        object_info = {
+            "ResolutionSelector": {
+                "input": {
+                    "required": {
+                        "width": ["INT", {}],
+                        "height": ["INT", {}],
+                        "preview": [["false", "true"], {}],
+                    }
+                }
+            }
+        }
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value=object_info), patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor, "execute"
+        ) as execute:
+            with self.assertRaisesRegex(ValueError, "节点 28.*preview"):
+                await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        execute.assert_not_called()
+        diagnostic = self.agent.workflow_job(self.job["id"])["metadata"]["execution_diagnostic"]
+        self.assertEqual(diagnostic["details"]["field"], "preview")
+        self.assertEqual(diagnostic["details"]["source_index"], 2)
+
+    async def test_workflow_failure_keeps_comfy_error_and_persists_ai_diagnosis(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {"prompt": {"7": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}},
+            "inspection": {"format": "api", "node_count": 1, "models": []},
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        failure = workflow_manager.WorkflowExecutionError(
+            "工作流执行失败：节点 7：CUDA out of memory",
+            code="execution_error",
+            details={"node_id": "7", "exception_message": "CUDA out of memory"},
+            prompt_id="prompt-id",
+            hint="请降低分辨率/批量大小。",
+        )
+        ai = {
+            "category": "memory",
+            "summary": "节点 7 执行时显存不足。",
+            "cause": "ComfyUI 返回 CUDA out of memory。",
+            "actions": ["降低分辨率或批量大小后重试。"],
+            "confidence": "high",
+            "ai_status": "completed",
+        }
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "execute", side_effect=failure), patch.object(
+            workflow_manager, "diagnose_execution_failure", new=AsyncMock(side_effect=lambda settings, **kwargs: {**kwargs["diagnostic"], **ai})
+        ):
+            with self.assertRaisesRegex(workflow_manager.WorkflowExecutionError, "CUDA out of memory"):
+                await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        diagnostic = self.agent.workflow_job(self.job["id"])["metadata"]["execution_diagnostic"]
+        self.assertEqual(diagnostic["ai_status"], "completed")
+        self.assertEqual(diagnostic["category"], "memory")
+        self.assertEqual(diagnostic["summary"], "节点 7 执行时显存不足。")
+        self.assertIn("CUDA out of memory", diagnostic["message"])
+        self.assertEqual(diagnostic["details"]["node_id"], "7")
+
+    async def test_stale_resource_assessment_does_not_block_prepared_execution(self):
+        metadata = {
+            "candidate": {
+                "id": "candidate",
+                "execution_mode": "local",
+                "resource_requirements": {"vram_gb": 24},
+                "resource_assessment": {"feasible": False, "reasons": ["旧评估"]},
+            },
+            "workflow": {"prompt": {"7": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}},
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        result = {"prompt_id": "prompt-id", "outputs": {"9": {"images": []}}, "history": {}, "status": "completed"}
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "system_stats", return_value={}), patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor, "execute", return_value=result
+        ) as execute:
+            completed = await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+
+        self.assertEqual(completed["status"], "completed")
+        execute.assert_called_once()
+        refreshed = self.agent.workflow_job(self.job["id"])["metadata"]["candidate"]["resource_assessment"]
+        self.assertNotEqual(refreshed["reasons"], ["旧评估"])
+        self.assertEqual(refreshed["source"], "execution_preflight")
+
+    async def test_workflow_execution_retries_only_a_connection_failure_before_prompt_id(self):
+        metadata = {
+            "candidate": {"id": "candidate", "execution_mode": "local"},
+            "workflow": {"prompt": {"7": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}},
+        }
+        self.agent.store.update_workflow_job(self.job["id"], state="ready", metadata=metadata)
+        first_failure = workflow_manager.WorkflowExecutionError(
+            "ComfyUI 请求失败：POST /prompt：连接被拒绝",
+            code="connection_error",
+            details={"method": "POST", "path": "/prompt"},
+            retryable=True,
+        )
+        second_failure = workflow_manager.WorkflowExecutionError(
+            "ComfyUI 请求失败：POST /prompt：连接仍然被拒绝",
+            code="connection_error",
+            details={"method": "POST", "path": "/prompt"},
+            retryable=True,
+        )
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "execute",
+            side_effect=[first_failure, second_failure],
+        ) as execute, patch.object(workflow_manager.asyncio, "sleep", new=AsyncMock()):
+            with self.assertRaisesRegex(workflow_manager.WorkflowExecutionError, "仍然被拒绝"):
+                await self.agent.execute_workflow(self.job["id"], confirmed=True, timeout=1)
+        self.assertEqual(execute.call_count, 2)
+        diagnostic = self.agent.workflow_job(self.job["id"])["metadata"]["execution_diagnostic"]
+        self.assertEqual(diagnostic["recovery"], "已自动重试一次提交请求。")
+
+
+class WorkflowDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ai_diagnosis_parses_structured_json_and_keeps_original_error(self):
+        settings = {"model": "test-model", "api_base_url": "http://model.test/v1"}
+        original = workflow_diagnostics.static_diagnostic(
+            code="execution_error",
+            message="工作流执行失败：节点 7：CUDA out of memory",
+            details={"node_id": "7"},
+        )
+        response = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "category": "memory",
+                            "summary": "节点 7 显存不足",
+                            "cause": "ComfyUI 返回 CUDA out of memory",
+                            "actions": ["降低分辨率"],
+                            "confidence": "high",
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            }]
+        }
+        with patch.object(workflow_diagnostics, "complete", new=AsyncMock(return_value=response)) as complete:
+            result = await workflow_diagnostics.diagnose_execution_failure(
+                settings, diagnostic=original, workflow_context={"node_count": 1}
+            )
+        self.assertEqual(result["ai_status"], "completed")
+        self.assertEqual(result["category"], "memory")
+        self.assertEqual(result["actions"], ["降低分辨率"])
+        self.assertIn("CUDA out of memory", result["message"])
+        complete.assert_awaited_once()
+
+    async def test_missing_model_skips_ai_request_and_keeps_static_diagnosis(self):
+        original = workflow_diagnostics.static_diagnostic(
+            code="execution_error", message="工作流执行失败：节点 7：CUDA out of memory"
+        )
+        with patch.object(workflow_diagnostics, "complete", new=AsyncMock()) as complete:
+            result = await workflow_diagnostics.diagnose_execution_failure({}, diagnostic=original)
+        self.assertEqual(result["ai_status"], "unavailable")
+        self.assertEqual(result["category"], "memory")
+        self.assertIn("CUDA out of memory", result["message"])
+        complete.assert_not_awaited()
+
 
 class WorkflowExecutorTests(unittest.TestCase):
+    def test_submit_uses_comfyui_prompt_route(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        prompt = {"12": {"class_type": "CheckpointLoaderSimple", "inputs": {}}}
+        with patch.object(executor, "_json", return_value={"prompt_id": "prompt-id"}) as request:
+            self.assertEqual(executor.submit(prompt), "prompt-id")
+
+        request.assert_called_once()
+        method, path, payload = request.call_args.args[:3]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/prompt")
+        self.assertEqual(payload["prompt"], prompt)
+        self.assertTrue(payload["client_id"])
+
+    def test_submit_exposes_comfyui_node_validation_errors(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(
+            executor,
+            "_json",
+            return_value={
+                "error": {"type": "prompt_invalid", "message": "缺少模型文件"},
+                "node_errors": {"12": {"errors": ["CheckpointLoaderSimple: model not found"]}},
+            },
+        ):
+            with self.assertRaisesRegex(workflow_executor.WorkflowExecutionError, "缺少模型文件") as caught:
+                executor.submit({"12": {"class_type": "CheckpointLoaderSimple", "inputs": {}}})
+        self.assertEqual(caught.exception.code, "prompt_rejected")
+        self.assertIn("节点 12", str(caught.exception))
+        self.assertIn("model not found", str(caught.exception))
+        self.assertIn("模型", caught.exception.hint)
+
+    def test_wait_uses_history_until_prompt_is_complete(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(
+            executor,
+            "_json",
+            side_effect=[
+                {},
+                {"prompt-id": {"status": {"status_str": "success", "completed": False}}},
+                {
+                    "prompt-id": {
+                        "status": {"status_str": "success", "completed": True, "messages": []},
+                        "outputs": {"7": {"text": ["done"]}},
+                    }
+                },
+            ],
+        ) as request, patch.object(workflow_executor.time, "sleep") as sleep:
+            result = executor.wait("prompt-id", timeout=1, interval=0.1)
+
+        self.assertEqual(result["outputs"], {"7": {"text": ["done"]}})
+        self.assertEqual([call_record.args[1] for call_record in request.call_args_list], ["/history/prompt-id"] * 3)
+        self.assertEqual(sleep.call_count, 2)
+        sleep.assert_called_with(0.1)
+
+    def test_wait_persists_comfyui_history_error_details_on_exception(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(
+            executor,
+            "_json",
+            side_effect=[
+                {
+                    "prompt-id": {
+                        "status": {
+                            "status_str": "error",
+                            "completed": True,
+                            "messages": [
+                                [
+                                    "execution_error",
+                                    {
+                                        "prompt_id": "prompt-id",
+                                        "node_id": "28",
+                                        "node_type": "TextGenerate",
+                                        "exception_message": "_clip_generate() got an unexpected keyword argument 'mtp'",
+                                    },
+                                ]
+                            ],
+                        },
+                        "outputs": {},
+                    }
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(workflow_executor.WorkflowExecutionError, "节点 28（TextGenerate）") as caught:
+                executor.wait("prompt-id", timeout=1, interval=0.1)
+        self.assertEqual(caught.exception.code, "execution_error")
+        self.assertEqual(caught.exception.prompt_id, "prompt-id")
+        self.assertIn("unexpected keyword argument 'mtp'", str(caught.exception))
+
+    def test_wait_rejects_completed_history_without_outputs(self):
+        executor = workflow_executor.ComfyUIWorkflowExecutor({})
+        with patch.object(
+            executor,
+            "_json",
+            side_effect=[
+                {
+                    "prompt-id": {
+                        "status": {"status_str": "success", "completed": True},
+                        "outputs": {},
+                    }
+                },
+            ],
+        ):
+            with self.assertRaisesRegex(workflow_executor.WorkflowExecutionError, "没有输出") as caught:
+                executor.wait("prompt-id", timeout=1, interval=0.1)
+
+        self.assertEqual(caught.exception.code, "empty_outputs")
+        self.assertEqual(caught.exception.prompt_id, "prompt-id")
+
     def test_folder_paths_accepts_string_lists_and_discards_malformed_entries(self):
         executor = workflow_executor.ComfyUIWorkflowExecutor({})
         with patch.object(
@@ -1941,6 +2642,49 @@ class WorkflowExecutorTests(unittest.TestCase):
 
 
 class SearchEngineModelSourceTests(unittest.TestCase):
+    def test_manual_huggingface_source_is_normalized_and_bing_url_is_available(self):
+        from types import SimpleNamespace
+
+        searcher = model_source.ModelSourceSearcher({})
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://hf-mirror.com", SimpleNamespace(selected_region="domestic")),
+        ):
+            source = searcher.manual_source(
+                "https://huggingface.co/acme/flux/blob/main/vae/flux2-vae.safetensors",
+                "flux2-vae.safetensors",
+            )
+
+        self.assertEqual(source["source_type"], "huggingface_manual")
+        self.assertEqual(source["repo_id"], "acme/flux")
+        self.assertEqual(source["filename"], "vae/flux2-vae.safetensors")
+        self.assertEqual(
+            source["source_url"],
+            "https://hf-mirror.com/acme/flux/resolve/main/vae/flux2-vae.safetensors?download=true",
+        )
+        bing_url = searcher.bing_search_url("flux2-vae.safetensors")
+        self.assertIn("cn.bing.com/search", bing_url)
+        self.assertIn("site%3Ahuggingface.co", bing_url)
+        self.assertIn("flux2-vae.safetensors", bing_url)
+
+    def test_manual_huggingface_source_rejects_untrusted_or_directory_urls(self):
+        for value in (
+            "https://evil.example/acme/flux/blob/main/flux2-vae.safetensors",
+            "https://huggingface.co/acme/flux/tree/main/flux2-vae.safetensors",
+            "https://huggingface.co/acme/flux/blob/main/other.safetensors",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    model_source.ModelSourceSearcher._source_from_huggingface_url(
+                        value,
+                        "flux2-vae.safetensors",
+                        endpoint="https://hf-mirror.com",
+                        region="domestic",
+                        source_type="huggingface_manual",
+                    )
+                )
+
     def test_search_engine_is_selected_by_region_and_hf_result_is_normalized(self):
         from types import SimpleNamespace
 
@@ -2254,6 +2998,22 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["models"][0]["source"]["repo_id"], "acme/flux")
         self.assertTrue(plan["model_download_ready"])
 
+    async def test_manual_model_source_is_available_when_search_returns_no_results(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        with patch.object(model_source.ModelSourceSearcher, "search", return_value=[]):
+            result = await self.agent.search_workflow_model_sources(self.job["id"])
+
+        self.assertEqual(result["results"]["flux2-vae.safetensors"], [])
+        self.assertIn("flux2-vae.safetensors", result["search_urls"]["flux2-vae.safetensors"])
+        selected = self.agent.select_workflow_model_source(
+            self.job["id"],
+            "flux2-vae.safetensors",
+            {"url": "https://huggingface.co/acme/flux/blob/main/vae/flux2-vae.safetensors"},
+        )
+        self.assertEqual(selected["source"]["source_type"], "huggingface_manual")
+        self.assertEqual(selected["source"]["repo_id"], "acme/flux")
+        self.assertEqual(selected["source"]["filename"], "vae/flux2-vae.safetensors")
+
     async def test_local_model_inventory_is_available_before_remote_search(self):
         self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
         comfyui = Path(self.directory.name) / "ComfyUI"
@@ -2269,7 +3029,7 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(model_source.ModelSourceSearcher, "search") as search:
             result = await self.agent.search_workflow_model_sources(self.job["id"])
-        search.assert_not_called()
+        search.assert_called_once_with("flux2-vae.safetensors")
         self.assertEqual(result["local_results"]["flux2-vae.safetensors"], ["vae/existing-vae.safetensors"])
         self.assertEqual(result["results"]["flux2-vae.safetensors"], [])
 
@@ -2425,6 +3185,100 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "downloading")
         self.assertEqual(status["status"], "failed")
 
+    async def test_model_download_can_be_paused_and_queued_again(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        self.agent.store.update_workflow_job(self.job["id"], metadata={
+            **self.agent.workflow_job(self.job["id"])["metadata"],
+            "model_search_results": {"flux2-vae.safetensors": [{
+                "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors", "sha256": "",
+            }]},
+        })
+        self.agent.select_workflow_model_source(self.job["id"], "flux2-vae.safetensors", {
+            "repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors",
+        })
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        comfyui.mkdir()
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        lock = asyncio.Lock()
+        await lock.acquire()
+        self.agent._model_download_locks[self.job["id"]] = lock
+
+        queued = await self.agent.confirm_model_download(
+            self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"], wait_for_completion=False
+        )
+        key = (self.job["id"], "flux2-vae.safetensors")
+        first_task = self.agent._model_download_tasks[key]
+        first_event = self.agent._model_download_cancel_events[key]
+        self.assertEqual(queued["status"], "downloading")
+        self.assertEqual(self.agent.cancel_model_download(*key)["status"], "cancelling")
+        self.assertEqual(self.agent.model_download_status(*key)["status"], "cancelling")
+        lock.release()
+        with self.assertRaisesRegex(workflow_manager.ModelDownloadCancelled, "模型下载已取消"):
+            await first_task
+        self.assertEqual(self.agent.model_download_status(*key)["status"], "cancelled")
+
+        await lock.acquire()
+        retried = await self.agent.confirm_model_download(
+            self.job["id"], confirmed=True, model_names=["flux2-vae.safetensors"], wait_for_completion=False
+        )
+        second_task = self.agent._model_download_tasks[key]
+        second_event = self.agent._model_download_cancel_events[key]
+        self.assertEqual(retried["status"], "downloading")
+        self.assertIsNot(first_event, second_event)
+        self.assertIsNot(first_task, second_task)
+        self.assertEqual(self.agent.cancel_model_download(*key)["status"], "cancelling")
+        lock.release()
+        with self.assertRaisesRegex(workflow_manager.ModelDownloadCancelled, "模型下载已取消"):
+            await second_task
+
+    def test_model_download_status_survives_agent_recreation(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_downloads"] = {
+            "flux2-vae.safetensors": {
+                "status": "downloading",
+                "downloaded_bytes": 5 * 1024 * 1024,
+                "total_bytes": 20 * 1024 * 1024,
+                "error": "",
+            }
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        recreated = GlobalChatAgent(SettingsStore(Path(self.directory.name) / "settings.json"))
+        status = recreated.model_download_status(self.job["id"], "flux2-vae.safetensors")
+
+        self.assertEqual(status["status"], "paused")
+        self.assertEqual(status["downloaded_bytes"], 5 * 1024 * 1024)
+        self.assertEqual(status["total_bytes"], 20 * 1024 * 1024)
+
+    def test_timed_out_download_status_is_resumable_after_agent_recreation(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_downloads"] = {
+            "flux2-vae.safetensors": {
+                "status": "failed",
+                "downloaded_bytes": 5 * 1024 * 1024,
+                "total_bytes": 20 * 1024 * 1024,
+                "error": "模型文件下载失败（已保留可续传的部分文件）：The read operation timed out",
+            }
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        recreated = GlobalChatAgent(SettingsStore(Path(self.directory.name) / "settings.json"))
+        status = recreated.model_download_status(self.job["id"], "flux2-vae.safetensors")
+
+        self.assertEqual(status["status"], "paused")
+        self.assertEqual(status["downloaded_bytes"], 5 * 1024 * 1024)
+        self.assertEqual(status["total_bytes"], 20 * 1024 * 1024)
+        self.assertIn("timed out", status["error"])
+
+    def test_timed_out_workflow_error_without_snapshot_is_resumable(self):
+        error = "模型文件下载失败（已保留可续传的部分文件）：The read operation timed out"
+        self.agent.store.update_workflow_job(self.job["id"], state="preparing_models", error=error)
+
+        status = self.agent.model_download_status(self.job["id"], "flux2-vae.safetensors")
+
+        self.assertEqual(status["status"], "paused")
+        self.assertEqual(status["error"], error)
+
     async def test_local_model_picker_can_satisfy_dependency_without_download(self):
         self._add_missing_models([("missing-model.safetensors", "vae_name")])
         comfyui = Path(self.directory.name) / "ComfyUI"
@@ -2453,6 +3307,112 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         refreshed_plan = self.agent.dependency_plan(self.job["id"])
         self.assertEqual(refreshed_plan["models"][0]["status"], "selected_local")
         self.assertEqual(refreshed_plan["missing_models"], [])
+
+    async def test_identical_content_with_different_filename_is_automatically_used(self):
+        self._add_missing_models([("workflow-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        content = b"same model content"
+        (model_dir / "renamed-vae.safetensors").write_bytes(content)
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_search_results"] = {
+            "workflow-vae.safetensors": [{
+                "repo_id": "acme/vae",
+                "filename": "vae/workflow-vae.safetensors",
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }],
+        }
+        metadata["workflow"] = {
+            "prompt": {
+                "7": {"class_type": "VAELoader", "inputs": {"vae_name": "workflow-vae.safetensors"}}
+            }
+        }
+        metadata["inspection"]["models"][0]["nodes"] = ["7"]
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        model = plan["models"][0]
+        self.assertEqual(model["status"], "selected_local")
+        self.assertNotIn("has_similar_model", model)
+        self.assertNotIn("similar_local_candidates", model)
+        self.assertIn("vae/renamed-vae.safetensors", model["local_candidates"])
+        job = self.agent.workflow_job(self.job["id"])
+        self.assertEqual(
+            job["metadata"]["workflow"]["prompt"]["7"]["inputs"]["vae_name"],
+            "renamed-vae.safetensors",
+        )
+        self.assertEqual(
+            job["metadata"]["local_model_selections"]["workflow-vae.safetensors"]["workflow_path"],
+            "renamed-vae.safetensors",
+        )
+
+    async def test_similar_filename_with_different_content_is_not_a_local_match(self):
+        self._add_missing_models([("workflow-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "workflow-vae-copy.safetensors").write_bytes(b"different model content")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_search_results"] = {
+            "workflow-vae.safetensors": [{
+                "repo_id": "acme/vae",
+                "filename": "vae/workflow-vae.safetensors",
+                "sha256": hashlib.sha256(b"workflow model content").hexdigest(),
+            }],
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        model = self.agent.dependency_plan(self.job["id"])["models"][0]
+        self.assertEqual(model["status"], "source_required")
+        self.assertNotIn("has_similar_model", model)
+        self.assertNotIn("similar_local_candidates", model)
+
+    async def test_multiple_differently_named_identical_local_models_use_the_first_sorted_file(self):
+        self._add_missing_models([("workflow-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        content = b"same model content"
+        (model_dir / "renamed-vae-a.safetensors").write_bytes(content)
+        (model_dir / "renamed-vae-b.safetensors").write_bytes(content)
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["model_search_results"] = {
+            "workflow-vae.safetensors": [{
+                "repo_id": "acme/vae",
+                "filename": "vae/workflow-vae.safetensors",
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }],
+        }
+        metadata["workflow"] = {
+            "prompt": {
+                "7": {"class_type": "VAELoader", "inputs": {"vae_name": "workflow-vae.safetensors"}}
+            }
+        }
+        metadata["inspection"]["models"][0]["nodes"] = ["7"]
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        model = self.agent.dependency_plan(self.job["id"])["models"][0]
+        self.assertEqual(model["status"], "selected_local")
+        self.assertEqual(
+            self.agent.workflow_job(self.job["id"])["metadata"]["workflow"]["prompt"]["7"]["inputs"]["vae_name"],
+            "renamed-vae-a.safetensors",
+        )
+
+    async def test_exact_filename_is_installed_without_a_local_match_prompt(self):
+        self._add_missing_models([("workflow-vae.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "workflow-vae.safetensors").write_bytes(b"workflow model content")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["models"][0]["status"], "installed")
+        self.assertEqual(plan["missing_models"], [])
 
     async def test_model_download_refuses_when_no_trusted_source_is_selected(self):
         self._add_missing_models([("missing-model.safetensors", "model")])
@@ -2485,6 +3445,18 @@ class ModelDownloaderTests(unittest.TestCase):
             if self.read_count == 1:
                 return b"abc"
             raise OSError("connection interrupted")
+
+    class TimedOutResponse(Response):
+        def __init__(self, body=b"abc", *, status=200, headers=None, timeout_first=False):
+            super().__init__(body, status=status, headers=headers or {"Content-Length": "6"})
+            self.read_count = 0
+            self.timeout_first = timeout_first
+
+        def read(self, size=-1):
+            self.read_count += 1
+            if self.read_count == 1 and not self.timeout_first:
+                return self.getvalue()
+            raise TimeoutError("The read operation timed out")
 
     def test_link_to_comfyui_uses_registered_target_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2576,6 +3548,69 @@ class ModelDownloaderTests(unittest.TestCase):
             self.assertEqual(requests[1].get_header("Range"), "bytes=3-")
             self.assertEqual(Path(result["path"]).read_bytes(), b"abcdef")
             self.assertFalse(partial.exists())
+
+    def test_read_timeout_retries_from_partial_file_with_range(self):
+        import hashlib
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory) / "cache"
+            requests = []
+            responses = [
+                self.TimedOutResponse(),
+                self.Response(b"def", status=206, headers={
+                    "Content-Range": "bytes 3-5/6", "Content-Length": "3",
+                }),
+            ]
+
+            def opener(request, timeout):
+                requests.append(request)
+                return responses.pop(0)
+
+            downloader = model_downloader.ModelDownloader({}, opener=opener)
+            decision = SimpleNamespace(selected_region="international")
+            with patch.object(downloader.router, "endpoint", return_value=("https://huggingface.co", decision)), patch.object(
+                model_downloader.time, "sleep", return_value=None
+            ):
+                result = downloader.download(
+                    repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                    cache_root=cache_root, expected_sha256=hashlib.sha256(b"abcdef").hexdigest(),
+                )
+
+            self.assertIsNone(requests[0].get_header("Range"))
+            self.assertEqual(requests[1].get_header("Range"), "bytes=3-")
+            self.assertEqual(Path(result["path"]).read_bytes(), b"abcdef")
+
+    def test_repeated_read_timeout_keeps_partial_file_as_retryable_error(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory) / "cache"
+            requests = []
+
+            def opener(request, timeout):
+                requests.append(request)
+                if len(requests) == 1:
+                    return self.TimedOutResponse()
+                return self.TimedOutResponse(b"", status=206, headers={
+                    "Content-Range": "bytes 3-5/6", "Content-Length": "3",
+                }, timeout_first=True)
+
+            downloader = model_downloader.ModelDownloader({}, opener=opener)
+            decision = SimpleNamespace(selected_region="international")
+            with patch.object(downloader.router, "endpoint", return_value=("https://huggingface.co", decision)), patch.object(
+                model_downloader.time, "sleep", return_value=None
+            ):
+                with self.assertRaisesRegex(model_downloader.ModelDownloadRetryableError, "已保留可续传"):
+                    downloader.download(
+                        repo_id="acme/model", filename="model.safetensors", category="checkpoints",
+                        cache_root=cache_root,
+                    )
+
+            partial = cache_root / "acme" / "model" / "model.safetensors.part"
+            self.assertEqual(partial.read_bytes(), b"abc")
+            self.assertEqual(len(requests), model_downloader.MAX_TRANSIENT_RETRIES + 1)
+            self.assertEqual(requests[-1].get_header("Range"), "bytes=3-")
 
     def test_cancelled_download_keeps_partial_for_range_retry(self):
         from types import SimpleNamespace

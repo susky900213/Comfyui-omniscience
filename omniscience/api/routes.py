@@ -25,6 +25,8 @@ from ..constants import (
 )
 from ..host import BrowserUnavailable, MCPProtocolError
 from ..util import ProjectFolderExistsError
+from ..workflow_diagnostics import static_diagnostic
+from ..workflow_executor import WorkflowExecutionError
 from . import deps
 
 logger = logging.getLogger("Comfyui-omniscience")
@@ -257,6 +259,18 @@ def register_routes(prompt_server: Any) -> None:
 
     @routes.post("/cline/global-chat/workflows/{job_id}/execute")
     async def cline_execute_workflow(request):
+        def execution_diagnostic(job: dict[str, Any] | None, error: BaseException, code: str) -> dict[str, Any]:
+            persisted = (job or {}).get("metadata", {}).get("execution_diagnostic")
+            if isinstance(persisted, dict) and persisted:
+                return persisted
+            return static_diagnostic(
+                code=getattr(error, "code", None) or code,
+                message=str(error),
+                details=getattr(error, "details", None),
+                retryable=bool(getattr(error, "retryable", False)),
+                prompt_id=str(getattr(error, "prompt_id", "") or ""),
+            )
+
         try:
             values = await _body(request)
             return _response(
@@ -266,8 +280,27 @@ def register_routes(prompt_server: Any) -> None:
                     timeout=float(values.get("timeout", 1800)),
                 )
             )
+        except WorkflowExecutionError as exc:
+            agent = deps.global_chat_agent()
+            job = agent.workflow_job(request.match_info["job_id"])
+            diagnostic = execution_diagnostic(job, exc, "execution_error")
+            return _response({"error": str(exc), "workflow": job, "diagnostic": diagnostic}, status=400)
         except (ValueError, OSError) as exc:
-            return _response({"error": str(exc)}, status=400)
+            agent = deps.global_chat_agent()
+            try:
+                job = agent.workflow_job(request.match_info["job_id"])
+            except (ValueError, OSError):
+                job = None
+            if job is None:
+                return _response(
+                    {
+                        "error": str(exc),
+                        "diagnostic": execution_diagnostic(None, exc, "preflight_error"),
+                    },
+                    status=400,
+                )
+            diagnostic = execution_diagnostic(job, exc, "preflight_error")
+            return _response({"error": str(exc), "workflow": job, "diagnostic": diagnostic}, status=400)
 
     @routes.get("/cline/global-chat/workflows/{job_id}")
     async def cline_workflow_job(request):

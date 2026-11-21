@@ -69,6 +69,7 @@ class ModelSourceSearcher:
     def __init__(self, settings: Any):
         self.settings = settings
         self.router = RegionRouter(settings)
+        self._last_region = ""
 
     @staticmethod
     def _request_json(url: str) -> Any:
@@ -118,6 +119,43 @@ class ModelSourceSearcher:
             return "https://cn.bing.com/search?" + urlencode({"q": query, "count": count, "first": 1})
         # ``start=0`` deliberately keeps this request on Google's first page.
         return "https://www.google.com/search?" + urlencode({"q": query, "num": count, "start": 0})
+
+    @staticmethod
+    def _bing_search_url(region: str, basename: str, *, limit: int = MAX_MODEL_SOURCE_RESULTS) -> str:
+        query = f'site:huggingface.co "{basename}"'
+        count = max(1, min(10, int(limit)))
+        host = "cn.bing.com" if region == "domestic" else "www.bing.com"
+        return "https://" + host + "/search?" + urlencode({"q": query, "count": count, "first": 1})
+
+    def bing_search_url(self, filename: str, *, limit: int = MAX_MODEL_SOURCE_RESULTS) -> str:
+        """Return a user-facing Bing query for a model filename."""
+        basename = Path(str(filename or "").replace("\\", "/")).name.strip()
+        if not basename:
+            raise ValueError("模型文件名不能为空。")
+        region = self._last_region or "domestic"
+        return self._bing_search_url(region, basename, limit=limit)
+
+    def manual_source(self, value: str, filename: str) -> dict[str, Any]:
+        """Validate a user-provided Hugging Face file page and normalize it."""
+        basename = Path(str(filename or "").replace("\\", "/")).name.strip()
+        if not basename:
+            raise ValueError("模型文件名不能为空。")
+        endpoint, decision = self.router.endpoint("huggingface")
+        region = str(getattr(decision, "selected_region", "") or "")
+        source = self._source_from_huggingface_url(
+            value,
+            basename,
+            endpoint=endpoint,
+            region=region,
+            source_type="huggingface_manual",
+        )
+        if source is None:
+            raise ValueError(
+                "手动地址无效。请填写 Hugging Face 文件地址，格式为 "
+                "https://huggingface.co/<用户名>/<仓库>/blob/<分支>/<模型文件相对路径>，"
+                "且文件名必须与工作流依赖一致。"
+            )
+        return source
 
     @staticmethod
     def _unwrap_search_url(value: str) -> str:
@@ -375,12 +413,51 @@ class ModelSourceSearcher:
                     return found
         return found
 
+    def enrich_sha256(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fill missing hashes from Hub metadata without changing candidate identity."""
+        if not isinstance(candidates, list) or not candidates:
+            return candidates if isinstance(candidates, list) else []
+        endpoint, _decision = self.router.endpoint("huggingface")
+        base = self._normalised_base(endpoint)
+        details_by_repo: dict[str, Any] = {}
+        enriched: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            item = dict(candidate)
+            digest = str(item.get("sha256") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                repo_id = str(item.get("repo_id") or "")
+                filename = str(item.get("filename") or "").replace("\\", "/")
+                if REPO_ID.fullmatch(repo_id) and filename and ".." not in Path(filename).parts:
+                    if repo_id not in details_by_repo:
+                        try:
+                            details_by_repo[repo_id] = self._request_json(
+                                f"{base}/api/models/{quote(repo_id, safe='/')}"
+                            )
+                        except ValueError:
+                            details_by_repo[repo_id] = None
+                    details = details_by_repo.get(repo_id)
+                    siblings = details.get("siblings") if isinstance(details, dict) else []
+                    for sibling in siblings if isinstance(siblings, list) else []:
+                        if not isinstance(sibling, dict) or str(sibling.get("rfilename") or "") != filename:
+                            continue
+                        lfs = sibling.get("lfs") if isinstance(sibling.get("lfs"), dict) else {}
+                        digest = str(lfs.get("sha256") or lfs.get("oid") or "").lower()
+                        if digest.startswith("sha256:"):
+                            digest = digest.removeprefix("sha256:")
+                        break
+            item["sha256"] = digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+            enriched.append(item)
+        return enriched
+
     def search(self, filename: str, *, limit: int = MAX_MODEL_SOURCE_RESULTS) -> list[dict[str, Any]]:
         basename = Path(str(filename or "").replace("\\", "/")).name.strip()
         if not basename:
             raise ValueError("模型文件名不能为空。")
         endpoint, decision = self.router.endpoint("huggingface")
         region = str(getattr(decision, "selected_region", "") or "")
+        self._last_region = region
         web_error = ""
         try:
             web_results = self._search_web(basename, endpoint=endpoint, region=region, limit=limit)

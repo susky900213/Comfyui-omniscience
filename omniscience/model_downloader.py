@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from threading import Event
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,16 @@ from urllib.request import Request, urlopen
 from .region_router import RegionRouter
 
 MAX_MODEL_BYTES = 50 * 1024 * 1024 * 1024
+MAX_TRANSIENT_RETRIES = 2
 CATEGORIES = {"checkpoints", "vae", "loras", "controlnet", "clip", "unet", "diffusion_models", "upscale_models", "embeddings"}
 
 
 class ModelDownloadError(ValueError):
     pass
+
+
+class ModelDownloadRetryableError(ModelDownloadError):
+    """Raised when a transient network failure leaves a resumable partial file."""
 
 
 class ModelDownloadCancelled(ModelDownloadError):
@@ -97,6 +103,7 @@ class ModelDownloader:
         """Stream a file to a .part file, resuming with HTTP Range when possible."""
         partial = destination.with_name(destination.name + ".part")
         retried_without_range = False
+        transient_retries = 0
         while True:
             self._raise_if_cancelled(cancel_event)
             offset = partial.stat().st_size if partial.is_file() else 0
@@ -115,7 +122,15 @@ class ModelDownloader:
                     retried_without_range = True
                     continue
                 raise ModelDownloadError(f"模型文件下载请求失败：HTTP {exc.code} {exc.reason}") from exc
-            except (URLError, TimeoutError, OSError) as exc:
+            except TimeoutError as exc:
+                if transient_retries < MAX_TRANSIENT_RETRIES:
+                    transient_retries += 1
+                    time.sleep(transient_retries)
+                    continue
+                raise ModelDownloadRetryableError(
+                    f"模型文件下载暂时中断（已保留可续传的部分文件）：{exc}"
+                ) from exc
+            except (URLError, OSError) as exc:
                 raise ModelDownloadError(f"模型文件下载失败（已保留可续传的部分文件）：{exc}") from exc
 
             try:
@@ -175,7 +190,15 @@ class ModelDownloader:
                         raise ModelDownloadError("模型文件未完整下载；再次尝试可续传。")
             except ModelDownloadError:
                 raise
-            except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            except TimeoutError as exc:
+                if transient_retries < MAX_TRANSIENT_RETRIES:
+                    transient_retries += 1
+                    time.sleep(transient_retries)
+                    continue
+                raise ModelDownloadRetryableError(
+                    f"模型文件下载暂时中断（已保留可续传的部分文件）：{exc}"
+                ) from exc
+            except (HTTPError, URLError, OSError, ValueError) as exc:
                 raise ModelDownloadError(f"模型文件下载失败（已保留可续传的部分文件）：{exc}") from exc
             break
 

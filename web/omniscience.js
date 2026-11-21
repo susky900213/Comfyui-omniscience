@@ -91,13 +91,19 @@ function formatModelDownloadSize(bytes) {
 
 function modelDownloadProgress() {
   const container = el("div", "cline-workflow-download-progress");
+  const row = el("div", "cline-workflow-download-progress-row");
   const bar = el("progress", "cline-workflow-download-progress-bar");
   bar.max = 100;
   bar.value = 0;
   bar.setAttribute("aria-label", "模型下载进度");
+  const action = button("…", "cline-workflow-download-control");
+  action.disabled = true;
+  action.setAttribute("aria-label", "正在准备下载");
+  action.title = "正在准备下载";
   const label = el("span", "cline-workflow-download-progress-label", "正在连接下载服务器…");
-  container.append(bar, label);
-  return { container, bar, label };
+  row.append(bar, action);
+  container.append(row, label);
+  return { container, bar, label, action };
 }
 
 function updateModelDownloadProgress(progress, result) {
@@ -132,22 +138,181 @@ function renderLocalModelInventory(container, inventory) {
 }
 
 function modelSourceLabel(source) {
-  const type = source?.source_type === "huggingface_search" ? "搜索引擎" : "Hugging Face API";
+  const type = source?.source_type === "huggingface_search" ? "搜索引擎" : source?.source_type === "huggingface_manual" ? "手动地址" : "Hugging Face API";
   const region = source?.region === "domestic" ? "国内" : source?.region === "international" ? "海外" : "";
   return [type, region, source?.repo_id, source?.filename].filter(Boolean).join(" · ");
 }
 
-async function waitForModelDownload(jobId, name, onProgress) {
+function setModelDownloadControl(progress, state, handler) {
+  const controls = {
+    idle: ["↓", "开始下载", false],
+    starting: ["…", "正在准备下载", true],
+    downloading: ["⏸", "暂停下载", false],
+    pausing: ["…", "正在暂停下载", true],
+    paused: ["▶", "恢复下载", false],
+    failed: ["↻", "重试下载", false],
+  };
+  const [icon, label, disabled] = controls[state] || controls.starting;
+  progress.action.textContent = icon;
+  progress.action.disabled = disabled;
+  progress.action.title = label;
+  progress.action.setAttribute("aria-label", label);
+  progress.action.onclick = handler || null;
+  progress.container.classList.toggle("paused", state === "paused");
+  progress.container.classList.toggle("error", state === "failed");
+}
+
+function isResumableModelDownloadError(error) {
+  return /timed out|timeout|超时|已保留可续传/i.test(String(error || ""));
+}
+
+function normalizeModelDownloadResult(result) {
+  if (result?.status !== "failed" || !isResumableModelDownloadError(result.error)) return result;
+  return { ...result, status: "paused" };
+}
+
+async function waitForModelDownload(jobId, name, onProgress, shouldContinue = () => true) {
   for (;;) {
     await sleep(1500);
-    const result = await request(
+    if (!shouldContinue()) return { status: "detached", jobId, name };
+    const result = normalizeModelDownloadResult(await request(
       `/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/status?name=${encodeURIComponent(name)}`,
-    );
+    ));
+    onProgress?.(result);
     if (result.status === "completed") return result;
+    if (result.status === "cancelled") return result;
+    if (result.status === "paused") return result;
     if (result.status === "failed") throw new Error(result.error || `模型下载失败：${name}`);
     if (result.status === "idle") throw new Error(`模型下载任务已停止，可重新点击下载并从断点继续：${name}`);
-    onProgress?.(result);
   }
+}
+
+function createModelDownloadRunner({ jobId, name, progress, prepareSource, onSourceSelected, onCompleted, onFailure }) {
+  let running = false;
+  let sourceReady = !prepareSource;
+
+  const updateStatus = (result) => {
+    if (result.status === "cancelling") {
+      progress.label.textContent = "正在暂停下载…";
+      setModelDownloadControl(progress, "pausing");
+      return;
+    }
+    updateModelDownloadProgress(progress, result);
+  };
+
+  const finish = async (result) => {
+    if (result.status === "detached") return result;
+    if (result.status === "cancelled" || result.status === "paused") {
+      updateModelDownloadProgress(progress, result);
+      const timedOut = isResumableModelDownloadError(result.error);
+      progress.label.textContent = timedOut
+        ? "连接超时，已保留下载进度，可点击 ▶ 继续下载"
+        : "下载已暂停，可点击 ▶ 继续下载";
+      setModelDownloadControl(progress, "paused", run);
+      return result;
+    }
+    if (result.status === "completed") {
+      progress.bar.value = 100;
+      progress.label.textContent = "下载完成，正在准备模型…";
+      await onCompleted(result);
+      return result;
+    }
+    return result;
+  };
+
+  const follow = async () => finish(await waitForModelDownload(
+    jobId, name, updateStatus, () => progress.container.isConnected,
+  ));
+
+  const run = async () => {
+    if (running) return;
+    running = true;
+    progress.container.classList.remove("paused", "error");
+    setModelDownloadControl(progress, "starting");
+    try {
+      if (!sourceReady) {
+        const selected = await prepareSource();
+        sourceReady = true;
+        onSourceSelected?.(selected);
+      }
+      await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/confirm`, {
+        method: "POST", body: JSON.stringify({ confirmed: true, model_names: [name] }),
+      });
+      setModelDownloadControl(progress, "downloading", pause);
+      progress.label.textContent = "正在连接下载服务器…";
+      await follow();
+    } catch (error) {
+      progress.label.textContent = `下载失败：${error.message}`;
+      setModelDownloadControl(progress, "failed", run);
+      onFailure?.(error, sourceReady);
+    } finally {
+      running = false;
+    }
+  };
+
+  const pause = async () => {
+    if (!running) {
+      await run();
+      return;
+    }
+    setModelDownloadControl(progress, "pausing");
+    progress.label.textContent = "正在暂停下载…";
+    try {
+      await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/cancel`, {
+        method: "POST", body: JSON.stringify({ name }),
+      });
+    } catch (error) {
+      setModelDownloadControl(progress, "downloading", pause);
+      progress.label.textContent = `暂停失败：${error.message}`;
+      showError(error);
+    }
+  };
+
+  const restore = async () => {
+    if (running) return null;
+    try {
+      const result = normalizeModelDownloadResult(await request(
+        `/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/status?name=${encodeURIComponent(name)}`,
+      ));
+      updateStatus(result);
+      if (result.status === "completed") {
+        await finish(result);
+        return result;
+      }
+      if (["downloading", "cancelling"].includes(result.status)) {
+        running = true;
+        setModelDownloadControl(progress, result.status === "cancelling" ? "pausing" : "downloading", pause);
+        try {
+          const finished = await follow();
+          return finished;
+        } finally {
+          running = false;
+        }
+      }
+      if (result.status === "cancelled" || result.status === "paused") {
+        await finish(result);
+        return result;
+      }
+      if (result.status === "failed") {
+        progress.label.textContent = `下载失败：${result.error || `模型下载失败：${name}`}`;
+        setModelDownloadControl(progress, "failed", run);
+        onFailure?.(new Error(result.error || `模型下载失败：${name}`), sourceReady);
+      }
+      if (result.status === "idle") {
+        progress.label.textContent = "尚未开始下载";
+        setModelDownloadControl(progress, "idle", run);
+      }
+      return result;
+    } catch (error) {
+      progress.label.textContent = `读取下载状态失败：${error.message}`;
+      setModelDownloadControl(progress, "failed", run);
+      onFailure?.(error, sourceReady);
+      return null;
+    }
+  };
+
+  progress.action.onclick = run;
+  return { run, pause, restore };
 }
 
 function ensureStyle() {
@@ -294,6 +459,66 @@ function promptLengthText(stats) {
   return `提示词：约 ${format(tokens)} Token · ${format(chars)} 字符`;
 }
 
+function workflowExecutionDiagnostic(errorOrJob) {
+  const payload = errorOrJob?.payload || errorOrJob;
+  return payload?.diagnostic
+    || payload?.workflow?.metadata?.execution_diagnostic
+    || payload?.metadata?.execution_diagnostic
+    || null;
+}
+
+function appendWorkflowExecutionFailure(card, errorOrJob) {
+  const diagnostic = workflowExecutionDiagnostic(errorOrJob) || {};
+  const message = diagnostic.message || errorOrJob?.message || errorOrJob?.error || "工作流执行失败。";
+  const phaseLabels = { preflight: "执行前检查", execution: "ComfyUI 执行" };
+  const categoryLabels = {
+    node: "节点缺失或未加载", model: "模型/权重", memory: "显存或内存",
+    parameters: "工作流参数", connection: "ComfyUI 连接", timeout: "执行超时",
+    environment: "运行环境", unknown: "未确定",
+  };
+  card.querySelector(".cline-workflow-execution-error")?.remove();
+  card.classList.remove("completed");
+  card.classList.add("failed");
+  const box = el("div", "cline-workflow-execution-error");
+  box.appendChild(el("strong", "", "工作流执行失败"));
+  const phase = phaseLabels[diagnostic.phase] || diagnostic.phase;
+  const category = categoryLabels[diagnostic.category] || diagnostic.category;
+  if (phase || category) {
+    box.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-diagnostic-label", [phase, category && `判断类别：${category}`].filter(Boolean).join(" · ")));
+  }
+  box.appendChild(el("p", "cline-workflow-candidate-meta warning", `ComfyUI 原始错误：${message}`));
+  if (diagnostic.ai_status === "completed" && diagnostic.summary) {
+    box.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-ai-summary", `AI 分析：${diagnostic.summary}`));
+    if (diagnostic.cause) box.appendChild(el("p", "cline-workflow-candidate-meta", `可能原因：${diagnostic.cause}`));
+    if (Array.isArray(diagnostic.actions) && diagnostic.actions.length) {
+      const actions = el("div", "cline-workflow-diagnostic-actions");
+      actions.appendChild(el("strong", "", "下一步："));
+      const list = document.createElement("ol");
+      diagnostic.actions.slice(0, 5).forEach((action) => list.appendChild(el("li", "", String(action))));
+      actions.appendChild(list);
+      box.appendChild(actions);
+    }
+    if (diagnostic.confidence) box.appendChild(el("p", "cline-workflow-candidate-meta", `AI 置信度：${diagnostic.confidence}`));
+  } else if (diagnostic.category && diagnostic.actions?.length) {
+    box.appendChild(el("p", "cline-workflow-candidate-meta", `本地判断：${diagnostic.actions[0]}`));
+  }
+  if (diagnostic.hint) box.appendChild(el("p", "cline-workflow-candidate-meta", `处理建议：${diagnostic.hint}`));
+  if (diagnostic.recovery) box.appendChild(el("p", "cline-workflow-candidate-meta", `自动处理：${diagnostic.recovery}`));
+  if (diagnostic.details) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "查看 ComfyUI 详细错误";
+    const body = el("pre", "cline-workflow-execution-details");
+    const text = typeof diagnostic.details === "string"
+      ? diagnostic.details
+      : JSON.stringify(diagnostic.details, null, 2);
+    body.textContent = String(text || "无更多详细错误").slice(0, 12000);
+    details.append(summary, body);
+    box.appendChild(details);
+  }
+  card.appendChild(box);
+}
+
 function workflowCandidateCard(jobId, candidate) {
   const card = el("div", "cline-workflow-candidate");
   card.appendChild(el("strong", "cline-workflow-candidate-title", `${candidate.title || "未命名工作流"} · ID: ${candidate.id || "未知"}`));
@@ -303,25 +528,42 @@ function workflowCandidateCard(jobId, candidate) {
   if (meta) card.appendChild(el("p", "cline-workflow-candidate-meta", meta));
   const resource = candidate.resource_assessment;
   if (resource) {
-    const resourceText = resource.feasible === true ? "本地资源匹配" : resource.feasible === false ? "本地资源不足" : "本地资源未知";
+    const resourceText = resource.stale
+      ? "评估已过期，仅供搜索参考"
+      : resource.feasible === true ? "本地资源匹配" : resource.feasible === false ? "本地资源不足" : "本地资源未知";
     const remoteText = resource.recommend_remote ? "，优先推荐非本地模型/云端推理" : "";
-    card.appendChild(el("p", `cline-workflow-candidate-meta ${resource.feasible === false ? "warning" : ""}`, `资源评估：${resourceText}${remoteText}。${resource.recommendation || ""}`));
+    card.appendChild(el("p", `cline-workflow-candidate-meta ${resource.feasible === false && !resource.stale ? "warning" : ""}`, `资源评估：${resourceText}${remoteText}。${resource.recommendation || ""}`));
   }
   if (["remote", "cloud", "api", "hosted"].includes(String(candidate.execution_mode || "").toLowerCase()) || candidate.remote_endpoint) {
     card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-remote", "非本地模型/云端推理工作流"));
   }
   const action = button(`选择并准备（ID: ${candidate.id || "未知"}）`, "cline-secondary cline-workflow-select");
   action.onclick = async () => {
+    const restoring = action.dataset.restore === "true";
+    delete action.dataset.restore;
     action.disabled = true;
     try {
-      const result = await request("/cline/global-chat/workflows/select", {
-        method: "POST",
-        body: JSON.stringify({ job_id: jobId, candidate_id: candidate.id }),
-      });
-      const inspection = await request("/cline/global-chat/workflows/inspect", {
-        method: "POST",
-        body: JSON.stringify({ job_id: jobId }),
-      });
+      let inspection;
+      if (restoring) {
+        // A restored card should use the last persisted inspection first. It
+        // must not depend on RunningHub being reachable again just because
+        // the user switched task nodes or changed settings.
+        const job = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`);
+        const metadata = job.metadata || {};
+        inspection = metadata.inspection && metadata.workflow
+          ? { inspection: metadata.inspection, workflow: metadata.workflow }
+          : await request("/cline/global-chat/workflows/inspect", {
+            method: "POST", body: JSON.stringify({ job_id: jobId }),
+          });
+      } else {
+        await request("/cline/global-chat/workflows/select", {
+          method: "POST",
+          body: JSON.stringify({ job_id: jobId, candidate_id: candidate.id }),
+        });
+        inspection = await request("/cline/global-chat/workflows/inspect", {
+          method: "POST", body: JSON.stringify({ job_id: jobId }),
+        });
+      }
       const report = inspection.inspection || {};
       card.classList.add("selected");
       const installedModels = (report.models || []).filter((model) => model.local_status === "installed").length;
@@ -348,7 +590,7 @@ function workflowCandidateCard(jobId, candidate) {
         }
       };
       card.appendChild(loadCanvas);
-      if (report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
+      if (!restoring && report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
         if (window.confirm("工作流检查完成。是否先加载到当前 ComfyUI 画布？\n\n当前画布中的未保存内容可能会被替换。")) {
           loadCanvas.click();
         }
@@ -373,44 +615,13 @@ function workflowCandidateCard(jobId, candidate) {
           localInventoryButton.disabled = false;
         }
       };
-      const renderModelSources = async (models, candidatesByName = {}) => {
+      const renderModelSources = async (models, candidatesByName = {}, searchUrlsByName = {}, searchCompleted = false) => {
         modelSourceArea.replaceChildren();
         for (const model of models || []) {
           if (["installed", "selected_local"].includes(model.status)) continue;
           const name = model.name;
           const group = el("div", "cline-workflow-node-source-group");
           group.appendChild(el("strong", "", `模型文件：${name}`));
-          if (model.local_candidates?.length) {
-            const localPicker = el("select", "cline-workflow-model-picker");
-            const localPlaceholder = el("option", "", `选择 ComfyUI ${model.category || "models"} 中已有文件`);
-            localPlaceholder.value = "";
-            localPicker.appendChild(localPlaceholder);
-            model.local_candidates.forEach((path) => {
-              const option = el("option", "", path);
-              option.value = path;
-              localPicker.appendChild(option);
-            });
-            localPicker.onchange = async () => {
-              if (!localPicker.value) return;
-              localPicker.disabled = true;
-              try {
-                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/local`, {
-                  method: "POST", body: JSON.stringify({ name, path: localPicker.value }),
-                });
-                model.status = "selected_local";
-                group.replaceChildren(
-                  el("strong", "", `已选择本地模型：${name}`),
-                  el("p", "cline-workflow-candidate-meta", localPicker.value),
-                );
-                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
-              } catch (error) {
-                localPicker.disabled = false;
-                localPicker.value = "";
-                showError(error);
-              }
-            };
-            group.appendChild(localPicker);
-          }
           const candidates = candidatesByName[name] || model.source_candidates || (model.source ? [model.source] : []);
           if (model.source) {
             group.appendChild(el("p", "cline-workflow-candidate-meta", `已选择：${modelSourceLabel(model.source)}`));
@@ -419,39 +630,107 @@ function workflowCandidateCard(jobId, candidate) {
             }
             const downloadGroup = el("div", "cline-workflow-model-download-group");
             const download = button(`下载 ${name}`, "cline-secondary cline-workflow-model-download");
-            download.onclick = async () => {
-              download.disabled = true;
-              download.textContent = `正在连接下载：${name}`;
-              const progressUi = modelDownloadProgress();
-              downloadGroup.appendChild(progressUi.container);
-              try {
-                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/confirm`, {
-                  method: "POST", body: JSON.stringify({ confirmed: true, model_names: [name] }),
-                });
-                const progress = await waitForModelDownload(jobId, name, (status) => {
-                  download.textContent = `正在下载：${name}`;
-                  updateModelDownloadProgress(progressUi, status);
-                });
-                progressUi.bar.value = 100;
-                progressUi.label.textContent = "下载完成，正在准备模型…";
+            const progressUi = modelDownloadProgress();
+            const runner = createModelDownloadRunner({
+              jobId,
+              name,
+              progress: progressUi,
+              onCompleted: async (progress) => {
                 model.status = "installed";
                 group.replaceChildren(
                   el("strong", "", `已下载：${name}`),
                   el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(model.source)} · ${progress.model?.link?.path || model.source.filename}`),
                 );
                 modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
-              } catch (error) {
-                download.disabled = false;
-                download.textContent = `重试下载：${name}`;
-                progressUi.label.textContent = `下载失败：${error.message}`;
-                progressUi.container.classList.add("error");
+              },
+              onFailure: (error) => {
                 showError(error);
-              }
+              },
+            });
+            download.onclick = () => {
+              download.disabled = true;
+              download.textContent = `正在下载：${name}`;
+              runner.run();
             };
             downloadGroup.appendChild(download);
+            downloadGroup.appendChild(progressUi.container);
             group.appendChild(downloadGroup);
+            void runner.restore().then((result) => {
+              if (!result) return;
+              if (["downloading", "cancelling"].includes(result.status)) {
+                download.disabled = true;
+                download.textContent = `正在下载：${name}`;
+              } else if (["paused", "cancelled"].includes(result.status)) {
+                download.disabled = false;
+                download.textContent = `继续下载 ${name}`;
+              } else if (result.status === "failed") {
+                download.disabled = false;
+                download.textContent = `重试下载 ${name}`;
+              }
+            });
           } else if (!candidates.length) {
             group.appendChild(el("p", "cline-workflow-candidate-meta", "没有搜索结果；请重试搜索或改用已有模型。不会按文件名猜仓库。"));
+          }
+          if (!candidates.length && !model.source && searchCompleted) {
+            group.appendChild(el("p", "cline-workflow-candidate-meta", "也可以手动填写 Hugging Face 文件地址："));
+            const manualInput = el("input", "cline-workflow-model-manual-input");
+            manualInput.type = "url";
+            manualInput.placeholder = "https://huggingface.co/<用户名>/<仓库>/blob/<分支>/<模型文件相对路径>";
+            manualInput.value = "";
+            manualInput.setAttribute("aria-label", `手动填写 ${name} 的 Hugging Face 文件地址`);
+            const manualActions = el("div", "cline-workflow-model-manual-actions");
+            const manualSubmit = button("使用此地址", "cline-secondary cline-workflow-model-manual-submit");
+            const bingUrl = searchUrlsByName[name];
+            if (bingUrl) {
+              const bingLink = document.createElement("a");
+              bingLink.className = "cline-workflow-model-bing-link";
+              bingLink.href = bingUrl;
+              bingLink.target = "_blank";
+              bingLink.rel = "noopener noreferrer";
+              bingLink.textContent = "在 Bing 中搜索这个文件";
+              manualActions.append(manualSubmit, bingLink);
+            } else {
+              manualActions.appendChild(manualSubmit);
+            }
+            const manualError = el("p", "cline-workflow-candidate-meta warning");
+            const progressUi = modelDownloadProgress();
+            const runner = createModelDownloadRunner({
+              jobId,
+              name,
+              progress: progressUi,
+              prepareSource: async () => {
+                const url = manualInput.value.trim();
+                if (!url) throw new Error("请填写 Hugging Face 文件地址。");
+                manualSubmit.disabled = true;
+                manualInput.disabled = true;
+                manualError.textContent = "正在校验并准备模型…";
+                return request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/source`, {
+                  method: "POST", body: JSON.stringify({ name, source: { url } }),
+                });
+              },
+              onSourceSelected: (selected) => {
+                model.source = selected.source;
+                manualError.textContent = "地址已验证，正在下载…";
+              },
+              onCompleted: async (progress) => {
+                model.status = "installed";
+                group.replaceChildren(
+                  el("strong", "", `已下载：${name}`),
+                  el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(model.source)} · ${progress.model?.link?.path || model.source.filename}`),
+                );
+                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
+              },
+              onFailure: (error, sourceReady) => {
+                if (!sourceReady) {
+                  manualSubmit.disabled = false;
+                  manualInput.disabled = false;
+                }
+                manualError.textContent = `${sourceReady ? "下载失败" : "地址无效或下载失败"}：${error.message}`;
+                showError(error);
+              },
+            });
+            manualSubmit.onclick = runner.run;
+            group.append(manualInput, manualActions, manualError, progressUi.container);
           }
           if (candidates.length && !model.source) {
             const picker = el("select", "cline-workflow-model-picker");
@@ -469,32 +748,31 @@ function workflowCandidateCard(jobId, candidate) {
               picker.disabled = true;
               const progressUi = modelDownloadProgress();
               group.appendChild(progressUi.container);
-              try {
-                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/source`, {
+              const runner = createModelDownloadRunner({
+                jobId,
+                name,
+                progress: progressUi,
+                prepareSource: async () => request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/source`, {
                   method: "POST", body: JSON.stringify({ name, source }),
-                });
-                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/confirm`, {
-                  method: "POST", body: JSON.stringify({ confirmed: true, model_names: [name] }),
-                });
-                const progress = await waitForModelDownload(jobId, name, (status) => {
-                  updateModelDownloadProgress(progressUi, status);
-                });
-                progressUi.bar.value = 100;
-                progressUi.label.textContent = "下载完成，正在准备模型…";
-                model.status = "installed";
-                model.source = source;
-                group.replaceChildren(
-                  el("strong", "", `已下载：${name}`),
-                  el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(source)} · ${progress.model?.link?.path || source.filename}`),
-                );
-                modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
-              } catch (error) {
-                picker.disabled = false;
-                picker.value = "";
-                progressUi.label.textContent = `下载失败：${error.message}`;
-                progressUi.container.classList.add("error");
-                showError(error);
-              }
+                }),
+                onSourceSelected: (selected) => { model.source = selected.source || source; },
+                onCompleted: async (progress) => {
+                  model.status = "installed";
+                  group.replaceChildren(
+                    el("strong", "", `已下载：${name}`),
+                    el("p", "cline-workflow-candidate-meta", `${modelSourceLabel(model.source)} · ${progress.model?.link?.path || source.filename}`),
+                  );
+                  modelSourceArea.dispatchEvent(new Event("workflow-model-prepared"));
+                },
+                onFailure: (error, sourceReady) => {
+                  if (!sourceReady) {
+                    picker.disabled = false;
+                    picker.value = "";
+                  }
+                  showError(error);
+                },
+              });
+              runner.run();
             };
             group.appendChild(picker);
           }
@@ -506,7 +784,7 @@ function workflowCandidateCard(jobId, candidate) {
       const sourceSearchArea = el("div", "cline-workflow-node-sources");
       const searchButton = button("搜索缺失节点仓库（优先 GitHub）", "cline-secondary cline-workflow-node-search");
       const modelSearchButton = button("搜索缺失模型文件（Hugging Face）", "cline-secondary cline-workflow-model-search");
-      const pendingModels = (plan.models || []).filter((model) => model.status !== "installed");
+      const pendingModels = (plan.models || []).filter((model) => !["installed", "selected_local"].includes(model.status));
       card.append(localInventoryButton, localInventoryArea);
       void refreshLocalInventory();
       if (pendingModels.length) card.appendChild(modelSourceArea);
@@ -518,7 +796,10 @@ function workflowCandidateCard(jobId, candidate) {
             const searched = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/search`, {
               method: "POST", body: "{}",
             });
-            await renderModelSources(plan.models || [], searched.results || {});
+            if (Array.isArray(searched.models)) {
+              plan.models = searched.models;
+            }
+            await renderModelSources(plan.models || [], searched.results || {}, searched.search_urls || {}, true);
             if (searched.message) {
               localInventoryArea.appendChild(el("p", "cline-workflow-candidate-meta", searched.message));
             }
@@ -659,6 +940,17 @@ function workflowCandidateCard(jobId, candidate) {
     }
   };
   card.appendChild(action);
+  // The conversation transcript contains the candidate, while selection,
+  // source choice, and download progress live in the persisted workflow job.
+  // Re-entering the conversation must therefore restore the selected card
+  // instead of asking the user to select it again.
+  void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)
+    .then((job) => {
+      if (job?.selected_candidate_id !== candidate.id || !card.isConnected || card.classList.contains("selected")) return;
+      action.dataset.restore = "true";
+      action.click();
+    })
+    .catch(() => {});
   return card;
 }
 
@@ -671,9 +963,28 @@ function appendWorkflowExecuteButton(card, jobId) {
       const result = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/execute`, { method: "POST", body: JSON.stringify({ confirmed: true }) });
       execute.textContent = `执行完成（${Object.keys(result.outputs || {}).length} 个输出节点）`;
       card.classList.add("completed");
-    } catch (error) { execute.disabled = false; showError(error); }
+      card.classList.remove("failed");
+      card.querySelector(".cline-workflow-execution-error")?.remove();
+    } catch (error) {
+      execute.disabled = false;
+      execute.textContent = "重新确认执行工作流";
+      appendWorkflowExecutionFailure(card, error);
+      try {
+        const job = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`);
+        if (job?.metadata?.execution_diagnostic && card.isConnected) appendWorkflowExecutionFailure(card, job);
+      } catch { /* the original execution error is already visible on the card */ }
+      showError(error);
+    }
   };
   card.appendChild(execute);
+  void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)
+    .then((job) => {
+      if (job?.metadata?.execution_diagnostic && card.isConnected) {
+        appendWorkflowExecutionFailure(card, job);
+        execute.textContent = "重新确认执行工作流";
+      }
+    })
+    .catch(() => {});
 }
 
 function appendWorkflowCandidates(content, article) {
@@ -726,6 +1037,7 @@ function renderMessages() {
   const log = document.querySelector(`#${PANEL_ID} .cline-messages`);
   if (!log) return;
   const messages = displayedMessages();
+  const shouldFollow = log.scrollHeight - log.scrollTop - log.clientHeight <= 24;
   log.replaceChildren();
   if (!messages.length) {
     const welcome = el("div", "cline-welcome");
@@ -750,7 +1062,7 @@ function renderMessages() {
   }
   if (state.error) log.appendChild(el("div", "cline-error", state.error));
   if (displayedBusy() || (!state.globalChatActive && state.task?.status === "running")) log.appendChild(el("div", "cline-status", "Omniscience 正在思考或执行…"));
-  log.scrollTop = log.scrollHeight;
+  if (shouldFollow) log.scrollTop = log.scrollHeight;
 }
 
 function nodeActions(control, onClick) {
