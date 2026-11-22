@@ -216,6 +216,7 @@ class ModelDownloader:
         category: str,
         models_root: Path | str,
         target_root: Path | str | None = None,
+        target_name: str | None = None,
     ) -> dict[str, Any]:
         """Link a downloaded model into a registered ComfyUI folder.
 
@@ -228,13 +229,16 @@ class ModelDownloader:
         source = Path(model_path).expanduser().resolve()
         if not source.is_file():
             raise ModelDownloadError(f"模型文件不存在：{source}")
+        link_name = str(target_name or source.name).strip().replace("\\", "/")
+        if not link_name or Path(link_name).name != link_name or ".." in Path(link_name).parts:
+            raise ModelDownloadError("模型目标文件名无效。")
         destination_root = (
             Path(target_root).expanduser().resolve()
             if target_root is not None
             else (Path(models_root).expanduser().resolve() / category).resolve()
         )
         destination_root.mkdir(parents=True, exist_ok=True)
-        target = destination_root / source.name
+        target = destination_root / link_name
         if target.exists() or target.is_symlink():
             if target.is_symlink() and target.resolve(strict=False) == source:
                 return {"path": str(target), "created": False}

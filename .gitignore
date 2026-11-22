@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 *.py[cod]
 ref_code/
+/.omniscience-tokens.json

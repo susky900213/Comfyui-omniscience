@@ -18,24 +18,31 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import io
 import re
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .. import archives, node_review, node_security, paths, skill_review, skill_security
-from ..constants import MAX_NODE_PACKAGE_BYTES
+from .. import access_tokens, archives, node_review, node_security, paths, skill_review, skill_security
+from ..constants import (
+    MAX_NODE_PACKAGE_BYTES,
+    MAX_NODE_PACKAGE_FILE_BYTES,
+    MAX_NODE_PACKAGE_FILES,
+    MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES,
+)
 from ..util import ProjectFolderExistsError, project_folder_name
 from ..workspace import Workspace
 
 # GitHub hands the tarball to us through its own blob host, so redirects are
 # followed only between these HTTPS hosts.
 TARBALL_HOSTS = {"api.github.com", "codeload.github.com", "objects.githubusercontent.com", "github.com"}
-GITEE_HOSTS = {"gitee.com", "www.gitee.com"}
+GITCODE_HOSTS = {"gitcode.com", "www.gitcode.com"}
 DOWNLOAD_TIMEOUT_SECONDS = 60
 MAX_REPO_INFO_BYTES = 1_000_000
 VERDICT_LABELS = {"clean": "未发现风险", "review": "需要复核", "blocked": "已被阻止"}
@@ -59,7 +66,7 @@ class NodeSecurityBlockedError(ValueError):
         super().__init__(
             f"{headline}节点“{folder}”：{skill_security.summarize(report)} "
             f"{skill_security.findings_text(report, limit=3)} "
-            "风险节点不会通过工作流依赖自动安装。请在节点管理区单独查看报告，必要时人工复核。"
+            "风险节点不会通过手动 GitHub 兜底安装；如果该节点由 ComfyUI-Manager 已经放入 custom_nodes，请在 Manager 中停用或移除后再处理。"
         )
         self.folder = folder
         self.report = report
@@ -79,13 +86,13 @@ class _TarballRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
-class _GiteeRedirectHandler(HTTPRedirectHandler):
-    """Follow Gitee archive redirects only to Gitee HTTPS hosts."""
+class _GitCodeRedirectHandler(HTTPRedirectHandler):
+    """Follow GitCode archive redirects only to GitCode HTTPS hosts."""
 
     def redirect_request(self, request, response, code, message, headers, new_url):
         parsed = urlparse(new_url)
-        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in GITEE_HOSTS or parsed.port not in {None, 443}:
-            raise ValueError("Gitee 下载尝试跳转到不受支持的地址，已阻止安装。")
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in GITCODE_HOSTS | {"api.gitcode.com"} or parsed.port not in {None, 443}:
+            raise ValueError("GitCode 下载尝试跳转到不受支持的地址，已阻止安装。")
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
@@ -110,13 +117,13 @@ class NodeInstallerMixin:
         pin_commit: bool = False,
         expected_class_type: str = "",
     ) -> dict[str, Any]:
-        """Install a node project from a public GitHub/Gitee link or uploaded archive."""
+        """Install a node project from a public GitHub/GitCode link or uploaded archive."""
         value = str(source or "").strip()
         if not value:
-            raise ValueError("请提供 GitHub/Gitee 仓库地址或节点压缩包。")
+            raise ValueError("请提供 GitHub/GitCode 仓库地址或节点压缩包。")
         if archives.looks_like_archive(value):
             if pin_commit:
-                raise ValueError("工作流节点必须使用可固定版本的 GitHub/Gitee 仓库来源，不能使用可变压缩包链接。")
+                raise ValueError("工作流节点必须使用可固定版本的 GitHub/GitCode 仓库来源，不能使用可变压缩包链接。")
             return await self.install_workspace_archive(value, acknowledged=acknowledged)
         host, owner, repository, prefix, ref = self._node_repository_source(value)
         resolved_ref = ref or await asyncio.to_thread(self._repository_default_branch, host, owner, repository)
@@ -128,7 +135,7 @@ class NodeInstallerMixin:
             source_url = f"{source_url}/{prefix}"
         return await self._install_package(
             package,
-            archive_name=f"{repository}.zip" if host in GITEE_HOSTS else f"{repository}.tar.gz",
+            archive_name=f"{repository}.zip" if host in GITCODE_HOSTS else f"{repository}.tar.gz",
             folder=prefix.split("/")[-1] if prefix else repository,
             source=source_url,
             subdirectory=prefix,
@@ -262,6 +269,79 @@ class NodeInstallerMixin:
             report["acknowledged"] = True
         return report
 
+    async def scan_installed_manager_node(
+        self,
+        *,
+        manager_id: str,
+        repository: str = "",
+        expected_class_type: str = "",
+    ) -> dict[str, Any]:
+        """Scan the project that Manager placed in ``custom_nodes``.
+
+        Manager owns acquisition and installation, so this is intentionally a
+        post-install scan.  It never imports the project and it also checks the
+        exact ``NODE_CLASS_MAPPINGS`` export before accepting a directory as the
+        installed provider for the missing node.
+        """
+        nodes = self.settings.comfyui_node_directory()
+        if nodes is None or not nodes.is_dir():
+            return {
+                "status": "not_verified",
+                "security": {"verdict": "unknown", "status": "custom_nodes_not_found"},
+                "message": "Manager 已返回安装成功，但暂时找不到 custom_nodes 目录，无法完成安全扫描。",
+            }
+        names: list[str] = []
+        for value in (repository, manager_id):
+            text = str(value or "").rstrip("/")
+            if text:
+                names.append(text.rsplit("/", 1)[-1].removesuffix(".git").split("@", 1)[0])
+        preferred = [nodes / project_folder_name(name) for name in names if name]
+        candidates = preferred + [
+            item for item in sorted(nodes.iterdir())
+            if item.is_dir() and not item.is_symlink() and item.name not in {"__pycache__", ".disabled"}
+        ]
+        seen: set[Path] = set()
+        for root in candidates:
+            root = root.resolve()
+            if root in seen or not root.is_dir():
+                continue
+            seen.add(root)
+            if expected_class_type and not self._exports_node_class(root, expected_class_type):
+                continue
+            source = repository or f"comfyui-manager:{manager_id}"
+            try:
+                report = await self._review_package(root, source=source, acknowledged=False)
+            except NodeSecurityBlockedError as exc:
+                # Manager has already placed the project, but the risk report
+                # must still be persisted and returned to the panel.  Do not
+                # silently treat a risky Manager package as a usable node.
+                self.store.save_node_scan(str(root), exc.report)
+                raise
+            self.store.save_node_scan(str(root), report)
+            return {
+                "status": "manager_installed",
+                "folder": root.name,
+                "path": str(root),
+                "source": source,
+                "security": {
+                    "verdict": report.get("verdict"),
+                    "severity": report.get("severity"),
+                    "engine": report.get("engine"),
+                    "mode": report.get("mode", "static"),
+                    "summary": VERDICT_LABELS.get(str(report.get("verdict")), report.get("verdict")),
+                    "findings": (report.get("findings") or [])[:6],
+                    "domains": (report.get("domains") or [])[:12],
+                    "post_install": True,
+                },
+                "security_report_path": str(root),
+            }
+        return {
+            "status": "not_verified",
+            "source": repository or f"comfyui-manager:{manager_id}",
+            "security": {"verdict": "unknown", "status": "node_export_not_found", "post_install": True},
+            "message": f"Manager 已安装节点包，但在 custom_nodes 中没有找到导出“{expected_class_type}”的项目，未将其视为已验证节点。",
+        }
+
     def _place_package(self, root: Path, target: Path, report: dict[str, Any]) -> int:
         if target.exists() or target.is_symlink():
             raise ProjectFolderExistsError(
@@ -369,7 +449,7 @@ class NodeInstallerMixin:
     def _requested_node_source(cls, content: Any) -> str | None:
         """The node source the user actually named: repo URL, archive, then ``owner/repo``."""
         text = str(content or "")
-        url = re.search(r"https://(?:github\.com|gitee\.com)/[A-Za-z0-9._~:/?#\[\]!$&'()*+,;=%@-]+", text, re.IGNORECASE)
+        url = re.search(r"https://(?:github\.com|gitcode\.com)/[A-Za-z0-9._~:/?#\[\]!$&'()*+,;=%@-]+", text, re.IGNORECASE)
         if url:
             source = url.group(0).rstrip(".,;:!?)\"]")
             try:
@@ -428,28 +508,28 @@ class NodeInstallerMixin:
 
     @staticmethod
     def _node_repository_source(source: Any) -> tuple[str, str, str, str, str | None]:
-        """Validate a public GitHub/Gitee repository or ``tree`` folder link."""
+        """Validate a public GitHub/GitCode repository or ``tree`` folder link."""
         value = str(source or "").strip()
         parsed = urlparse(value)
         parts = [unquote(part) for part in parsed.path.split("/") if part]
         host = (parsed.hostname or "").lower()
         if (
             parsed.scheme != "https"
-            or host not in {"github.com", "gitee.com"}
+            or host not in {"github.com", "gitcode.com"}
             or parsed.username
             or parsed.password
             or parsed.port not in {None, 443}
             or len(parts) < 2
         ):
-            raise ValueError("请提供公开 GitHub/Gitee HTTPS 仓库或节点文件夹链接。")
+            raise ValueError("请提供公开 GitHub/GitCode HTTPS 仓库或节点文件夹链接。")
         owner, repository = parts[0], parts[1].removesuffix(".git")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repository):
-            raise ValueError("GitHub/Gitee 仓库地址无效。")
+            raise ValueError("GitHub/GitCode 仓库地址无效。")
         ref: str | None = None
         prefix = ""
         if len(parts) > 2:
             if parts[2] != "tree" or len(parts) < 4:
-                raise ValueError("链接应指向 GitHub/Gitee 仓库或仓库内的节点文件夹（tree 链接）。")
+                raise ValueError("链接应指向 GitHub/GitCode 仓库或仓库内的节点文件夹（tree 链接）。")
             ref = parts[3]
             prefix = "/".join(parts[4:]).strip("/")
         if any(part in {".", ".."} for part in prefix.split("/") if part):
@@ -461,12 +541,12 @@ class NodeInstallerMixin:
         if host == "github.com":
             return cls._github_default_branch(owner, repository)
         try:
-            info = cls._gitee_json(f"https://gitee.com/api/v5/repos/{owner}/{repository}")
+            info = cls._gitcode_json(f"https://api.gitcode.com/api/v5/repos/{owner}/{repository}")
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            raise ValueError(f"无法读取公开 Gitee 仓库：{exc}") from exc
+            raise ValueError("无法读取公开 GitCode 仓库。") from exc
         ref = str((info or {}).get("default_branch") or "").strip() if isinstance(info, dict) else ""
         if not ref:
-            raise ValueError("Gitee 仓库没有可用的默认分支。")
+            raise ValueError("GitCode 仓库没有可用的默认分支。")
         return ref
 
     @classmethod
@@ -474,45 +554,132 @@ class NodeInstallerMixin:
         if host == "github.com":
             return cls._github_commit(owner, repository, ref)
         try:
-            info = cls._gitee_json(
-                f"https://gitee.com/api/v5/repos/{owner}/{repository}/commits/{quote(ref, safe='')}"
+            info = cls._gitcode_json(
+                f"https://api.gitcode.com/api/v5/repos/{owner}/{repository}/commits/{quote(ref, safe='')}"
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            raise ValueError(f"无法固定 Gitee 节点版本：{exc}") from exc
+            raise ValueError("无法固定 GitCode 节点版本。") from exc
         sha = str((info or {}).get("sha") or "").strip() if isinstance(info, dict) else ""
         if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-            raise ValueError("Gitee 没有返回有效提交哈希，已拒绝安装可变版本。")
+            raise ValueError("GitCode 没有返回有效提交哈希，已拒绝安装可变版本。")
         return sha
 
     @staticmethod
-    def _gitee_json(url: str) -> Any:
-        from ..node_search import GiteeNodeSearcher
+    def _gitcode_json(url: str) -> Any:
+        from ..node_search import GitCodeNodeSearcher
 
-        return GiteeNodeSearcher._request(url)
+        return GitCodeNodeSearcher._request(url)
+
+    @staticmethod
+    def _gitcode_raw(url: str, *, max_bytes: int = MAX_NODE_PACKAGE_FILE_BYTES) -> bytes:
+        authenticated_url = access_tokens.with_access_token(url, "gitcode")
+        request = Request(
+            authenticated_url,
+            headers={"Accept": "application/octet-stream", "User-Agent": "Comfyui-omniscience-Node-Installer"},
+        )
+        try:
+            with build_opener(_GitCodeRedirectHandler()).open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed GitCode API host
+                final_host = (urlparse(response.geturl()).hostname or "").lower()
+                if final_host not in GITCODE_HOSTS | {"api.gitcode.com"}:
+                    raise ValueError("GitCode raw 文件下载被重定向到不受支持的主机，已拒绝安装。")
+                body = response.read(max_bytes + 1)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise ValueError("无法下载 GitCode 节点文件。") from exc
+        if len(body) > max_bytes:
+            raise ValueError(f"GitCode 节点单文件超过 {max_bytes} 字节上限。")
+        return body
+
+    @staticmethod
+    def _gitcode_archive_path(path: Any) -> str:
+        value = str(path or "").replace("\\", "/")
+        parts = value.split("/")
+        if (
+            not value
+            or value.startswith("/")
+            or any(not part or part in {".", ".."} for part in parts)
+            or ":" in parts[0]
+            or "\x00" in value
+        ):
+            raise ValueError("GitCode 节点文件路径无效，已拒绝安装。")
+        return "/".join(parts)
+
+    @classmethod
+    def _gitcode_source_archive(cls, owner: str, repository: str, ref: str) -> bytes:
+        """Build a bounded archive through GitCode's documented tree/raw APIs."""
+        tree_entries: list[dict[str, Any]] = []
+        page = 1
+        page_size = 100
+        while True:
+            tree_url = (
+                f"https://api.gitcode.com/api/v5/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+                f"/git/trees/{quote(ref, safe='')}?recursive=1&per_page={page_size}&page={page}"
+            )
+            payload = cls._gitcode_json(tree_url)
+            entries = payload.get("tree") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("GitCode 没有返回有效的节点文件树。")
+            tree_entries.extend(item for item in entries if isinstance(item, dict))
+            if len(tree_entries) > MAX_NODE_PACKAGE_FILES:
+                raise ValueError(f"GitCode 节点文件数超过 {MAX_NODE_PACKAGE_FILES} 个上限。")
+            if len(entries) < page_size:
+                break
+            page += 1
+
+        files: list[tuple[str, dict[str, Any]]] = []
+        for item in tree_entries:
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"tree", "directory"}:
+                continue
+            if item_type not in {"blob", "file"}:
+                raise ValueError("GitCode 节点文件树包含不支持的条目，已拒绝安装。")
+            path = cls._gitcode_archive_path(item.get("path"))
+            declared_size = item.get("size")
+            try:
+                if declared_size is not None and int(declared_size) > MAX_NODE_PACKAGE_FILE_BYTES:
+                    raise ValueError(f"GitCode 节点单文件超过 {MAX_NODE_PACKAGE_FILE_BYTES} 字节上限。")
+            except (TypeError, ValueError) as exc:
+                if isinstance(exc, ValueError) and "超过" in str(exc):
+                    raise
+                raise ValueError("GitCode 节点文件大小无效，已拒绝安装。") from exc
+            files.append((path, item))
+        if not files:
+            raise ValueError("GitCode 仓库没有可下载的节点文件。")
+
+        archive = io.BytesIO()
+        uncompressed_bytes = 0
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
+            for path, _item in files:
+                encoded_path = "/".join(quote(part, safe="") for part in path.split("/"))
+                raw_url = (
+                    f"https://api.gitcode.com/api/v5/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+                    f"/raw/{encoded_path}?ref={quote(ref, safe='')}"
+                )
+                content = cls._gitcode_raw(raw_url)
+                uncompressed_bytes += len(content)
+                if uncompressed_bytes > MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES:
+                    raise ValueError(f"GitCode 节点解压后总大小超过 {MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES} 字节上限。")
+                package.writestr(path, content)
+                if archive.tell() > MAX_NODE_PACKAGE_BYTES:
+                    raise ValueError(f"GitCode 节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
+        result = archive.getvalue()
+        if len(result) > MAX_NODE_PACKAGE_BYTES:
+            raise ValueError(f"GitCode 节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
+        return result
 
     @classmethod
     def _repository_archive(cls, host: str, owner: str, repository: str, ref: str) -> bytes:
         if host == "github.com":
             return cls._github_tarball(owner, repository, ref)
-        url = f"https://gitee.com/{quote(owner, safe='')}/{quote(repository, safe='')}/repository/archive/{quote(ref, safe='')}.zip"
-        request = Request(url, headers={"Accept": "application/zip", "User-Agent": "Comfyui-omniscience-Node-Installer"})
-        try:
-            with build_opener(_GiteeRedirectHandler()).open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 - host-validated Gitee URL
-                final_host = (urlparse(response.geturl()).hostname or "").lower()
-                if final_host not in GITEE_HOSTS:
-                    raise ValueError("Gitee 下载被重定向到不受支持的主机，已拒绝安装。")
-                package = response.read(MAX_NODE_PACKAGE_BYTES + 1)
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            raise ValueError(f"无法下载 Gitee 节点仓库：{exc}") from exc
-        if len(package) > MAX_NODE_PACKAGE_BYTES:
-            raise ValueError(f"Gitee 节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
-        return package
+        return cls._gitcode_source_archive(owner, repository, ref)
 
     @staticmethod
     def _github_json(url: str) -> Any:
         from .github_skill import GitHubSkillInstaller
 
-        return GitHubSkillInstaller._github_request(url, max_bytes=MAX_REPO_INFO_BYTES)
+        return GitHubSkillInstaller._github_request(
+            url,
+            max_bytes=MAX_REPO_INFO_BYTES,
+        )
 
     @classmethod
     def _github_default_branch(cls, owner: str, repository: str) -> str:
@@ -541,29 +708,11 @@ class NodeInstallerMixin:
 
     @classmethod
     def _node_tarball(cls, owner: str, repository: str, ref: str) -> bytes:
-        """Try GitHub first, then the same owner/repo on Gitee for slow/blocked GitHub links."""
+        """Try GitHub first, then rebuild the same owner/repo through GitCode APIs."""
         try:
             return cls._github_tarball(owner, repository, ref)
-        except (ValueError, HTTPError, URLError, TimeoutError, OSError) as github_error:
-            url = f"https://gitee.com/{quote(owner, safe='')}/{quote(repository, safe='')}/repository/archive/{quote(ref, safe='')}.zip"
-            request = Request(
-                url,
-                headers={
-                    "Accept": "application/zip",
-                    "User-Agent": "Comfyui-omniscience-Node-Installer",
-                },
-            )
-            try:
-                with build_opener().open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 - fixed Gitee host
-                    final_host = (urlparse(response.geturl()).hostname or "").lower()
-                    if final_host not in {"gitee.com", "www.gitee.com"}:
-                        raise ValueError("Gitee 下载被重定向到不受支持的主机，已拒绝安装。")
-                    package = response.read(MAX_NODE_PACKAGE_BYTES + 1)
-            except (HTTPError, URLError, TimeoutError, OSError) as gitee_error:
-                raise ValueError(f"GitHub 和 Gitee 节点仓库均无法下载：GitHub={github_error}；Gitee={gitee_error}") from gitee_error
-            if len(package) > MAX_NODE_PACKAGE_BYTES:
-                raise ValueError(f"Gitee 节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
-            return package
+        except (ValueError, HTTPError, URLError, TimeoutError, OSError):
+            return cls._gitcode_source_archive(owner, repository, ref)
 
     @classmethod
     def _github_tarball(cls, owner: str, repository: str, ref: str) -> bytes:
@@ -583,7 +732,7 @@ class NodeInstallerMixin:
                     raise ValueError("GitHub 下载被重定向到不受支持的主机，已拒绝安装。")
                 package = response.read(MAX_NODE_PACKAGE_BYTES + 1)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            raise ValueError(f"无法下载 GitHub 节点仓库：{exc}") from exc
+            raise ValueError("无法下载 GitHub 节点仓库。") from exc
         if len(package) > MAX_NODE_PACKAGE_BYTES:
             raise ValueError(f"节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
         return package

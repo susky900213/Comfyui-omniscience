@@ -11,20 +11,24 @@ from threading import Event
 from pathlib import Path
 from typing import Any
 
-from .workflow_parser import WorkflowParseError, inspect_workflow, to_api_workflow
+from .workflow_parser import (
+    WORKFLOW_INSPECTION_VERSION,
+    WorkflowParseError,
+    inspect_workflow,
+    to_api_workflow,
+)
 from .workflow_provider import RunningHubProvider
 from .workflow_executor import ComfyUIWorkflowExecutor, WorkflowExecutionError
 from .model_downloader import CATEGORIES, ModelDownloader
 from .model_downloader import ModelDownloadCancelled, ModelDownloadRetryableError
-from .model_source import ModelSourceSearcher
+from .model_source import ModelSourceSearcher, model_filenames_match
 from . import paths
 from .resource_assessor import assess, local_snapshot, rank_resource
 from .environment_diagnostics import diagnose_environment, diagnose_running_environment
 from .workflow_diagnostics import diagnose_execution_failure, static_diagnostic
-from .node_search import GiteeNodeSearcher, GitHubNodeSearcher
+from .node_search import ComfyUIManagerClient
 from .util import json_text
 
-MAX_WORKFLOW_NODE_SEARCHES = 5
 MODEL_SUFFIXES = {".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".pkl"}
 MODEL_HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -49,6 +53,286 @@ class WorkflowManagerMixin:
     """Persisted RunningHub search and candidate selection for global chat."""
 
     @staticmethod
+    def _node_source_candidates(value: Any) -> list[dict[str, Any]]:
+        """Normalize the persisted node-source cache without losing candidates.
+
+        Older jobs stored one Manager mapping per class type.  Newer jobs may
+        store a list directly or a primary mapping with a ``candidates`` list.
+        Accept all three forms so an existing workflow job can still be resumed
+        after the source-attribution changes.
+        """
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if not isinstance(value, dict):
+            return []
+        nested = value.get("candidates")
+        if isinstance(nested, list):
+            candidates = [item for item in nested if isinstance(item, dict)]
+            primary = {key: item for key, item in value.items() if key != "candidates"}
+            if primary.get("manager_id") or primary.get("repository") or primary.get("source"):
+                candidates.insert(0, primary)
+            return candidates
+        return [value]
+
+    @staticmethod
+    def _node_candidate_key(candidate: dict[str, Any]) -> tuple[str, str, str, str, str, str, str]:
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+
+        def value(*keys: str) -> str:
+            for key in keys:
+                raw = candidate.get(key)
+                if raw not in (None, "", [], {}):
+                    return str(raw).strip()
+                raw = metadata.get(key)
+                if raw not in (None, "", [], {}):
+                    return str(raw).strip()
+            return ""
+
+        return (
+            value("manager_id").casefold(),
+            value("install_id", "id").casefold(),
+            value("repository", "source", "reference", "repo", "url").rstrip("/").casefold(),
+            value("aux_id").casefold(),
+            value("cnr_id").casefold(),
+            value("version", "selected_version", "latest_version").casefold(),
+            value("install_type", "type").casefold(),
+        )
+
+    @classmethod
+    def _merge_node_source_candidates(cls, *values: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str, str, str, str]] = set()
+        for value in values:
+            for candidate in cls._node_source_candidates(value):
+                key = cls._node_candidate_key(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(dict(candidate))
+        return result
+
+    @staticmethod
+    def _node_candidate_matches_aux_id(candidate: dict[str, Any], aux_id: Any) -> bool:
+        expected = str(aux_id or "").strip().casefold().rstrip("/")
+        if not expected:
+            return False
+        values = {
+            str(candidate.get(key) or "").strip().casefold().rstrip("/")
+            for key in ("aux_id", "repository", "source", "reference", "manager_id", "install_id", "cnr_id")
+        }
+        metadata = candidate.get("metadata")
+        if isinstance(metadata, dict):
+            values.update(
+                str(metadata.get(key) or "").strip().casefold().rstrip("/")
+                for key in ("aux_id", "repository", "repo", "reference", "url", "source", "install_id", "cnr_id")
+            )
+        return expected in {value for value in values if value}
+
+    @staticmethod
+    def _node_candidate_source(candidate: dict[str, Any]) -> str:
+        metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+        for key in ("source", "reference", "repository", "repo", "url", "github_url"):
+            value = candidate.get(key) or metadata.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _node_candidate_value(candidate: dict[str, Any], field: str) -> str:
+        value = candidate.get(field)
+        if value in (None, "", [], {}):
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, dict):
+                value = metadata.get(field)
+                if value in (None, "", [], {}):
+                    aliases = {
+                        "version": ("selected_version", "latest_version"),
+                        "install_type": ("type",),
+                    }
+                    for alias in aliases.get(field, ()):
+                        value = metadata.get(alias)
+                        if value not in (None, "", [], {}):
+                            break
+        return str(value or "").strip()
+
+    @classmethod
+    def _annotated_node_candidates(
+        cls, candidates: list[dict[str, Any]], aux_id: Any
+    ) -> list[dict[str, Any]]:
+        """Attach the evidence used to consider a candidate for one occurrence."""
+        expected = str(aux_id or "").strip()
+        return [
+            {
+                **candidate,
+                "matches_aux_id": bool(expected and cls._node_candidate_matches_aux_id(candidate, expected)),
+                "aux_id_evidence": expected,
+            }
+            for candidate in candidates
+        ]
+
+    @classmethod
+    def _resolve_node_instance(
+        cls,
+        instance: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        selected: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Resolve one occurrence without turning a class-name match into ownership."""
+        aux_id = str(instance.get("aux_id") or "").strip()
+        matching = cls._instance_node_candidates(candidates, aux_id)
+        # Keep rejected alternatives visible on the instance.  In particular,
+        # an aux_id mismatch is useful evidence that a candidate exists but
+        # cannot safely be assigned to this occurrence.
+        annotated = cls._annotated_node_candidates(candidates, aux_id)
+        selected_candidate = selected.get("candidate") if isinstance(selected, dict) else None
+        if not isinstance(selected_candidate, dict):
+            selected_candidate = matching[0] if len(matching) == 1 else None
+        source = str((selected or {}).get("source") or "").strip() if isinstance(selected, dict) else ""
+        manager_id = str((selected or {}).get("manager_id") or "").strip() if isinstance(selected, dict) else ""
+        if selected:
+            if not manager_id and isinstance(selected_candidate, dict):
+                manager_id = str(selected_candidate.get("manager_id") or "").strip()
+            if not source and isinstance(selected_candidate, dict):
+                source = cls._node_candidate_source(selected_candidate)
+            if (
+                aux_id
+                and isinstance(selected_candidate, dict)
+                and not cls._node_candidate_matches_aux_id(selected_candidate, aux_id)
+            ):
+                return {
+                    **instance,
+                    "status": "unresolved",
+                    "source": "",
+                    "manager_id": "",
+                    "source_type": "unresolved",
+                    "source_selected": False,
+                    "candidate": dict(selected_candidate),
+                    "candidates": annotated,
+                    "candidate_count": len(annotated),
+                    "source_evidence": {
+                        "kind": "selected_source_aux_id_mismatch",
+                        "aux_id": aux_id,
+                        "aux_id_matched": False,
+                    },
+                }
+            if isinstance(selected_candidate, dict) and selected_candidate:
+                selected_key = cls._node_candidate_key(selected_candidate)
+                candidate_keys = {cls._node_candidate_key(item) for item in candidates}
+                if candidate_keys and selected_key not in candidate_keys:
+                    return {
+                        **instance,
+                        "status": "unresolved",
+                        "source": "",
+                        "manager_id": "",
+                        "source_type": "unresolved",
+                        "source_selected": False,
+                        "candidate": dict(selected_candidate),
+                        "candidates": annotated,
+                        "candidate_count": len(annotated),
+                        "source_evidence": {
+                            "kind": "selected_source_not_in_search_results",
+                            "aux_id": aux_id,
+                            "aux_id_matched": False,
+                        },
+                    }
+            provider = str(selected.get("provider") or selected.get("source_type") or "user_selected").strip()
+            return {
+                **instance,
+                "status": "selected",
+                "source": source,
+                "manager_id": manager_id,
+                "source_type": provider,
+                "source_selected": bool(source or manager_id),
+                "candidate": dict(selected_candidate) if isinstance(selected_candidate, dict) else None,
+                "candidates": annotated,
+                "candidate_count": len(annotated),
+                "source_evidence": {
+                    "kind": "user_selection",
+                    "aux_id": aux_id,
+                    "aux_id_matched": bool(
+                        isinstance(selected_candidate, dict)
+                        and aux_id
+                        and cls._node_candidate_matches_aux_id(selected_candidate, aux_id)
+                    ),
+                },
+            }
+
+        identities = {
+            cls._node_plugin_identity(candidate)
+            for candidate in matching
+            if cls._node_plugin_identity(candidate)
+        }
+        if len(identities) == 1 and matching:
+            candidate = matching[0]
+            source = cls._node_candidate_source(candidate)
+            manager_id = str(candidate.get("manager_id") or "").strip()
+            return {
+                **instance,
+                "status": "resolved",
+                "source": source,
+                "manager_id": manager_id,
+                "source_type": "comfyui_manager" if manager_id else "workflow_source" if source else "unresolved",
+                "source_selected": bool(source or manager_id),
+                "candidate": dict(candidate),
+                "candidates": annotated,
+                "candidate_count": len(annotated),
+                "source_evidence": {
+                    "kind": "aux_id" if aux_id else "exact_class_type",
+                    "aux_id": aux_id,
+                    "aux_id_matched": bool(aux_id and cls._node_candidate_matches_aux_id(candidate, aux_id)),
+                    "plugin_id": next(iter(identities)),
+                },
+            }
+        if len(identities) > 1:
+            status = "ambiguous"
+            reason = "multiple_plugins"
+        elif aux_id and candidates:
+            status = "unresolved"
+            reason = "aux_id_unmatched"
+        else:
+            status = "unresolved"
+            reason = "no_candidate"
+        return {
+            **instance,
+            "status": status,
+            "source": "",
+            "manager_id": "",
+            "source_type": "unresolved",
+            "source_selected": False,
+            "candidate": None,
+            "candidates": annotated,
+            "candidate_count": len(annotated),
+            "source_evidence": {"kind": reason, "aux_id": aux_id, "aux_id_matched": False},
+        }
+
+    @classmethod
+    def _instance_node_candidates(
+        cls, candidates: list[dict[str, Any]], aux_id: Any
+    ) -> list[dict[str, Any]]:
+        """Return only candidates supported by this node instance.
+
+        An explicit ``aux_id`` is positive ownership evidence.  If none of the
+        retained repositories matches it, returning an empty list is deliberate:
+        a class-name match must not silently override the source metadata.
+        Without an aux id all candidates remain available for ambiguity review.
+        """
+        expected = str(aux_id or "").strip()
+        if not expected:
+            return list(candidates)
+        return [item for item in candidates if cls._node_candidate_matches_aux_id(item, expected)]
+
+    @classmethod
+    def _node_plugin_identity(cls, item: dict[str, Any]) -> str:
+        source = str(item.get("source") or item.get("repository") or "").strip().rstrip("/")
+        if source:
+            return f"source:{source.casefold()}"
+        aux_id = str(item.get("aux_id") or "").strip()
+        if aux_id:
+            return f"aux:{aux_id.casefold()}"
+        manager_id = str(item.get("manager_id") or "").strip()
+        return f"manager:{manager_id}" if manager_id else ""
+
+    @staticmethod
     def _diagnostic_dependency_plan(metadata: dict[str, Any]) -> dict[str, Any]:
         """Rebuild only user-selected dependency actions after preparation.
 
@@ -66,8 +350,15 @@ class WorkflowManagerMixin:
             {
                 "class_type": str(class_type),
                 "source": (selection or {}).get("source") if isinstance(selection, dict) else "",
+                "manager_id": (selection or {}).get("manager_id") if isinstance(selection, dict) else "",
+                "source_type": (selection or {}).get("provider") if isinstance(selection, dict) else "",
+                "manager": (selection or {}).get("manager") if isinstance(selection, dict) else None,
             }
-            for class_type in inspection.get("missing_nodes") or []
+            for class_type in (
+                inspection.get("installable_missing_nodes")
+                or inspection.get("missing_nodes")
+                or []
+            )
             for selection in [node_sources.get(str(class_type))]
             if str(class_type) not in prepared_nodes
         ]
@@ -476,33 +767,33 @@ class WorkflowManagerMixin:
         if candidate is None:
             raise ValueError("请先选择一个工作流候选。")
         provider = RunningHubProvider(self.settings)
-        node_info = None
         if loaded_nodes is None:
             loaded_nodes_error = ""
+            loaded_nodes_checked = False
             try:
                 comfy_executor = ComfyUIWorkflowExecutor(self.settings)
                 node_info = await asyncio.to_thread(comfy_executor.object_info)
+                loaded_nodes_checked = True
                 loaded_nodes = sorted(str(name) for name in node_info if name)
             except Exception as exc:
                 loaded_nodes = None
                 loaded_nodes_error = str(exc)
         else:
+            loaded_nodes_checked = True
             loaded_nodes_error = ""
         workflow = await asyncio.to_thread(provider.get_workflow, candidate)
-        if node_info is None:
-            try:
-                node_info = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).object_info)
-            except Exception:
-                # An explicitly supplied loaded-node list is still useful for
-                # dependency reporting.  Conversion will provide the precise
-                # object_info/schema error only if this workflow needs widget
-                # values that cannot be inferred from its own inputs.
-                node_info = None
-        report = inspect_workflow(workflow, loaded_nodes=loaded_nodes, loaded_nodes_error=loaded_nodes_error)
-        # Normalize UI canvas exports immediately after download.  Keep the
-        # original nodes/links in the envelope so the panel can still load the
-        # graph, while execution uses the generated prompt below.
-        workflow = to_api_workflow(workflow, node_info=node_info)
+        report = inspect_workflow(
+            workflow,
+            loaded_nodes=loaded_nodes,
+            loaded_nodes_error=loaded_nodes_error,
+            loaded_nodes_checked=loaded_nodes_checked,
+        )
+        # Keep the provider's workflow untouched during selection/preparation.
+        # UI canvas exports may contain widget values for nodes that are not
+        # present in the current ComfyUI /object_info response yet (for
+        # example, a custom SetNode).  The user must still be able to reach
+        # the dependency and confirmation UI; API-prompt conversion is an
+        # execution preflight and is performed by execute_workflow instead.
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
@@ -522,6 +813,21 @@ class WorkflowManagerMixin:
         if folder_warning:
             report["folder_paths_warning"] = folder_warning
         metadata = dict(job.get("metadata") or {})
+        # A node installed before a ComfyUI restart is not registered in the
+        # old /object_info response. Refresh the durable result when the user
+        # inspects the workflow again after restarting ComfyUI.
+        prepared = dict(metadata.get("prepared_node_results") or {})
+        loaded_set = {str(name) for name in (loaded_nodes or [])} if loaded_nodes_checked else set()
+        prepared_changed = False
+        if loaded_nodes_checked:
+            for class_type, result in prepared.items():
+                if not isinstance(result, dict) or result.get("verification_status") != "restart_required":
+                    continue
+                result["node_registered"] = class_type in loaded_set
+                result["verification_status"] = "loaded" if class_type in loaded_set else "restart_required"
+                prepared_changed = True
+        if prepared_changed:
+            metadata["prepared_node_results"] = prepared
         metadata["inspection"] = report
         metadata["workflow"] = workflow
         updated = self.store.update_workflow_job(job["id"], state="checking_dependencies", metadata=metadata)
@@ -535,8 +841,70 @@ class WorkflowManagerMixin:
 
     def dependency_plan(self, job_id: Any) -> dict[str, Any]:
         job = self.workflow_job(job_id)
-        inspection = (job.get("metadata") or {}).get("inspection") or {}
-        missing_nodes = inspection.get("missing_nodes") or []
+        job_metadata = dict(job.get("metadata") or {})
+        inspection = job_metadata.get("inspection") or {}
+        # A dependency request can arrive before the browser has restored the
+        # card and called the async inspection endpoint.  Do not let an old
+        # cached report keep the install card out of sync with ComfyUI.
+        if (
+            isinstance(job_metadata.get("workflow"), dict)
+            and inspection.get("inspection_version") != WORKFLOW_INSPECTION_VERSION
+        ):
+            try:
+                loaded = ComfyUIWorkflowExecutor(self.settings, request_timeout=3.0).object_info()
+                refreshed = inspect_workflow(
+                    job_metadata["workflow"],
+                    loaded_nodes=loaded,
+                    loaded_nodes_checked=True,
+                )
+                old_models = {
+                    (str(item.get("field") or ""), str(item.get("name") or "")): item
+                    for item in inspection.get("models") or []
+                    if isinstance(item, dict)
+                }
+                for model in refreshed.get("models") or []:
+                    previous = old_models.get((str(model.get("field") or ""), str(model.get("name") or "")))
+                    if isinstance(previous, dict):
+                        for key in ("local_paths", "local_status", "download_status", "category"):
+                            if key in previous:
+                                model[key] = previous[key]
+                inspection = refreshed
+                job_metadata["inspection"] = inspection
+                self.store.update_workflow_job(job["id"], metadata=job_metadata)
+            except Exception:
+                # The async inspection endpoint will report the connection
+                # problem to the UI.  A dependency read must remain usable for
+                # legacy jobs when ComfyUI is temporarily unavailable.
+                pass
+        inspection = job_metadata.get("inspection") or {}
+        # ``missing_nodes`` is the historical executable-only report.  The
+        # install card must instead use the canvas dependency set so a bypassed
+        # node is not silently omitted from the list ComfyUI needs to render.
+        missing_nodes = [
+            str(name)
+            for name in (
+                inspection.get("installable_missing_nodes")
+                or inspection.get("missing_nodes")
+                or []
+            )
+            if str(name).strip()
+        ]
+        missing_node_instances = [
+            item for item in (
+                inspection.get("installable_missing_node_instances")
+                or inspection.get("missing_node_instances")
+                or []
+            )
+            if isinstance(item, dict) and str(item.get("class_type") or "").strip()
+        ]
+        # Reports created before instance-level attribution only contain the
+        # de-duplicated type list.  Reconstruct a minimal instance record for
+        # those jobs so dependency planning remains resumable.
+        if not missing_node_instances:
+            missing_node_instances = [
+                {"id": "", "class_type": name, "aux_id": "", "properties": {}}
+                for name in missing_nodes
+            ]
         unverified_nodes = inspection.get("unverified_nodes") or []
         prepared_models = (job.get("metadata") or {}).get("prepared_models") or []
         prepared_names = {
@@ -551,50 +919,177 @@ class WorkflowManagerMixin:
         ]
         candidate = (job.get("metadata") or {}).get("candidate") or {}
         node_sources = candidate.get("node_sources") or []
-        job_metadata = dict(job.get("metadata") or {})
         selected_node_sources = job_metadata.get("node_source_selections") or {}
         node_search_results = job_metadata.get("node_search_results") or {}
+        node_manager_results = job_metadata.get("node_manager_results") or {}
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
         models_root = Path(comfyui_root).expanduser().resolve() / "models" if comfyui_root else Path("/__missing_comfyui_models__")
         nodes = []
+        plugin_groups: dict[str, dict[str, Any]] = {}
+        unresolved_nodes: list[dict[str, Any]] = []
         from .agent.node_install import NodeInstallerMixin
+        manager_client = ComfyUIManagerClient(self.settings)
 
         for name in missing_nodes:
-            source = next(
+            instances = [
+                dict(item)
+                for item in missing_node_instances
+                if str(item.get("class_type") or "") == name
+            ]
+            aux_ids = sorted(
+                {
+                    str(item.get("aux_id") or "").strip()
+                    for item in instances
+                    if str(item.get("aux_id") or "").strip()
+                }
+            )
+            workflow_source = next(
                 (
-                    item.get("source") or item.get("url") or item.get("github_url")
+                    item
                     for item in node_sources
                     if isinstance(item, dict)
                     and (name == item.get("class_type") or name in (item.get("class_types") or []))
                 ),
-                None,
+                {},
             )
+            if not isinstance(workflow_source, dict):
+                workflow_source = {}
             selected = selected_node_sources.get(name)
-            selected_commit = ""
-            if isinstance(selected, dict):
-                source = selected.get("source")
-                selected_commit = str(selected.get("commit") or "")
-            try:
-                host, owner, repository, prefix, _ref = NodeInstallerMixin._node_repository_source(source)
-                if prefix:
-                    raise ValueError("节点来源必须指向仓库根目录。")
-                source = f"https://{host}/{owner}/{repository}"
-            except (TypeError, ValueError):
-                source = None
+            aux_id_for_lookup = ""
+            if len(aux_ids) == 1:
+                aux_id_for_lookup = aux_ids[0]
+            local_manager_candidates = manager_client.preferred_candidates(name, aux_id=aux_id_for_lookup)
+            if local_manager_candidates:
+                # A persisted search result may have selected another package
+                # for the same class name.  The installed Manager extension map
+                # is stronger evidence and must replace stale/ambiguous search
+                # results, while an explicit user selection remains available
+                # for validation below.
+                cached_candidates = self._merge_node_source_candidates(
+                    local_manager_candidates,
+                    selected,
+                )
+            else:
+                cached_candidates = self._merge_node_source_candidates(
+                    node_manager_results.get(name),
+                    node_search_results.get(name),
+                    workflow_source,
+                    selected,
+                )
+            selected_by_instance = selected.get("instances") if isinstance(selected, dict) else None
+            resolved_instances = []
+            for instance in instances:
+                instance_key = str(instance.get("id") or "")
+                instance_selection = selected
+                if isinstance(selected_by_instance, dict):
+                    instance_selection = selected_by_instance.get(instance_key)
+                    if not isinstance(instance_selection, dict):
+                        instance_selection = None
+                resolved_instances.append(
+                    self._resolve_node_instance(instance, cached_candidates, instance_selection)
+                )
+            confirmed_instances = [
+                item for item in resolved_instances if item.get("source_selected")
+            ]
+            confirmed_identities = {
+                self._node_plugin_identity(
+                    item.get("candidate") if isinstance(item.get("candidate"), dict) else item
+                )
+                for item in confirmed_instances
+            }
+            confirmed_identities.discard("")
+            source = ""
+            manager_id = ""
+            manager_candidate: dict[str, Any] = {}
+            selected_commit = str(selected.get("commit") or "") if isinstance(selected, dict) else ""
+            if len(confirmed_instances) == len(resolved_instances) and confirmed_instances and (
+                len(confirmed_identities) == 1 or isinstance(selected, dict)
+            ):
+                first = confirmed_instances[0]
+                source = str(first.get("source") or "").strip()
+                manager_id = str(first.get("manager_id") or "").strip()
+                if isinstance(first.get("candidate"), dict):
+                    manager_candidate = dict(first["candidate"])
+                if isinstance(selected, dict):
+                    selected_commit = str(selected.get("commit") or selected_commit)
+            if source:
+                try:
+                    host, owner, repository, prefix, _ref = NodeInstallerMixin._node_repository_source(source)
+                    if prefix:
+                        raise ValueError("节点来源必须指向仓库根目录。")
+                    source = f"https://{host}/{owner}/{repository}"
+                except (TypeError, ValueError):
+                    source = None
             if source and selected_commit and re.fullmatch(r"[0-9a-fA-F]{40}", selected_commit):
                 source = f"{source}/tree/{selected_commit}"
-            candidates = node_search_results.get(name, [])
-            nodes.append(
-                {
-                    "class_type": name,
-                    "status": "missing",
-                    "source": source,
-                    "source_candidates": candidates if isinstance(candidates, list) else [],
-                    "source_selected": bool(source),
-                    "download_allowed": bool(source),
-                }
-            )
+            source_is_ambiguous = any(item.get("status") == "ambiguous" for item in resolved_instances)
+            source_is_partial = bool(resolved_instances) and len(confirmed_instances) != len(resolved_instances)
+            node_item = {
+                "class_type": name,
+                "status": "missing",
+                "source": source,
+                "source_candidates": self._annotated_node_candidates(cached_candidates, ""),
+                "manager": manager_candidate if manager_id else None,
+                "manager_id": manager_id,
+                "source_type": "comfyui_manager" if manager_id else "manual" if source else "unresolved",
+                "source_selected": bool(source or manager_id) and not source_is_partial,
+                "download_allowed": bool(source or manager_id) and not source_is_partial,
+                "instances": resolved_instances,
+                "aux_ids": aux_ids,
+                "source_ambiguous": source_is_ambiguous,
+                "source_partial": source_is_partial,
+            }
+            nodes.append(node_item)
+            unresolved_for_type = [
+                item for item in resolved_instances if not item.get("source_selected")
+            ]
+            if unresolved_for_type:
+                unresolved_nodes.append(
+                    {
+                        "class_type": name,
+                        "instances": unresolved_for_type,
+                        "reason": "ambiguous" if source_is_ambiguous else "unresolved",
+                    }
+                )
+            # Aggregate confirmed occurrences, not merely class types.  A
+            # partially attributed type can therefore contribute its confirmed
+            # instances while the remaining occurrences stay unresolved.
+            for resolved in confirmed_instances:
+                candidate_for_group = resolved.get("candidate")
+                group_item = candidate_for_group if isinstance(candidate_for_group, dict) else resolved
+                plugin_identity = self._node_plugin_identity(group_item)
+                if not plugin_identity:
+                    continue
+                group = plugin_groups.setdefault(
+                    plugin_identity,
+                    {
+                        "id": plugin_identity,
+                        "source": resolved.get("source"),
+                        "manager_id": resolved.get("manager_id"),
+                        "manager": group_item if str(group_item.get("manager_id") or "").strip() else None,
+                        "package_id": str(
+                            group_item.get("install_id")
+                            or group_item.get("id")
+                            or group_item.get("manager_id")
+                            or ""
+                        ).strip(),
+                        "package_name": str(
+                            group_item.get("title")
+                            or group_item.get("name")
+                            or group_item.get("manager_id")
+                            or resolved.get("source")
+                            or plugin_identity
+                        ).strip(),
+                        "class_types": [],
+                        "node_instances": [],
+                        "node_count": 0,
+                    },
+                )
+                if name not in group["class_types"]:
+                    group["class_types"].append(name)
+                group["node_instances"].append(resolved)
+                group["node_count"] += 1
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
         planned_models = []
         model_source_selections = dict(job_metadata.get("model_source_selections") or {})
@@ -615,7 +1110,7 @@ class WorkflowManagerMixin:
                 digest = str(source.get("sha256") or "").lower()
                 if (
                     not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_id)
-                    or Path(source_filename).name != basename
+                    or not model_filenames_match(Path(source_filename).name, basename)
                     or ".." in Path(source_filename).parts
                     or digest and not re.fullmatch(r"[0-9a-f]{64}", digest)
                 ):
@@ -683,6 +1178,32 @@ class WorkflowManagerMixin:
             "job_id": job["id"],
             "state": job.get("state"),
             "nodes": nodes,
+            "workflow_node_count": inspection.get("node_count", 0),
+            "workflow_node_types": inspection.get("canvas_class_types") or inspection.get("class_types") or [],
+            "canvas_node_count": inspection.get("canvas_node_count", inspection.get("node_count", 0)),
+            "canvas_missing_nodes": inspection.get("canvas_missing_nodes") or missing_nodes,
+            "canvas_missing_node_count": inspection.get("canvas_missing_node_count", len(missing_node_instances)),
+            "installable_missing_nodes": missing_nodes,
+            "installable_missing_type_count": len(missing_nodes),
+            "installable_missing_node_count": len(missing_node_instances),
+            "installable_plugins": list(plugin_groups.values()),
+            "installable_plugin_count": len(plugin_groups),
+            "frontend_only_nodes": inspection.get("frontend_only_nodes") or [],
+            "frontend_only_type_count": inspection.get("frontend_only_type_count", 0),
+            "frontend_only_node_count": inspection.get("frontend_only_node_count", 0),
+            "plugin_groups": list(plugin_groups.values()),
+            "unresolved_nodes": unresolved_nodes,
+            "unresolved_node_types": [item["class_type"] for item in unresolved_nodes],
+            "unresolved_instances": [
+                instance
+                for item in unresolved_nodes
+                for instance in item.get("instances") or []
+            ],
+            "node_instance_count": sum(len(item.get("instances") or []) for item in nodes),
+            "resolved_node_instance_count": sum(
+                sum(1 for instance in item.get("instances") or [] if instance.get("source_selected"))
+                for item in nodes
+            ),
             "unverified_nodes": [
                 {"class_type": name, "status": "unverified", "download_allowed": False}
                 for name in unverified_nodes
@@ -699,9 +1220,9 @@ class WorkflowManagerMixin:
                 if paths
             },
             "folder_paths_warning": folder_warning,
-            "message": "节点仓库候选仅供参考；必须由你选择来源并确认安装。安全检测通过前不会写入 custom_nodes。",
+            "message": "缺失节点优先使用 ComfyUI-Manager 的精确映射和安装队列；没有映射时只能由用户手动提供 GitHub 地址。手动来源会在安装前进行安全扫描和节点导出校验。",
         }
-        metadata = dict(job.get("metadata") or {})
+        metadata = dict(job_metadata)
         if local_model_selections != (metadata.get("local_model_selections") or {}):
             metadata["local_model_selections"] = local_model_selections
             metadata["model_source_selections"] = model_source_selections
@@ -894,7 +1415,7 @@ class WorkflowManagerMixin:
     @classmethod
     def _model_source_matches_name(cls, source: dict[str, Any], basename: str) -> bool:
         filename = str(source.get("filename") or "").replace("\\", "/")
-        return bool(filename) and Path(filename).name.casefold() == str(basename).casefold() and ".." not in Path(filename).parts
+        return bool(filename) and model_filenames_match(Path(filename).name, basename) and ".." not in Path(filename).parts
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
@@ -1001,12 +1522,26 @@ class WorkflowManagerMixin:
             ) + (f" {folder_warning}" if folder_warning else ""),
         }
 
-    async def search_workflow_model_sources(self, job_id: Any) -> dict[str, Any]:
-        """Inspect local files first, then search exact filenames via web search and Hugging Face."""
+    async def search_workflow_model_sources(self, job_id: Any, model_name: Any = None) -> dict[str, Any]:
+        """Inspect local files first, then search exact filenames via web search and Hugging Face.
+
+        When ``model_name`` is supplied, only that unresolved model is searched.
+        The empty/default value preserves the original batch-search behavior.
+        """
         job = self.workflow_job(job_id)
         metadata = dict(job.get("metadata") or {})
         plan = metadata.get("dependency_plan") or self.dependency_plan(job_id)
         metadata = dict((self.store.get_workflow_job(job["id"]) or job).get("metadata") or {})
+        requested_name = str(model_name or "").strip()
+        if requested_name:
+            requested_model = next(
+                (item for item in plan.get("models", []) if str(item.get("name") or "") == requested_name),
+                None,
+            )
+            if requested_model is None:
+                raise ValueError("该工作流没有此缺失模型，不能重新搜索。")
+            if requested_model.get("source") or requested_model.get("status") in {"installed", "selected_local"}:
+                raise ValueError("该模型已有可用来源，无需重新搜索。")
         selections = metadata.get("model_source_selections") or {}
         prior_results = dict(metadata.get("model_search_results") or {})
         results: dict[str, list[dict[str, Any]]] = {}
@@ -1015,6 +1550,8 @@ class WorkflowManagerMixin:
         search_urls: dict[str, str] = {}
         for model in plan.get("models", []):
             name = str(model.get("name") or "")
+            if requested_name and name != requested_name:
+                continue
             if model.get("source") or model.get("status") in {"installed", "selected_local"} or name in selections:
                 continue
             local_candidates = [str(path) for path in model.get("local_candidates") or [] if str(path).strip()]
@@ -1076,7 +1613,10 @@ class WorkflowManagerMixin:
         repo_id = str(selected.get("repo_id") or repo_id)
         filename = str(selected.get("filename") or filename)
         normalized_filename = filename.replace("\\", "/")
-        if Path(normalized_filename).name != Path(name.replace("\\", "/")).name or ".." in Path(normalized_filename).parts:
+        if not model_filenames_match(
+            Path(normalized_filename).name,
+            Path(name.replace("\\", "/")).name,
+        ) or ".." in Path(normalized_filename).parts:
             raise ValueError("所选仓库中的模型文件名与工作流依赖不匹配。")
         safe_source = {
             "repo_id": repo_id,
@@ -1190,54 +1730,85 @@ class WorkflowManagerMixin:
         return changed
 
     async def search_workflow_node_sources(self, job_id: Any) -> dict[str, Any]:
-        """Search GitHub first, using Gitee only when the GitHub search fails."""
+        """Resolve missing nodes through ComfyUI-Manager's exact mappings.
+
+        GitHub repository text search is intentionally not used here: matching a
+        class name in a README is not evidence that the package registers it in
+        ``NODE_CLASS_MAPPINGS``.  The panel can provide a manual GitHub URL when
+        Manager has no mapping.
+        """
         job = self.workflow_job(job_id)
         plan = (job.get("metadata") or {}).get("dependency_plan") or self.dependency_plan(job_id)
         metadata = dict(job.get("metadata") or {})
         prior_results = dict(metadata.get("node_search_results") or {})
-        unresolved_items = [
+        manager_results = dict(metadata.get("node_manager_results") or {})
+        unsearched = [
             item
             for item in plan.get("nodes", [])
-            if not item.get("source")
+            if (
+                str(item.get("class_type") or "") not in manager_results
+                or bool(
+                    isinstance(manager_results.get(str(item.get("class_type") or "")), dict)
+                    and (manager_results.get(str(item.get("class_type") or "")) or {}).get("retryable")
+                )
+            )
         ]
-        unsearched = [
-            item for item in unresolved_items
-            if str(item.get("class_type") or "") not in prior_results
-        ]
-        # Search new classes first so empty results cannot starve later nodes.
-        # Once all classes have been queried, another click retries empty results.
-        retry_items = [
-            item for item in unresolved_items
-            if not prior_results.get(str(item.get("class_type") or ""))
-        ]
-        if unsearched:
-            search_items = unsearched
-        elif retry_items:
-            cursor = int(metadata.get("node_search_retry_cursor") or 0) % len(retry_items)
-            rotated = retry_items[cursor:] + retry_items[:cursor]
-            search_items = rotated[:MAX_WORKFLOW_NODE_SEARCHES]
-            metadata["node_search_retry_cursor"] = (cursor + len(search_items)) % len(retry_items)
-        else:
-            search_items = []
         results: dict[str, list[dict[str, Any]]] = {
-            str(item.get("class_type")): prior_results[str(item.get("class_type"))]
-            for item in unresolved_items
-            if str(item.get("class_type") or "") in prior_results
+            str(item.get("class_type")): self._merge_node_source_candidates(
+                manager_results.get(str(item.get("class_type"))),
+                prior_results.get(str(item.get("class_type"))),
+            )
+            for item in plan.get("nodes", [])
         }
-        searched = search_items[:MAX_WORKFLOW_NODE_SEARCHES]
+        # Resolve every unresolved class type in one request.  The Manager client
+        # caches its mapping payload for this search pass, so large workflows do
+        # not cause one full mapping download per node type.
+        searched = unsearched
+        manager_error = ""
+        manager_client = ComfyUIManagerClient(self.settings)
         for item in searched:
             class_type = str(item.get("class_type") or "")
+            aux_ids = [
+                str(instance.get("aux_id") or "").strip()
+                for instance in item.get("instances") or []
+                if str(instance.get("aux_id") or "").strip()
+            ]
             try:
-                candidates = await asyncio.to_thread(GitHubNodeSearcher.search, class_type)
+                # ``resolve`` remains the compatibility entry point.  The
+                # current client stores every candidate in ``_last_candidates``
+                # so this response no longer discards ambiguous ownership.
+                if len(set(aux_ids)) == 1:
+                    candidate = await asyncio.to_thread(
+                        manager_client.resolve, class_type, aux_id=aux_ids[0]
+                    )
+                else:
+                    candidate = await asyncio.to_thread(manager_client.resolve, class_type)
+                candidates = getattr(manager_client, "_last_candidates", None)
+                if not isinstance(candidates, list) or not candidates:
+                    candidates = [candidate] if candidate else []
             except ValueError as exc:
-                try:
-                    candidates = await asyncio.to_thread(GiteeNodeSearcher.search, class_type)
-                except ValueError as gitee_error:
-                    raise ValueError(f"GitHub 搜索失败：{exc}；Gitee 搜索失败：{gitee_error}") from gitee_error
-            results[class_type] = candidates
-        previous = prior_results
-        previous.update({str(item.get("class_type")): results[str(item.get("class_type"))] for item in searched})
-        metadata["node_search_results"] = previous
+                manager_error = str(exc)
+                candidate = None
+                candidates = []
+            results[class_type] = [item for item in candidates if isinstance(item, dict)]
+            if results[class_type]:
+                primary = dict(results[class_type][0])
+                primary["candidates"] = results[class_type]
+                manager_results[class_type] = primary
+            else:
+                manager_results[class_type] = {
+                    "class_type": class_type,
+                    "provider": "comfyui_manager",
+                    "verified": False,
+                    "match": "missing",
+                    "retryable": bool(manager_error),
+                    "message": "ComfyUI-Manager 没有找到该节点的精确映射。",
+                }
+        metadata["node_search_results"] = {
+            **prior_results,
+            **{class_type: results[class_type] for class_type in (str(item.get("class_type") or "") for item in searched)},
+        }
+        metadata["node_manager_results"] = manager_results
         metadata.pop("dependency_plan", None)
         self.store.update_workflow_job(job["id"], metadata=metadata)
         deferred = max(len(unsearched) - len(searched), 0)
@@ -1245,32 +1816,124 @@ class WorkflowManagerMixin:
             "job_id": job["id"],
             "results": results,
             "deferred": deferred,
-            "message": "优先搜索 GitHub；仅当 GitHub 搜索失败时回退到 Gitee。GitHub 正常返回空结果时不会回退；安装前仍会运行安全扫描。"
-            + (f" 为控制请求量，另有 {deferred} 个节点可再次点击搜索。" if deferred else ""),
+            "manager_error": manager_error,
+            "message": "已按 ComfyUI-Manager 节点映射进行精确解析；没有映射的节点不会展示 GitHub 模糊搜索结果。请手动输入并确认 GitHub 地址，安装前会执行安全扫描和 NODE_CLASS_MAPPINGS 校验。"
+            + (f" 另有 {deferred} 个节点可再次解析。" if deferred else ""),
         }
 
-    def select_workflow_node_source(self, job_id: Any, class_type: Any, source: Any) -> dict[str, Any]:
-        """Persist only an exact Gitee/GitHub repository URL returned by this job's search."""
+    def select_workflow_node_source(
+        self,
+        job_id: Any,
+        class_type: Any,
+        source: Any,
+        *,
+        manager_id: Any = "",
+        aux_id: Any = "",
+        cnr_id: Any = "",
+        install_id: Any = "",
+        version: Any = "",
+        install_type: Any = "",
+        reference: Any = "",
+        pip: Any = "",
+        instance_id: Any = "",
+        manual: bool = False,
+    ) -> dict[str, Any]:
+        """Persist a Manager mapping or an explicitly entered GitHub source."""
         name = str(class_type or "").strip()
         value = str(source or "").strip().rstrip("/")
         job = self.workflow_job(job_id)
         metadata = dict(job.get("metadata") or {})
         inspection = metadata.get("inspection") or {}
-        if name not in (inspection.get("missing_nodes") or []):
+        installable_missing_nodes = (
+            inspection.get("installable_missing_nodes")
+            or inspection.get("missing_nodes")
+            or []
+        )
+        if name not in installable_missing_nodes:
             raise ValueError("该工作流中没有此缺失节点，不能选择安装来源。")
         if name in (job.get("metadata") or {}).get("prepared_node_results", {}):
             raise ValueError("该节点已准备完成，不能再次更换来源。")
-        candidates = (metadata.get("node_search_results") or {}).get(name, [])
-        if not any(str(item.get("source") or "").rstrip("/") == value for item in candidates):
-            raise ValueError("节点来源不在本次 Gitee/GitHub 搜索结果中，请重新搜索并从列表中选择。")
         from .agent.node_install import NodeInstallerMixin
 
-        host, owner, repository, prefix, _ref = NodeInstallerMixin._node_repository_source(value)
-        if prefix:
-            raise ValueError("节点仓库来源必须指向仓库根目录。")
-        canonical = f"https://{host}/{owner}/{repository}"
+        manager_result = (metadata.get("node_manager_results") or {}).get(name)
+        manager_candidates = self._merge_node_source_candidates(
+            manager_result,
+            (metadata.get("node_search_results") or {}).get(name),
+        )
+        chosen_manager_id = str(manager_id or "").strip()
+        if chosen_manager_id and not manual:
+            matching_candidates = [
+                item for item in manager_candidates
+                if str(item.get("manager_id") or "").strip().casefold() == chosen_manager_id.casefold()
+            ]
+            requested_identity = {
+                "cnr_id": str(cnr_id or "").strip(),
+                "aux_id": str(aux_id or "").strip(),
+                "install_id": str(install_id or "").strip(),
+                "version": str(version or "").strip(),
+                "install_type": str(install_type or "").strip(),
+            }
+            for field, requested in requested_identity.items():
+                if requested:
+                    matching_candidates = [
+                        item for item in matching_candidates
+                        if (
+                            self._node_candidate_value(item, "version").casefold()
+                            if field == "version"
+                            else self._node_candidate_value(item, field).casefold()
+                        ) == requested.casefold()
+                    ]
+            if aux_id:
+                matching_candidates = [
+                    item for item in matching_candidates
+                    if self._node_candidate_matches_aux_id(item, aux_id)
+                ]
+            if not matching_candidates:
+                raise ValueError("节点来源不是本次 ComfyUI-Manager 映射结果，请重新解析。")
+            manager = matching_candidates[0]
+            candidate_source = self._node_candidate_source(manager).strip().rstrip("/")
+            submitted_source = str(source or "").strip().rstrip("/")
+            if submitted_source and not candidate_source:
+                raise ValueError("节点来源无法与本次 ComfyUI-Manager 映射候选核对，请重新解析。")
+            if submitted_source and candidate_source:
+                if submitted_source.casefold() != candidate_source.casefold():
+                    raise ValueError("节点来源与本次 ComfyUI-Manager 映射候选不一致，请重新解析。")
+            canonical = candidate_source
+            selection = {
+                "source": canonical,
+                "manager_id": str(manager.get("manager_id") or chosen_manager_id).strip(),
+                "manager": manager,
+                "candidate": manager,
+                "provider": "comfyui_manager",
+                "selected_at": time.time(),
+            }
+            for key in ("install_id", "cnr_id", "aux_id", "version", "selected_version", "install_type", "reference", "pip", "title"):
+                if manager.get(key) not in (None, "", [], {}):
+                    selection[key] = manager[key]
+        else:
+            if not manual:
+                raise ValueError("没有可用的 ComfyUI-Manager 节点包，请手动提供 GitHub 地址。")
+            try:
+                host, owner, repository, prefix, _ref = NodeInstallerMixin._node_repository_source(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"手动节点来源无效：{exc}") from exc
+            if host != "github.com" or prefix:
+                raise ValueError("手动兜底来源必须是 GitHub 仓库根目录 HTTPS 地址。")
+            canonical = f"https://{host}/{owner}/{repository}"
+            selection = {"source": canonical, "provider": "manual_github", "unverified": True, "selected_at": time.time()}
         selections = dict(metadata.get("node_source_selections") or {})
-        selections[name] = {"source": canonical, "selected_at": time.time()}
+        if instance_id:
+            existing = selections.get(name)
+            if not isinstance(existing, dict):
+                existing = {}
+            instance_selections = existing.get("instances")
+            if not isinstance(instance_selections, dict):
+                instance_selections = {}
+            instance_selections[str(instance_id)] = selection
+            existing["instances"] = instance_selections
+            selections[name] = existing
+        else:
+            selections[name] = selection
         metadata["node_source_selections"] = selections
         results = dict(metadata.get("node_search_results") or {})
         results.pop(name, None)
@@ -1279,39 +1942,343 @@ class WorkflowManagerMixin:
         updated = self.store.update_workflow_job(job["id"], metadata=metadata)
         return {"status": "source_selected", "job_id": job["id"], "class_type": name, "source": canonical, "job": updated}
 
-    async def confirm_node_installation(
+    @staticmethod
+    def _node_install_package_name(item: dict[str, Any]) -> str:
+        manager = item.get("manager") if isinstance(item.get("manager"), dict) else {}
+        return str(
+            item.get("package_name")
+            or manager.get("title")
+            or manager.get("name")
+            or item.get("manager_id")
+            or item.get("source")
+            or item.get("class_type")
+            or "未知插件"
+        ).strip()
+
+    def _save_node_install_progress(self, job_id: Any, progress: dict[str, Any]) -> dict[str, Any]:
+        """Persist node-install progress so a browser reload can resume polling."""
+        job = self.store.get_workflow_job(str(job_id))
+        if not job:
+            return progress
+        metadata = dict(job.get("metadata") or {})
+        metadata["node_install_progress"] = dict(progress)
+        status = str(progress.get("status") or "")
+        self.store.update_workflow_job(
+            str(job_id),
+            state="installing_nodes" if status == "installing" else "selected",
+            error=str(progress.get("error") or "") if status == "failed" else "",
+            metadata=metadata,
+        )
+        return progress
+
+    async def start_node_installation(
         self,
         job_id: Any,
         *,
         confirmed: bool = False,
         acknowledge_security_for: str = "",
     ) -> dict[str, Any]:
+        """Queue node installation and return immediately with a durable progress snapshot."""
         if not confirmed:
             raise ValueError("必须由用户明确确认后才能安装缺少的节点。")
         job = self.workflow_job(job_id)
-        plan = (job.get("metadata") or {}).get("dependency_plan") or self.dependency_plan(job_id)
+        plan = (job.get("metadata") or {}).get("dependency_plan")
+        if not plan:
+            plan = await asyncio.to_thread(self.dependency_plan, job_id)
+        nodes = [item for item in plan.get("nodes") or [] if isinstance(item, dict)]
+        if not nodes:
+            return {
+                "status": "completed",
+                "job_id": job["id"],
+                "progress": {"status": "completed", "current": 0, "completed": 0, "total": 0},
+            }
+        unresolved = [
+            str(item.get("class_type") or "未知节点")
+            for item in nodes
+            if not item.get("source") and not item.get("manager_id")
+        ]
+        if unresolved:
+            raise ValueError("以下缺失节点尚未选择 ComfyUI-Manager 安装包或手动 GitHub 来源：" + "、".join(unresolved[:8]))
+        tasks = getattr(self, "_node_install_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._node_install_tasks = tasks
+        key = str(job["id"])
+        existing = tasks.get(key)
+        if existing is not None and not existing.done():
+            return {"status": "installing", "job_id": key, "progress": self.node_install_status(key)["progress"]}
+        previous = dict((job.get("metadata") or {}).get("node_install_progress") or {})
+        if previous.get("status") == "completed":
+            return {"status": "completed", "job_id": key, "progress": previous}
+        progress = {
+            "status": "installing",
+            "phase": "starting",
+            "current": 0,
+            "completed": 0,
+            "total": len(nodes),
+            "current_node": "",
+            "current_plugin": "",
+            "completed_plugins": [],
+            "events": [],
+            "error": "",
+        }
+        self._save_node_install_progress(key, progress)
+        task = asyncio.create_task(
+            self._run_background_node_installation(
+                key,
+                acknowledge_security_for=acknowledge_security_for,
+                total=len(nodes),
+            )
+        )
+        tasks[key] = task
+        task.add_done_callback(lambda completed, task_key=key: self._discard_node_install_task(task_key, completed))
+        return {"status": "installing", "job_id": key, "progress": progress}
+
+    async def _run_background_node_installation(
+        self, job_id: str, *, acknowledge_security_for: str, total: int
+    ) -> dict[str, Any]:
+        try:
+            result = await self.confirm_node_installation(
+                job_id,
+                confirmed=True,
+                acknowledge_security_for=acknowledge_security_for,
+                progress_callback=lambda update: self._merge_node_install_progress(job_id, update, total),
+            )
+            progress = dict((self.store.get_workflow_job(job_id) or {}).get("metadata", {}).get("node_install_progress") or {})
+            progress.update({"status": "completed", "phase": "completed", "current": total, "completed": total, "total": total, "error": ""})
+            self._save_node_install_progress(job_id, progress)
+            return result
+        except Exception as exc:
+            progress = dict((self.store.get_workflow_job(job_id) or {}).get("metadata", {}).get("node_install_progress") or {})
+            progress.update({"status": "failed", "phase": "failed", "error": str(exc), "total": total})
+            report = getattr(exc, "report", None)
+            if isinstance(report, dict):
+                progress["security"] = report
+            self._save_node_install_progress(job_id, progress)
+            raise
+
+    def _merge_node_install_progress(self, job_id: str, update: dict[str, Any], total: int) -> dict[str, Any]:
+        job = self.store.get_workflow_job(job_id) or {}
+        metadata = job.get("metadata") or {}
+        previous = metadata.get("node_install_progress") or {}
+        merged = {**dict(previous), **dict(update), "status": "installing", "total": total}
+        completed_plugins = list(previous.get("completed_plugins") or [])
+        completed_plugin = str(update.get("completed_plugin") or "").strip()
+        if completed_plugin and completed_plugin not in completed_plugins:
+            completed_plugins.append(completed_plugin)
+        merged["completed_plugins"] = completed_plugins
+
+        events = list(previous.get("events") or [])
+        manager_messages = [
+            str(message).strip()
+            for message in update.get("manager_messages") or []
+            if str(message).strip()
+        ]
+        event = ""
+        if completed_plugin:
+            event = f"已完成：{completed_plugin}"
+        elif manager_messages:
+            event = "；".join(manager_messages)
+        else:
+            phase = str(update.get("phase") or "installing").strip()
+            current_plugin = str(update.get("current_plugin") or "").strip()
+            current_node = str(update.get("current_node") or "").strip()
+            target = current_plugin or current_node
+            if target:
+                event = f"{phase}：{target}"
+        if event and (not events or events[-1] != event):
+            events.append(event)
+        merged["events"] = events[-20:]
+        return self._save_node_install_progress(
+            job_id,
+            merged,
+        )
+
+    def _discard_node_install_task(self, key: str, task: asyncio.Task) -> None:
+        tasks = getattr(self, "_node_install_tasks", {})
+        if tasks.get(key) is task:
+            tasks.pop(key, None)
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error is not None:
+            logging.getLogger("Comfyui-omniscience").warning("Background node installation failed: %s", error)
+
+    def node_install_status(self, job_id: Any) -> dict[str, Any]:
+        """Return the durable node-install progress for a workflow job."""
+        job = self.workflow_job(job_id)
+        key = str(job["id"])
+        progress = dict((job.get("metadata") or {}).get("node_install_progress") or {})
+        if not progress:
+            progress = {"status": "idle", "current": 0, "completed": 0, "total": 0}
+        tasks = getattr(self, "_node_install_tasks", {})
+        active_task = tasks.get(key)
+        if progress.get("status") == "installing" and (
+            active_task is None or active_task.done()
+        ):
+            # The progress snapshot survives a browser/ComfyUI restart, but
+            # asyncio tasks do not.  Do not leave the client polling a task
+            # which can no longer make progress; the next explicit confirmation
+            # may safely start the installation again.
+            progress.update(
+                {
+                    "status": "failed",
+                    "phase": "interrupted",
+                    "interrupted": True,
+                    "error": progress.get("error")
+                    or "ComfyUI 重启后，原节点安装任务已中断，请重试。",
+                }
+            )
+            self._save_node_install_progress(key, progress)
+        return {"status": progress.get("status", "idle"), "job_id": job["id"], "progress": progress}
+
+    async def confirm_node_installation(
+        self,
+        job_id: Any,
+        *,
+        confirmed: bool = False,
+        acknowledge_security_for: str = "",
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        if not confirmed:
+            raise ValueError("必须由用户明确确认后才能安装缺少的节点。")
+        job = self.workflow_job(job_id)
+        plan = (job.get("metadata") or {}).get("dependency_plan")
+        if not plan:
+            plan = await asyncio.to_thread(self.dependency_plan, job_id)
         if not plan.get("nodes"):
             return {"status": "nodes_prepared", "job_id": job["id"], "nodes": [], "models_pending": bool(plan.get("models"))}
-        unresolved = [item.get("class_type") for item in plan.get("nodes", []) if not item.get("source")]
+        unresolved = [
+            item.get("class_type")
+            for item in plan.get("nodes", [])
+            if not item.get("source") and not item.get("manager_id")
+        ]
         if unresolved:
-            raise ValueError("以下缺失节点尚未选择 Gitee/GitHub 来源：" + "、".join(str(item) for item in unresolved[:8]))
+            raise ValueError("以下缺失节点尚未选择 ComfyUI-Manager 安装包或手动 GitHub 来源：" + "、".join(str(item) for item in unresolved[:8]))
         metadata = dict(job.get("metadata") or {})
         prepared = dict(metadata.get("prepared_node_results") or {})
         installed = []
-        for item in plan.get("nodes", []):
-            if not item.get("source"):
+
+        async def verify_loaded(class_type: str, result: dict[str, Any]) -> dict[str, Any]:
+            """Report the live ComfyUI registration without importing code here."""
+            try:
+                loaded = await asyncio.to_thread(ComfyUIWorkflowExecutor(self.settings).object_info)
+                registered = class_type in loaded
+                result["node_registered"] = registered
+                result["verification_status"] = "loaded" if registered else "restart_required"
+                if not registered:
+                    result["message"] = (
+                        f"节点文件已安装并完成安全扫描，但当前 ComfyUI /object_info 尚未注册“{class_type}”。"
+                        "请重启 ComfyUI 后重新检查工作流。"
+                    )
+            except Exception as exc:
+                result["node_registered"] = None
+                result["verification_status"] = "restart_required"
+                result["verification_error"] = str(exc)
+            return result
+
+        install_nodes = [item for item in plan.get("nodes", []) if isinstance(item, dict)]
+        total_nodes = len(install_nodes)
+        for index, item in enumerate(install_nodes):
+            if not item.get("source") and not item.get("manager_id"):
                 raise ValueError(f"节点 {item.get('class_type')} 没有可信安装来源。")
             class_type = str(item.get("class_type") or "")
+            if callable(progress_callback):
+                progress_callback(
+                    {
+                        "phase": "installing",
+                        "current": index + 1,
+                        "completed": index,
+                        "current_node": class_type,
+                        "current_plugin": self._node_install_package_name(item),
+                        "total": total_nodes,
+                    }
+                )
             existing = prepared.get(class_type)
             if existing:
                 installed.append(existing)
+                if callable(progress_callback):
+                    progress_callback(
+                        {
+                            "phase": "completed",
+                            "completed": index + 1,
+                            "completed_plugin": self._node_install_package_name(item),
+                        }
+                    )
                 continue
             selected_sources = dict((self.store.get_workflow_job(job["id"]) or {}).get("metadata", {}).get("node_source_selections") or {})
             selected = dict(selected_sources.get(class_type) or {})
+            provider = str(selected.get("provider") or item.get("source_type") or "").strip()
+            manager_id = str(selected.get("manager_id") or item.get("manager_id") or "").strip()
+            if provider == "comfyui_manager" or manager_id:
+                manager = selected.get("manager") if isinstance(selected.get("manager"), dict) else item.get("manager")
+                manager = manager if isinstance(manager, dict) else {}
+                candidate = selected.get("candidate") if isinstance(selected.get("candidate"), dict) else manager
+                if not isinstance(candidate, dict):
+                    candidate = {}
+                manager_source = str(item.get("source") or manager.get("repository") or "")
+                self.store.update_workflow_job(job["id"], state="installing_nodes")
+                try:
+                    from .agent.node_install import NodeSecurityBlockedError
+                    manager_result = await asyncio.to_thread(
+                        ComfyUIManagerClient(self.settings).install,
+                        manager_id,
+                        version=str(manager.get("selected_version") or manager.get("version") or selected.get("selected_version") or selected.get("version") or "latest"),
+                        source=manager_source,
+                        candidate=candidate,
+                        on_progress=(
+                            lambda update, node=class_type, plugin=self._node_install_package_name(item): progress_callback(
+                                {
+                                    "phase": str(update.get("phase") or "installing"),
+                                    "current_node": node,
+                                    "current_plugin": plugin,
+                                    "manager_task_id": update.get("manager_task_id"),
+                                    "manager_id": update.get("manager_id"),
+                                    "manager_status": update.get("manager_status"),
+                                    "manager_messages": update.get("manager_messages") or [],
+                                }
+                            )
+                            if callable(progress_callback)
+                            else None
+                        ),
+                    )
+                    from .agent.node_install import NodeInstallerMixin
+                    verification = await NodeInstallerMixin.scan_installed_manager_node(
+                        self,
+                        manager_id=manager_id,
+                        repository=manager_source,
+                        expected_class_type=class_type,
+                    )
+                    result = {**manager_result, **verification, "class_type": class_type}
+                    if result.get("status") != "manager_installed":
+                        result["requires_restart"] = True
+                    result = await verify_loaded(class_type, result)
+                except Exception as exc:
+                    partial = dict(self.store.get_workflow_job(job["id"]) or job)
+                    partial_metadata = dict(partial.get("metadata") or {})
+                    partial_metadata["prepared_node_results"] = prepared
+                    self.store.update_workflow_job(job["id"], state="selected", error=str(exc), metadata=partial_metadata)
+                    raise
+                prepared[class_type] = result
+                partial_metadata = dict(self.store.get_workflow_job(job["id"]) or job)
+                saved_metadata = dict(partial_metadata.get("metadata") or {})
+                saved_metadata["prepared_node_results"] = prepared
+                self.store.update_workflow_job(job["id"], state="selected", error="", metadata=saved_metadata)
+                installed.append(result)
+                if callable(progress_callback):
+                    progress_callback(
+                        {
+                            "phase": "completed",
+                            "completed": index + 1,
+                            "completed_plugin": self._node_install_package_name(item),
+                        }
+                    )
+                continue
             try:
                 host, owner, repository, _prefix, ref = self._node_repository_source(item["source"])
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"节点 {class_type} 的 Gitee/GitHub 来源无效：{exc}") from exc
+                raise ValueError(f"节点 {class_type} 的 GitHub 来源无效：{exc}") from exc
             commit = str(selected.get("commit") or (ref if re.fullmatch(r"[0-9a-fA-F]{40}", str(ref or "")) else ""))
             if not commit:
                 resolved_ref = str(ref or await asyncio.to_thread(self._repository_default_branch, host, owner, repository))
@@ -1332,6 +2299,7 @@ class WorkflowManagerMixin:
                     acknowledged=class_type == acknowledge_security_for,
                     expected_class_type=class_type,
                 )
+                result = await verify_loaded(class_type, result)
             except Exception as exc:
                 from .agent.node_install import NodeSecurityBlockedError
 
@@ -1348,6 +2316,14 @@ class WorkflowManagerMixin:
             saved_metadata["prepared_node_results"] = prepared
             self.store.update_workflow_job(job["id"], state="selected", error="", metadata=saved_metadata)
             installed.append(result)
+            if callable(progress_callback):
+                progress_callback(
+                    {
+                        "phase": "completed",
+                        "completed": index + 1,
+                        "completed_plugin": self._node_install_package_name(item),
+                    }
+                )
         metadata = dict(self.store.get_workflow_job(job["id"]) or job).get("metadata") or {}
         metadata["prepared_nodes"] = installed
         self.store.update_workflow_job(job["id"], state="selected", metadata=metadata)
@@ -1382,7 +2358,9 @@ class WorkflowManagerMixin:
             )
             if prepared is not None:
                 return {"status": "completed", "job_id": job["id"], "name": requested_name, "model": prepared}
-        plan = (job.get("metadata") or {}).get("dependency_plan") or self.dependency_plan(job_id)
+        plan = (job.get("metadata") or {}).get("dependency_plan")
+        if not plan:
+            plan = await asyncio.to_thread(self.dependency_plan, job_id)
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
         if not comfyui_root:
@@ -1407,7 +2385,10 @@ class WorkflowManagerMixin:
             if not isinstance(item.get("source"), dict):
                 raise ValueError(f"模型 {item.get('name')} 没有可信下载来源，请先搜索并选择 Hugging Face 文件。")
             source_filename = str(item["source"].get("filename") or item.get("name") or "").replace("\\", "/")
-            if Path(source_filename).name != Path(str(item.get("name") or "").replace("\\", "/")).name or ".." in Path(source_filename).parts:
+            if not model_filenames_match(
+                Path(source_filename).name,
+                Path(str(item.get("name") or "").replace("\\", "/")).name,
+            ) or ".." in Path(source_filename).parts:
                 raise ValueError(f"模型 {item.get('name')} 的下载来源文件名不匹配。")
         model_name = str(selected_models[0].get("name") or "")
         if not wait_for_completion:
@@ -1492,6 +2473,7 @@ class WorkflowManagerMixin:
                     category=category,
                     models_root=models_root,
                     target_root=target_root,
+                    target_name=Path(str(item.get("name") or "").replace("\\", "/")).name,
                 )
                 installed.append({"name": item.get("name"), "download": downloaded, "link": linked})
         except ModelDownloadCancelled:

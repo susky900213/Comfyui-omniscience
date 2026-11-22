@@ -42,6 +42,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
         self._model_download_locks: dict[str, asyncio.Lock] = {}
         self._model_download_progress: dict[tuple[str, str], dict[str, Any]] = {}
         self._model_download_cancel_events: dict[tuple[str, str], Any] = {}
+        self._node_install_tasks: dict[str, asyncio.Task] = {}
 
     @staticmethod
     def _region_from_text(text: str) -> str | None:
@@ -62,6 +63,30 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
             if previous:
                 return previous
         return None
+
+    async def clear_global_history(self) -> None:
+        """Clear the global transcript and all state used to restore its cards.
+
+        Model downloads are cooperative and may already have created partial
+        files.  Signal and cancel their in-process tasks so they no longer
+        update a workflow job that is about to be removed; this does not remove
+        downloaded files or installed nodes.
+        """
+        async with self._lock:
+            for cancel_event in self._model_download_cancel_events.values():
+                cancel_event.set()
+            for task in self._model_download_tasks.values():
+                if not task.done():
+                    task.cancel()
+            for task in self._node_install_tasks.values():
+                if not task.done():
+                    task.cancel()
+            self._model_download_tasks.clear()
+            self._node_install_tasks.clear()
+            self._model_download_locks.clear()
+            self._model_download_progress.clear()
+            self._model_download_cancel_events.clear()
+            self.store.clear_global_messages()
 
     @staticmethod
     def _tool_catalog(tools: list[dict[str, Any]]) -> str:
@@ -209,7 +234,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                                 raise ValueError("只有在用户明确请求安装节点时才允许调用此工具。")
                             source = arguments.get("source")
                             if not self._install_node_source_allowed(text, source):
-                                raise ValueError("工具参数必须对应用户明确给出的 GitHub/Gitee 地址或已上传的节点压缩包。")
+                                raise ValueError("工具参数必须对应用户明确给出的 GitHub/GitCode 地址或已上传的节点压缩包。")
                             result = await self.install_comfyui_node(source)
                         elif tool_name == "search_runninghub_workflows":
                             if not workflow_requested:

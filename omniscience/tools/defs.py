@@ -192,7 +192,7 @@ GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
         "install_comfyui_node",
         (
             "Install one ComfyUI custom node project into ComfyUI/custom_nodes. Call only when the user "
-            "explicitly asked to install a node. Pass the exact public GitHub/Gitee repository or tree-folder link "
+            "explicitly asked to install a node. Pass the exact public GitHub/GitCode repository or tree-folder link "
             "they provided, or the workspace path of a node archive they uploaded (for example "
             "uploads/my-node.zip). The package is staged outside custom_nodes, security-scanned with the "
             "engine the user configured, then copied in; the result carries the verdict and findings. "
@@ -204,7 +204,7 @@ GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
         {
             "source": {
                 "type": "string",
-                "description": "The user's https://github.com/OWNER/REPO or https://gitee.com/OWNER/REPO (optionally /tree/REF/FOLDER), or an uploaded archive path such as uploads/name.zip.",
+                "description": "The user's https://github.com/OWNER/REPO or https://gitcode.com/OWNER/REPO (optionally /tree/REF/FOLDER), or an uploaded archive path such as uploads/name.zip.",
             }
         },
         ["source"],

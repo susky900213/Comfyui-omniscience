@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from . import paths, providers, skill_security
+from . import access_tokens, paths, providers, skill_security
 from .constants import (
     DEFAULT_COMPACTION_THRESHOLD_PERCENT,
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -92,6 +92,8 @@ class SettingsStore:
             "comfyui_server_url": str(data.get("comfyui_server_url") or "http://127.0.0.1:8188"),
             "api_key_configured": bool(data.get("api_key") or paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
             "api_key_from_environment": bool(paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
+            "gitcode_token_configured": bool(self.gitcode_token()),
+            "gitcode_token_from_environment": bool(paths.env("GITCODE_TOKEN", "CLINE_GITCODE_TOKEN")),
         }
 
     def update(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -155,6 +157,12 @@ class SettingsStore:
                 current["api_key"] = key
             # An empty field means "leave the stored key unchanged". This
             # prevents opening Settings and clicking Save from deleting it.
+        if "gitcode_token" in values:
+            token = str(values.get("gitcode_token") or "").strip()
+            if token:
+                current["gitcode_token"] = token
+            # Environment-provided tokens and stored tokens are preserved when
+            # the password field is left blank.
         workspace = current.get("workspace") or str(default_workspace())
         workspace_path = Path(workspace).expanduser()
         workspace_path.mkdir(parents=True, exist_ok=True)
@@ -183,6 +191,9 @@ class SettingsStore:
 
     def api_key(self) -> str:
         return paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY") or str(self.load().get("api_key") or "")
+
+    def gitcode_token(self) -> str:
+        return access_tokens.resolve("gitcode", self.load().get("gitcode_token"))
 
     def comfyui_node_directory(self) -> Path | None:
         data = self.load()

@@ -114,7 +114,16 @@ def register_routes(prompt_server: Any) -> None:
     @routes.get("/cline/global-chat/workflows/{job_id}/dependencies")
     async def cline_workflow_dependencies(request):
         try:
-            return _response(deps.global_chat_agent().dependency_plan(request.match_info["job_id"]))
+            # dependency_plan performs blocking local HTTP/file operations while
+            # consulting ComfyUI and ComfyUI-Manager.  Running it directly in
+            # this aiohttp handler can deadlock when Manager is served by the
+            # same ComfyUI event loop: the handler waits for Manager while the
+            # loop is unable to process Manager's request.
+            plan = await asyncio.to_thread(
+                deps.global_chat_agent().dependency_plan,
+                request.match_info["job_id"],
+            )
+            return _response(plan)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
 
@@ -135,7 +144,19 @@ def register_routes(prompt_server: Any) -> None:
             values = await _body(request)
             return _response(
                 deps.global_chat_agent().select_workflow_node_source(
-                    request.match_info["job_id"], values.get("class_type"), values.get("source")
+                    request.match_info["job_id"],
+                    values.get("class_type"),
+                    values.get("source"),
+                    manager_id=values.get("manager_id"),
+                    aux_id=values.get("aux_id"),
+                    cnr_id=values.get("cnr_id"),
+                    install_id=values.get("install_id"),
+                    version=values.get("version"),
+                    install_type=values.get("install_type"),
+                    reference=values.get("reference"),
+                    pip=values.get("pip"),
+                    instance_id=values.get("instance_id"),
+                    manual=bool(values.get("manual")),
                 )
             )
         except (ValueError, OSError) as exc:
@@ -144,7 +165,12 @@ def register_routes(prompt_server: Any) -> None:
     @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/search")
     async def cline_search_workflow_model_sources(request):
         try:
-            return _response(await deps.global_chat_agent().search_workflow_model_sources(request.match_info["job_id"]))
+            values = await _body(request)
+            return _response(
+                await deps.global_chat_agent().search_workflow_model_sources(
+                    request.match_info["job_id"], values.get("name")
+                )
+            )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
 
@@ -184,7 +210,7 @@ def register_routes(prompt_server: Any) -> None:
         try:
             values = await _body(request)
             return _response(
-                await deps.global_chat_agent().confirm_node_installation(
+                await deps.global_chat_agent().start_node_installation(
                     request.match_info["job_id"],
                     confirmed=bool(values.get("confirmed")),
                     acknowledge_security_for=str(values.get("acknowledge_security_for") or ""),
@@ -192,6 +218,13 @@ def register_routes(prompt_server: Any) -> None:
             )
         except NodeSecurityBlockedError as exc:
             return _response({"error": str(exc), "security": exc.report}, status=409)
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
+
+    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/nodes/status")
+    async def cline_workflow_node_install_status(request):
+        try:
+            return _response(deps.global_chat_agent().node_install_status(request.match_info["job_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
 
@@ -367,7 +400,7 @@ def register_routes(prompt_server: Any) -> None:
     @routes.delete("/cline/global-chat/history")
     async def cline_clear_global_chat(request):
         try:
-            deps.global_chat_agent().store.clear_global_messages()
+            await deps.global_chat_agent().clear_global_history()
             return _response({"messages": []})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)

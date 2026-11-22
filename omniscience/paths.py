@@ -58,6 +58,16 @@ CONFIG_PATH = Path(
     os.environ.get("OMNISCIENCE_CONFIG_FILE", os.environ.get("CLINE_CONFIG_FILE", str(DEFAULT_CONFIG_PATH)))
 ).expanduser()
 
+# Optional local-only repository token file.  The file is intentionally kept
+# next to this checkout so setup-page entry is not required; deployments can
+# point it elsewhere with OMNISCIENCE_TOKEN_FILE.
+LOCAL_TOKEN_CONFIG_PATH = Path(
+    os.environ.get(
+        "OMNISCIENCE_TOKEN_FILE",
+        str(Path(__file__).resolve().parent.parent / ".omniscience-tokens.json"),
+    )
+).expanduser()
+
 DEFAULT_MODEL = os.environ.get("OMNISCIENCE_MODEL", os.environ.get("CLINE_MODEL", ""))
 DEFAULT_API_BASE_URL = os.environ.get("OMNISCIENCE_API_BASE_URL", os.environ.get("CLINE_API_BASE_URL", "https://api.openai.com/v1"))
 DEFAULT_WORKSPACE = Path.home() / ".Comfyui-node"

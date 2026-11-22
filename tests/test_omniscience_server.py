@@ -10,9 +10,11 @@ import os
 import stat
 import sys
 import tarfile
+import threading
 import zipfile
 from threading import Event
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
 from omniscience_server import (
@@ -24,7 +26,7 @@ from omniscience_server import (
     _project_folder_name,
     apply_unified_patch,
 )
-from omniscience import archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
+from omniscience import access_tokens, archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
 from omniscience import model_downloader, model_source, node_search, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
@@ -75,6 +77,59 @@ class WorkspaceTests(unittest.TestCase):
     def test_unified_patch_can_create_a_file(self):
         patch = "@@ -0,0 +1,2 @@\n" + "+first\n" + "+second\n"
         self.assertEqual(apply_unified_patch("", patch), "first\nsecond\n")
+
+
+class AccessTokenTests(unittest.TestCase):
+    def test_precedence_query_injection_and_settings_redaction(self):
+        from omniscience import paths
+
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "tokens.json"
+            config = Path(directory) / "config.json"
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            token_file.write_text(json.dumps({"gitcode_access_token": "local-secret"}), encoding="utf-8")
+            previous_token_path = paths.LOCAL_TOKEN_CONFIG_PATH
+            paths.LOCAL_TOKEN_CONFIG_PATH = token_file
+            try:
+                with patch.dict(os.environ, {"GITCODE_TOKEN": "", "CLINE_GITCODE_TOKEN": ""}, clear=False):
+                    self.assertEqual(access_tokens.resolve("gitcode", "legacy-secret"), "local-secret")
+                    authenticated = access_tokens.with_access_token(
+                        "https://api.gitcode.com/api/v5/search?q=node&access_token=old#fragment",
+                        "gitcode",
+                        "explicit-secret",
+                    )
+                    query = parse_qs(urlsplit(authenticated).query)
+                    self.assertEqual(query["access_token"], ["local-secret"])
+                    self.assertNotIn("Authorization", authenticated)
+                    self.assertNotIn("Bearer", authenticated)
+                    os.environ["GITCODE_TOKEN"] = "environment-secret"
+                    self.assertEqual(access_tokens.resolve("gitcode", "legacy-secret"), "environment-secret")
+
+                store = SettingsStore(config)
+                public = store.update(
+                    {
+                        "workspace": str(workspace),
+                        "github_token": "github-secret",
+                        "gitcode_token": "gitcode-secret",
+                    }
+                )
+                public_text = json.dumps(public, ensure_ascii=False)
+                self.assertTrue(public["gitcode_token_configured"])
+                self.assertNotIn("github_token_configured", public)
+                self.assertNotIn("github_token_from_environment", public)
+                self.assertNotIn("github-secret", public_text)
+                self.assertNotIn("gitcode-secret", public_text)
+            finally:
+                paths.LOCAL_TOKEN_CONFIG_PATH = previous_token_path
+
+    def test_github_is_always_anonymous_even_when_legacy_credentials_exist(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "must-not-be-used", "CLINE_GITHUB_TOKEN": "also-unused"}, clear=False):
+            self.assertEqual(access_tokens.resolve("github", "legacy-github-secret"), "")
+            self.assertEqual(
+                access_tokens.with_access_token("https://api.github.com/search/repositories?q=node", "github", "github-secret"),
+                "https://api.github.com/search/repositories?q=node",
+            )
 
 
 class SettingsTests(unittest.TestCase):
@@ -1644,53 +1699,65 @@ class NodeInstallerTests(unittest.IsolatedAsyncioTestCase):
             ("Acme", "Demo", "sub", "v1.2"),
         )
 
-    def test_gitee_links_are_validated_and_github_parser_rejects_them(self):
+    def test_gitcode_links_are_validated_and_github_parser_rejects_them(self):
         self.assertEqual(
-            node_install.NodeInstallerMixin._node_repository_source("https://gitee.com/Acme/Demo.git/tree/v1.2/sub"),
-            ("gitee.com", "Acme", "Demo", "sub", "v1.2"),
+            node_install.NodeInstallerMixin._node_repository_source("https://gitcode.com/Acme/Demo.git/tree/v1.2/sub"),
+            ("gitcode.com", "Acme", "Demo", "sub", "v1.2"),
         )
         with self.assertRaises(ValueError):
-            node_install.NodeInstallerMixin._github_node_source("https://gitee.com/Acme/Demo")
+            node_install.NodeInstallerMixin._github_node_source("https://gitcode.com/Acme/Demo")
         for source in (
-            "http://gitee.com/acme/demo",
+            "http://gitcode.com/acme/demo",
             "https://evil.example/acme/demo",
-            "https://user:pw@gitee.com/acme/demo",
-            "https://gitee.com/acme/demo/tree/main/../secret",
+            "https://user:pw@gitcode.com/acme/demo",
+            "https://gitcode.com/acme/demo/tree/main/../secret",
         ):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 node_install.NodeInstallerMixin._node_repository_source(source)
 
-    def test_gitee_commit_uses_only_the_top_level_commit_sha(self):
+    def test_gitcode_commit_uses_only_the_top_level_commit_sha(self):
         commit = "a" * 40
-        with patch.object(node_install.NodeInstallerMixin, "_gitee_json", return_value={"sha": commit}) as request:
+        with patch.object(node_install.NodeInstallerMixin, "_gitcode_json", return_value={"sha": commit}) as request:
             self.assertEqual(
-                node_install.NodeInstallerMixin._repository_commit("gitee.com", "acme", "demo", "main"),
+                node_install.NodeInstallerMixin._repository_commit("gitcode.com", "acme", "demo", "main"),
                 commit,
             )
         self.assertIn("/repos/acme/demo/commits/main", request.call_args.args[0])
         with patch.object(
             node_install.NodeInstallerMixin,
-            "_gitee_json",
+            "_gitcode_json",
             return_value={"commit": {"tree": {"sha": commit}}},
         ):
             with self.assertRaisesRegex(ValueError, "没有返回有效提交哈希"):
-                node_install.NodeInstallerMixin._repository_commit("gitee.com", "acme", "demo", "main")
+                node_install.NodeInstallerMixin._repository_commit("gitcode.com", "acme", "demo", "main")
 
-    def test_gitee_archive_uses_validated_archive_endpoint_and_redirect_handler(self):
-        response = unittest.mock.MagicMock()
-        response.geturl.return_value = "https://gitee.com/acme/demo/repository/archive/" + "a" * 40 + ".zip"
-        response.read.return_value = b"archive"
-        response.__enter__.return_value = response
-        with patch.object(node_install, "build_opener") as build:
-            build.return_value.open.return_value.__enter__.return_value = response
-            package = node_install.NodeInstallerMixin._repository_archive("gitee.com", "acme", "demo", "a" * 40)
-        self.assertEqual(package, b"archive")
-        archive_url = build.return_value.open.call_args.args[0].full_url
-        self.assertEqual(archive_url, "https://gitee.com/acme/demo/repository/archive/" + "a" * 40 + ".zip")
-        handler = build.call_args.args[0]
-        self.assertIsInstance(handler, node_install._GiteeRedirectHandler)
+    def test_gitcode_archive_rebuilds_from_documented_tree_and_raw_apis(self):
+        commit = "a" * 40
+        tree = {
+            "tree": [
+                {"path": "__init__.py", "type": "blob", "size": 12},
+                {"path": "nodes.py", "type": "blob", "size": 9},
+                {"path": "docs", "type": "tree"},
+            ]
+        }
+        with patch.object(node_install.NodeInstallerMixin, "_gitcode_json", return_value=tree) as tree_request, patch.object(
+            node_install.NodeInstallerMixin,
+            "_gitcode_raw",
+            side_effect=[b"NODE_CLASS_MAPPINGS = {}\n", b"VALUE = 1\n"],
+        ) as raw_request:
+            package = node_install.NodeInstallerMixin._repository_archive("gitcode.com", "acme", "demo", commit)
+        self.assertTrue(package.startswith(b"PK\x03\x04"))
+        with zipfile.ZipFile(io.BytesIO(package)) as archive:
+            self.assertEqual(archive.namelist(), ["__init__.py", "nodes.py"])
+            self.assertEqual(archive.read("nodes.py"), b"VALUE = 1\n")
+        tree_request.assert_called_once()
+        self.assertIn("/repos/acme/demo/git/trees/", tree_request.call_args.args[0])
+        self.assertEqual(raw_request.call_count, 2)
+
+    def test_gitcode_redirect_handler_rejects_untrusted_hosts(self):
+        handler = node_install._GitCodeRedirectHandler()
         redirect_request = unittest.mock.Mock()
-        for url in ("https://evil.example/archive.zip", "http://gitee.com/archive.zip"):
+        for url in ("https://evil.example/archive.zip", "http://gitcode.com/archive.zip"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 handler.redirect_request(redirect_request, None, 302, "Found", {}, url)
 
@@ -1721,8 +1788,8 @@ class NodeInstallRequestTests(unittest.TestCase):
             "https://github.com/acme/demo-node",
         )
         self.assertEqual(
-            GlobalChatAgent._requested_node_source("安装节点 https://gitee.com/acme/demo-node"),
-            "https://gitee.com/acme/demo-node",
+            GlobalChatAgent._requested_node_source("安装节点 https://gitcode.com/acme/demo-node"),
+            "https://gitcode.com/acme/demo-node",
         )
 
     def test_the_model_cannot_choose_a_different_source(self):
@@ -1731,9 +1798,9 @@ class NodeInstallRequestTests(unittest.TestCase):
         self.assertTrue(GlobalChatAgent._install_node_source_allowed(text, "https://github.com/acme/demo-node/tree/main/tools"))
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(text, "https://github.com/evil/other"))
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(text, "uploads/anything.zip"))
-        gitee_text = "安装节点 https://gitee.com/acme/demo-node"
-        self.assertTrue(GlobalChatAgent._install_node_source_allowed(gitee_text, "https://gitee.com/acme/demo-node"))
-        self.assertFalse(GlobalChatAgent._install_node_source_allowed(gitee_text, "https://github.com/acme/demo-node"))
+        gitcode_text = "安装节点 https://gitcode.com/acme/demo-node"
+        self.assertTrue(GlobalChatAgent._install_node_source_allowed(gitcode_text, "https://gitcode.com/acme/demo-node"))
+        self.assertFalse(GlobalChatAgent._install_node_source_allowed(gitcode_text, "https://github.com/acme/demo-node"))
         self.assertTrue(GlobalChatAgent._install_node_source_allowed("安装节点 uploads/a.zip", "uploads/a.zip"))
         archive = "安装节点 @uploads/pkg.zip 这个压缩包"
         self.assertTrue(GlobalChatAgent._install_node_source_allowed(archive, "uploads/pkg.zip"))
@@ -1741,6 +1808,144 @@ class NodeInstallRequestTests(unittest.TestCase):
 
 
 class WorkflowParserTests(unittest.TestCase):
+    def test_inspection_matches_exact_registered_class_types_and_counts_instances(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        prompt = {
+            "1": {"class_type": "LoadImage", "inputs": {}},
+            "2": {"class_type": "LoadImage", "inputs": {}},
+            "3": {"class_type": "Display Name", "inputs": {}},
+            "4": {"class_type": "loadimage", "inputs": {}},
+        }
+        report = inspect_workflow(
+            prompt,
+            loaded_nodes={"LoadImage", "Display Name"},
+        )
+
+        self.assertEqual(report["node_count"], 4)
+        self.assertEqual(report["matched_node_count"], 3)
+        self.assertEqual(report["matched_type_count"], 2)
+        self.assertEqual(report["missing_nodes"], ["loadimage"])
+        self.assertEqual(report["missing_node_count"], 1)
+        self.assertEqual(report["missing_node_details"], [{"class_type": "loadimage", "count": 1, "node_ids": ["4"]}])
+
+    def test_inspection_successfully_empty_object_info_marks_all_execution_nodes_missing(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {"1": {"class_type": "CustomNode", "inputs": {}}},
+            loaded_nodes=set(),
+            loaded_nodes_checked=True,
+        )
+
+        self.assertTrue(report["loaded_nodes_checked"])
+        self.assertEqual(report["matched_node_count"], 0)
+        self.assertEqual(report["missing_nodes"], ["CustomNode"])
+        self.assertEqual(report["missing_node_count"], 1)
+
+    def test_inspection_request_failure_leaves_nodes_unverified(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {"1": {"class_type": "CustomNode", "inputs": {}}},
+            loaded_nodes=None,
+            loaded_nodes_error="连接失败",
+            loaded_nodes_checked=False,
+        )
+
+        self.assertFalse(report["loaded_nodes_checked"])
+        self.assertEqual(report["missing_nodes"], [])
+        self.assertEqual(report["unverified_nodes"], ["CustomNode"])
+        self.assertEqual(report["unverified_node_count"], 1)
+
+    def test_canvas_only_nodes_are_not_execution_missing_nodes(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {"id": 1, "type": "Note", "widgets_values": ["text"]},
+                    {"id": 2, "type": "CustomNode", "widgets_values": []},
+                ]
+            },
+            loaded_nodes=set(),
+            loaded_nodes_checked=True,
+        )
+
+        self.assertEqual(report["node_count"], 2)
+        self.assertEqual(report["execution_node_count"], 1)
+        self.assertEqual(report["missing_nodes"], ["CustomNode"])
+        self.assertEqual(report["installable_missing_nodes"], ["CustomNode"])
+        self.assertEqual(report["installable_missing_node_count"], 1)
+
+    def test_bypassed_canvas_nodes_are_not_execution_missing_nodes(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {"id": 1, "type": "CustomNode", "mode": 4, "widgets_values": []},
+                    {"id": 2, "type": "ActiveNode", "widgets_values": []},
+                ]
+            },
+            loaded_nodes={"ActiveNode"},
+        )
+
+        self.assertEqual(report["node_count"], 2)
+        self.assertEqual(report["execution_node_count"], 1)
+        self.assertEqual(report["missing_nodes"], [])
+        self.assertEqual(report["matched_node_count"], 1)
+        self.assertEqual(report["canvas_missing_nodes"], ["CustomNode"])
+        self.assertEqual(report["installable_missing_nodes"], ["CustomNode"])
+        self.assertEqual(report["installable_missing_node_instances"][0]["id"], "1")
+
+    def test_frontend_only_kjnodes_are_not_installable_missing_nodes(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {"id": 1, "type": "GetNode", "widgets_values": []},
+                    {"id": 2, "type": "SetNode", "widgets_values": []},
+                    {"id": 3, "type": "SigmasGraph", "widgets_values": []},
+                    {"id": 4, "type": "Text", "widgets_values": []},
+                ]
+            },
+            loaded_nodes=set(),
+            loaded_nodes_checked=True,
+        )
+
+        self.assertEqual(report["execution_node_count"], 2)
+        self.assertEqual(report["missing_nodes"], ["SigmasGraph", "Text"])
+        self.assertEqual(report["installable_missing_nodes"], ["SigmasGraph", "Text"])
+        self.assertEqual(report["installable_missing_type_count"], 2)
+        self.assertEqual(report["installable_missing_node_count"], 2)
+        self.assertEqual(report["frontend_only_nodes"], ["GetNode", "SetNode"])
+        self.assertEqual(report["frontend_only_node_count"], 2)
+
+    def test_installable_node_types_are_deduplicated_but_instance_count_is_preserved(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {"id": 1, "type": "MissingNode", "mode": 4, "widgets_values": []},
+                    {"id": 2, "type": "MissingNode", "widgets_values": []},
+                    {"id": 3, "type": "Note", "widgets_values": ["not installable"]},
+                ]
+            },
+            loaded_nodes=set(),
+            loaded_nodes_checked=True,
+        )
+
+        self.assertEqual(report["installable_missing_nodes"], ["MissingNode"])
+        self.assertEqual(report["installable_missing_node_count"], 2)
+        self.assertEqual(report["installable_missing_node_details"], [{
+            "class_type": "MissingNode",
+            "count": 2,
+            "node_ids": ["1", "2"],
+        }])
+
     def test_ui_canvas_is_converted_to_api_prompt_with_links_and_object_info_widgets(self):
         from omniscience.workflow_parser import inspect_workflow, to_api_workflow
 
@@ -2095,26 +2300,363 @@ class GitHubNodeSearchTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 node_search.GitHubNodeSearcher.search(value)
 
-    def test_gitee_search_returns_only_canonical_public_repository_candidates(self):
-        payload = [
-            {
-                "path_with_namespace": "Acme/Comfy-Node",
-                "html_url": "https://gitee.com/Acme/Comfy-Node",
-                "description": "国内节点",
-                "stars_count": 12,
-                "language": "Python",
-                "updated_at": "2026-01-01T00:00:00Z",
-            },
-            {"path_with_namespace": "attacker/other", "html_url": "https://evil.example/attacker/other"},
-            {"path_with_namespace": "Acme/subdir", "html_url": "https://gitee.com/Acme/subdir/tree/main/folder"},
-        ]
-        with patch.object(node_search.GiteeNodeSearcher, "_request", return_value=payload) as request:
-            results = node_search.GiteeNodeSearcher.search("LoadMoss", limit=99)
-        self.assertEqual([item["source"] for item in results], ["https://gitee.com/Acme/Comfy-Node"])
-        self.assertEqual(results[0]["provider"], "gitee")
+    def test_github_proxy_search_returns_only_canonical_public_repository_candidates(self):
+        payload = {
+            "items": [
+                {
+                    "full_name": "Acme/Comfy-Node",
+                    "html_url": "https://github.com/Acme/Comfy-Node",
+                    "description": "国内代理搜索到的 GitHub 节点",
+                    "stargazers_count": 12,
+                    "language": "Python",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+                {"full_name": "attacker/other", "html_url": "https://evil.example/attacker/other"},
+                {"full_name": "Acme/subdir", "html_url": "https://github.com/Acme/subdir/tree/main/folder"},
+            ]
+        }
+        with patch.object(node_search.GitHubProxyNodeSearcher, "_request", return_value=payload) as request:
+            results = node_search.GitHubProxyNodeSearcher.search("LoadMoss", limit=99)
+        self.assertEqual([item["source"] for item in results], ["https://github.com/Acme/Comfy-Node"])
+        self.assertEqual(results[0]["provider"], "github_proxy")
         self.assertEqual(results[0]["stars"], 12)
-        self.assertIn("https://gitee.com/api/v5/search/repositories?", request.call_args.args[0])
+        proxy_url = request.call_args.args[0]
+        self.assertTrue(proxy_url.startswith("https://gh-proxy.com/https://api.github.com/search/repositories?"))
         self.assertIn("per_page=8", request.call_args.args[0])
+
+
+class ComfyUIManagerClientTests(unittest.TestCase):
+    def setUp(self):
+        self.client = node_search.ComfyUIManagerClient({"comfyui_server_url": "http://127.0.0.1:8188"})
+
+    def test_exact_and_pattern_mapping_resolution(self):
+        payload = {
+            "comfy-org/load-moss": [["LoadMoss"], {"title_aux": "Load Moss", "repository": "https://github.com/acme/load-moss"}],
+            "comfy-org/wild": [[], {"nodename_pattern": "^Wild.*$", "repository": "https://github.com/acme/wild"}],
+        }
+        with patch.object(self.client, "_json", return_value=payload):
+            exact = self.client.resolve("LoadMoss")
+            pattern = self.client.resolve("WildAnything")
+            missing = self.client.resolve("NotMapped")
+        self.assertEqual(exact["manager_id"], "comfy-org/load-moss")
+        self.assertEqual(exact["match"], "exact")
+        self.assertEqual(pattern["match"], "pattern")
+        self.assertIsNone(missing)
+
+    def test_plain_name_lists_and_candidate_versions_are_not_collapsed(self):
+        payload = {
+            "comfy-org/plain": ["FirstNode", "SecondNode"],
+            "comfy-org/v1": [["VersionedNode"], {"repository": "https://github.com/acme/versioned", "version": "1.0", "install_type": "cnr"}],
+            "comfy-org/v2": [["VersionedNode"], {"repository": "https://github.com/acme/versioned", "version": "2.0", "install_type": "cnr"}],
+        }
+        with patch.object(self.client, "_json", return_value=payload):
+            first = self.client.resolve("FirstNode")
+            second = self.client.resolve("SecondNode")
+            versions = self.client.resolve_candidates("VersionedNode")
+        self.assertEqual(first["match"], "exact")
+        self.assertEqual(second["match"], "exact")
+        self.assertEqual({item["version"] for item in versions}, {"1.0", "2.0"})
+
+    def test_local_extension_cache_prefers_exact_package_for_same_named_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            comfyui = Path(directory)
+            cache = comfyui / "user" / "__manager" / "cache"
+            cache.mkdir(parents=True)
+            (cache / "1_extension-node-map.json").write_text(
+                json.dumps(
+                    {
+                        "https://github.com/sonnybox/ComfyUI-SuperNodes": [
+                            ["SigmasGraph"],
+                            {"title_aux": "ComfyUI-SuperNodes"},
+                        ],
+                        "https://github.com/kk8bit/KayTool": [
+                            ["Text"],
+                            {"title_aux": "KayTool"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (cache / "2_custom-node-list.json").write_text(
+                json.dumps(
+                    {
+                        "custom_nodes": [
+                            {
+                                "id": "supernodes",
+                                "title": "ComfyUI-SuperNodes",
+                                "reference": "https://github.com/sonnybox/ComfyUI-SuperNodes",
+                                "install_type": "git-clone",
+                            },
+                            {
+                                "title": "KayTool",
+                                "reference": "https://github.com/kk8bit/KayTool",
+                                "install_type": "git-clone",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = node_search.ComfyUIManagerClient(
+                {"comfyui_server_url": "http://127.0.0.1:8188", "comfyui_directory": str(comfyui)}
+            )
+            with patch.object(client, "_json", return_value={}):
+                sigmas = client.resolve("SigmasGraph")
+                text = client.resolve("Text")
+            self.assertEqual(sigmas["title"], "ComfyUI-SuperNodes")
+            self.assertEqual(sigmas["manager_id"], "supernodes")
+            self.assertEqual(sigmas["repository"], "https://github.com/sonnybox/ComfyUI-SuperNodes")
+            self.assertEqual(text["title"], "KayTool")
+            self.assertEqual(text["manager_id"], "kaytool")
+            self.assertEqual(text["repository"], "https://github.com/kk8bit/KayTool")
+
+    def test_confirmed_package_preference_resolves_text_to_kaytool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = node_search.ComfyUIManagerClient(
+                {"comfyui_server_url": "http://127.0.0.1:8188", "comfyui_directory": directory}
+            )
+            payload = {
+                "https://github.com/TFL-TFL/ComfyUI_Text_Translation": [
+                    ["Text"],
+                    {"title_aux": "ComfyUI_Text_Translation"},
+                ],
+                "kaytool": [["Text"], {"title_aux": "KayTool"}],
+                "https://github.com/pictorialink/ComfyUI-Text-Translation": [
+                    ["Text"],
+                    {"title_aux": "ComfyUI-Text-Translation"},
+                ],
+            }
+            with patch.object(client, "_json", return_value=payload):
+                candidates = client.preferred_candidates("Text")
+            self.assertEqual([item["manager_id"] for item in candidates], ["kaytool"])
+
+    def test_install_uses_candidate_install_id_version_and_metadata(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        responses = [{}, {}, task]
+        candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "install_id": "load-moss-package",
+            "version": "1.2.3",
+            "install_type": "cnr",
+            "reference": "https://github.com/acme/load-moss",
+            "pip": ["example>=1"],
+        }
+        with patch.object(self.client, "_json", side_effect=responses) as request, patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            self.client.install("comfy-org/load-moss", candidate=candidate)
+        params = request.call_args_list[0].args[2]["params"]
+        self.assertEqual(params["id"], "load-moss-package")
+        self.assertEqual(params["version"], "1.2.3")
+        self.assertEqual(params["install_type"], "cnr")
+        self.assertEqual(params["reference"], candidate["reference"])
+        self.assertEqual(params["pip"], candidate["pip"])
+
+    def test_install_uses_nightly_version_for_git_repository_candidates(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        repository = "https://github.com/sonnybox/ComfyUI-SuperNodes"
+        candidate = {
+            "manager_id": "supernodes",
+            "install_id": "supernodes",
+            "install_type": "git-clone",
+            "repository": repository,
+            "reference": repository,
+        }
+        with patch.object(self.client, "_json", side_effect=[{}, {}, task]) as request, patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            result = self.client.install("supernodes", candidate=candidate)
+        self.assertEqual(result["status"], "manager_installed")
+        params = request.call_args_list[0].args[2]["params"]
+        self.assertEqual(params["id"], "ComfyUI-SuperNodes")
+        self.assertEqual(params["version"], "nightly")
+        self.assertEqual(params["selected_version"], "nightly")
+        self.assertEqual(params["repository"], repository)
+        self.assertEqual(params["reference"], repository)
+        self.assertEqual(params["install_type"], "git-clone")
+
+    def test_install_uses_original_github_url_for_international_region(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        repository = "https://github.com/sonnybox/ComfyUI-SuperNodes"
+        candidate = {
+            "manager_id": "supernodes",
+            "install_id": "supernodes",
+            "install_type": "git-clone",
+            "repository": repository,
+        }
+        client = node_search.ComfyUIManagerClient(
+            {"comfyui_server_url": "http://127.0.0.1:8188", "network_region": "international"}
+        )
+        with patch.object(client, "_json", side_effect=[{}, {}, task]) as request, patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            client.install("supernodes", candidate=candidate)
+        params = request.call_args_list[0].args[2]["params"]
+        self.assertEqual(params["repository"], repository)
+
+    def test_domestic_install_uses_aliyun_pip_index_while_manager_runs(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        responses = [{}, {}, task]
+        observed: list[tuple[str, str | None, str | None, str | None, str | None]] = []
+
+        def fake_json(method, path, payload=None):
+            observed.append(
+                (
+                    method,
+                    os.environ.get("PIP_INDEX_URL"),
+                    os.environ.get("PIP_EXTRA_INDEX_URL"),
+                    os.environ.get("UV_INDEX_URL"),
+                    os.environ.get("UV_EXTRA_INDEX_URL"),
+                )
+            )
+            return responses.pop(0)
+
+        client = node_search.ComfyUIManagerClient(
+            {"comfyui_server_url": "http://127.0.0.1:8188", "network_region": "domestic"}
+        )
+        original = {
+            "PIP_INDEX_URL": "https://pypi.org/simple",
+            "PIP_EXTRA_INDEX_URL": "https://extra.example/simple",
+            "UV_INDEX_URL": "https://pypi.org/simple",
+            "UV_EXTRA_INDEX_URL": "https://extra.example/simple",
+        }
+        with patch.dict(os.environ, original, clear=False), patch.object(client, "_json", side_effect=fake_json), patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            client.install("supernodes", candidate={"install_type": "git-clone", "repository": "https://github.com/a/b"})
+            for _method, pip_index, pip_extra, uv_index, uv_extra in observed:
+                self.assertEqual(pip_index, node_search.DOMESTIC_PIP_INDEX_URL)
+                self.assertIsNone(pip_extra)
+                self.assertEqual(uv_index, node_search.DOMESTIC_PIP_INDEX_URL)
+                self.assertIsNone(uv_extra)
+            self.assertEqual({key: os.environ.get(key) for key in original}, original)
+
+    def test_international_install_preserves_existing_pip_environment(self):
+        client = node_search.ComfyUIManagerClient(
+            {"comfyui_server_url": "http://127.0.0.1:8188", "network_region": "international"}
+        )
+        original = {
+            "PIP_INDEX_URL": "https://pypi.org/simple",
+            "PIP_EXTRA_INDEX_URL": "https://extra.example/simple",
+            "UV_INDEX_URL": "https://pypi.org/simple",
+            "UV_EXTRA_INDEX_URL": "https://extra.example/simple",
+        }
+        observed = []
+
+        def fake_install(*_args, **_kwargs):
+            observed.append({key: os.environ.get(key) for key in original})
+            return {"status": "manager_installed"}
+
+        with patch.dict(os.environ, original, clear=False), patch.object(client, "_install", side_effect=fake_install):
+            client.install("supernodes")
+            self.assertEqual({key: os.environ.get(key) for key in original}, original)
+
+        self.assertEqual(observed, [original])
+
+    def test_domestic_install_configures_manager_git_endpoint(self):
+        decision = type("Decision", (), {"selected_region": "domestic"})()
+        git_utils = type("GitUtils", (), {"GITHUB_ENDPOINT": None})()
+        repository = "https://github.com/sonnybox/ComfyUI-SuperNodes"
+        previous = os.environ.get("GITHUB_ENDPOINT")
+
+        def get_url_for_clone(url):
+            normalized = f"https://github.com/{url.split('github.com/', 1)[1]}"
+            return git_utils.GITHUB_ENDPOINT + normalized[18:]
+
+        git_utils.get_url_for_clone = get_url_for_clone
+        with patch.dict(node_search.sys.modules, {"comfyui_manager.common.git_utils": git_utils}, clear=False):
+            with node_search._manager_git_environment(decision):
+                self.assertEqual(os.environ["GITHUB_ENDPOINT"], node_search.MANAGER_GITHUB_ENDPOINT)
+                self.assertEqual(git_utils.GITHUB_ENDPOINT, node_search.MANAGER_GITHUB_ENDPOINT)
+                self.assertEqual(
+                    git_utils.get_url_for_clone(repository),
+                    "https://gh-proxy.com/https://github.com/sonnybox/ComfyUI-SuperNodes",
+                )
+        self.assertEqual(os.environ.get("GITHUB_ENDPOINT"), previous)
+        self.assertIsNone(git_utils.GITHUB_ENDPOINT)
+
+    def test_install_queues_manager_task_and_accepts_success_history(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        responses = [{}, {}, task]
+        with patch.object(self.client, "_json", side_effect=responses) as request, patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            result = self.client.install("comfy-org/load-moss")
+        self.assertEqual(result["status"], "manager_installed")
+        self.assertEqual(request.call_args_list[0].args[:2], ("POST", "/v2/manager/queue/task"))
+        self.assertEqual(request.call_args_list[1].args[:2], ("POST", "/v2/manager/queue/start"))
+        payload = request.call_args_list[0].args[2]
+        self.assertEqual(payload["kind"], "install")
+        self.assertEqual(payload["params"]["id"], "comfy-org/load-moss")
+
+    def test_install_accepts_manager_single_task_history_response(self):
+        # When ui_id is supplied, current Manager returns the task directly
+        # under ``history`` instead of returning ``history[ui_id]``.
+        task = {
+            "history": {
+                "ui_id": "omniscience-node-test",
+                "result": "success",
+                "status": {"status_str": "success", "completed": True, "messages": []},
+            }
+        }
+        with patch.object(self.client, "_json", side_effect=[{}, {}, task]), patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            result = self.client.install("comfy-org/load-moss")
+        self.assertEqual(result["status"], "manager_installed")
+        self.assertEqual(result["manager_result"]["ui_id"], "omniscience-node-test")
+
+    def test_install_reports_manager_queue_progress(self):
+        task = {
+            "history": {
+                "omniscience-node-test": {
+                    "status": {"status_str": "success", "completed": True, "messages": []},
+                    "result": "success",
+                }
+            }
+        }
+        progress = []
+        with patch.object(self.client, "_json", side_effect=[{}, {}, task]), patch.object(
+            node_search.uuid, "uuid4", return_value=type("UUID", (), {"hex": "test"})()
+        ), patch.object(node_search.time, "monotonic", side_effect=[0, 1]), patch.object(node_search.time, "sleep"):
+            self.client.install("comfy-org/load-moss", on_progress=progress.append)
+        self.assertEqual([item["phase"] for item in progress], ["queued", "completed"])
+        self.assertEqual(progress[-1]["manager_id"], "comfy-org/load-moss")
 
 
 class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
@@ -2148,19 +2690,452 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.paths.TASK_DATABASE, self.paths.SKILL_DATABASE, self.paths.STATE_DIRECTORY = self.previous
 
     async def test_search_and_explicit_source_selection_are_persisted(self):
-        candidates = [{"full_name": "acme/load-moss", "source": "https://github.com/acme/load-moss"}]
-        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=candidates) as search:
+        manager_candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "aux_id": "comfy-org/load-moss",
+            "repository": "https://github.com/acme/load-moss",
+            "title": "Load Moss",
+            "provider": "comfyui_manager",
+            "verified": True,
+            "match": "exact",
+            "class_type": "LoadMoss",
+        }
+        with patch.object(workflow_manager.ComfyUIManagerClient, "resolve", return_value=manager_candidate) as resolve, patch.object(
+            node_search.GitHubNodeSearcher, "search"
+        ) as search:
             result = await self.agent.search_workflow_node_sources(self.job["id"])
-        search.assert_called_once_with("LoadMoss")
-        self.assertEqual(result["results"]["LoadMoss"], candidates)
-        with self.assertRaisesRegex(ValueError, "不在本次 Gitee/GitHub 搜索结果"):
-            self.agent.select_workflow_node_source(self.job["id"], "LoadMoss", "https://github.com/evil/repo")
+        resolve.assert_called_once_with("LoadMoss")
+        search.assert_not_called()
+        self.assertEqual(result["results"]["LoadMoss"], [manager_candidate])
         selected = self.agent.select_workflow_node_source(
-            self.job["id"], "LoadMoss", "https://github.com/acme/load-moss"
+            self.job["id"], "LoadMoss", "https://github.com/acme/load-moss", manager_id="comfy-org/load-moss"
         )
         self.assertEqual(selected["status"], "source_selected")
         plan = self.agent.dependency_plan(self.job["id"])
         self.assertEqual(plan["nodes"][0]["source"], "https://github.com/acme/load-moss")
+        self.assertEqual(plan["nodes"][0]["manager_id"], "comfy-org/load-moss")
+
+    async def test_dependency_route_runs_blocking_plan_off_comfyui_event_loop(self):
+        from omniscience.api import deps
+
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        deps._GLOBAL_CHAT_AGENT = self.agent
+        try:
+            recorder = _registered_routes()
+            route = recorder.handlers[("GET", "/cline/global-chat/workflows/{job_id}/dependencies")]
+            called_from = []
+
+            def blocking_plan(job_id):
+                called_from.append((job_id, threading.current_thread().name))
+                return {"job_id": job_id, "nodes": [], "models": []}
+
+            with patch.object(self.agent, "dependency_plan", side_effect=blocking_plan):
+                response = await asyncio.wait_for(
+                    route(_FakeRequest(match_info={"job_id": self.job["id"]})),
+                    timeout=1,
+                )
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.text)["job_id"], self.job["id"])
+            self.assertEqual(called_from[0][0], self.job["id"])
+            self.assertNotEqual(called_from[0][1], threading.current_thread().name)
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
+    async def test_node_installation_runs_in_background_and_persists_progress(self):
+        plan = {
+            "nodes": [
+                {"class_type": "SigmasGraph", "manager_id": "supernodes", "package_name": "ComfyUI-SuperNodes"},
+                {"class_type": "Text", "manager_id": "kaytool", "package_name": "KayTool"},
+            ],
+            "models": [],
+        }
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["dependency_plan"] = plan
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        async def fake_confirm(_job_id, *, progress_callback=None, **_kwargs):
+            progress_callback({
+                "phase": "installing",
+                "current": 1,
+                "completed": 0,
+                "current_node": "SigmasGraph",
+                "current_plugin": "ComfyUI-SuperNodes",
+                "manager_task_id": "manager-task-1",
+                "manager_status": "running",
+                "manager_messages": ["正在下载插件依赖"],
+            })
+            progress_callback({
+                "phase": "completed",
+                "completed": 1,
+                "completed_plugin": "ComfyUI-SuperNodes",
+            })
+            progress_callback({
+                "phase": "installing",
+                "current": 2,
+                "completed": 1,
+                "current_node": "Text",
+                "current_plugin": "KayTool",
+            })
+            return {"status": "nodes_prepared", "nodes": [{"class_type": "SigmasGraph"}, {"class_type": "Text"}]}
+
+        with patch.object(self.agent, "confirm_node_installation", side_effect=fake_confirm):
+            started = await self.agent.start_node_installation(self.job["id"], confirmed=True)
+            self.assertEqual(started["status"], "installing")
+            task = self.agent._node_install_tasks[self.job["id"]]
+            await task
+
+        status = self.agent.node_install_status(self.job["id"])
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["progress"]["completed"], 2)
+        self.assertEqual(status["progress"]["total"], 2)
+        self.assertEqual(status["progress"]["completed_plugin"], "ComfyUI-SuperNodes")
+        self.assertEqual(status["progress"]["completed_plugins"], ["ComfyUI-SuperNodes"])
+        self.assertEqual(status["progress"]["manager_task_id"], "manager-task-1")
+        self.assertIn("正在下载插件依赖", status["progress"]["events"])
+        self.assertIn("已完成：ComfyUI-SuperNodes", status["progress"]["events"])
+        self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "selected")
+
+    async def test_node_install_routes_start_and_read_background_progress(self):
+        from omniscience.api import deps
+
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        deps._GLOBAL_CHAT_AGENT = self.agent
+        try:
+            recorder = _registered_routes()
+            start = recorder.handlers[("POST", "/cline/global-chat/workflows/{job_id}/dependencies/nodes/confirm")]
+            status = recorder.handlers[("GET", "/cline/global-chat/workflows/{job_id}/dependencies/nodes/status")]
+            with patch.object(
+                self.agent,
+                "start_node_installation",
+                AsyncMock(return_value={"status": "installing", "job_id": self.job["id"], "progress": {"total": 2}}),
+            ) as start_install, patch.object(
+                self.agent,
+                "node_install_status",
+                return_value={"status": "installing", "job_id": self.job["id"], "progress": {"completed": 1, "total": 2}},
+            ) as read_status:
+                started = await start(
+                    _FakeRequest(
+                        {"confirmed": True, "acknowledge_security_for": "Text"},
+                        {"job_id": self.job["id"]},
+                    )
+                )
+                current = await status(_FakeRequest(match_info={"job_id": self.job["id"]}))
+            self.assertEqual(started.status, 200)
+            self.assertEqual(json.loads(started.text)["status"], "installing")
+            self.assertEqual(current.status, 200)
+            self.assertEqual(json.loads(current.text)["progress"]["completed"], 1)
+            start_install.assert_awaited_once_with(
+                self.job["id"], confirmed=True, acknowledge_security_for="Text"
+            )
+            read_status.assert_called_once_with(self.job["id"])
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
+    async def test_orphaned_node_install_progress_is_marked_interrupted_after_restart(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["node_install_progress"] = {
+            "status": "installing",
+            "phase": "queued",
+            "current": 1,
+            "completed": 0,
+            "total": 2,
+            "current_node": "SigmasGraph",
+            "current_plugin": "ComfyUI-SuperNodes",
+            "completed_plugins": [],
+            "error": "",
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata, state="installing_nodes")
+        self.agent._node_install_tasks = {}
+
+        status = self.agent.node_install_status(self.job["id"])
+
+        self.assertEqual(status["status"], "failed")
+        self.assertTrue(status["progress"]["interrupted"])
+        self.assertEqual(status["progress"]["phase"], "interrupted")
+        self.assertIn("重启", status["progress"]["error"])
+        self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "selected")
+
+    async def test_manager_selection_requires_matching_candidate_identity_and_source(self):
+        candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "install_id": "load-moss-package",
+            "cnr_id": "load-moss",
+            "aux_id": "acme/load-moss",
+            "version": "1.2.3",
+            "install_type": "cnr",
+            "repository": "https://github.com/acme/load-moss",
+            "class_type": "LoadMoss",
+            "provider": "comfyui_manager",
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {"missing_nodes": ["LoadMoss"], "unverified_nodes": [], "models": []},
+                "node_manager_results": {"LoadMoss": {**candidate, "candidates": [candidate]}},
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "映射结果"):
+            self.agent.select_workflow_node_source(
+                self.job["id"], "LoadMoss", candidate["repository"],
+                manager_id=candidate["manager_id"], install_id=candidate["install_id"], version="9.9.9",
+            )
+        with self.assertRaisesRegex(ValueError, "来源与本次"):
+            self.agent.select_workflow_node_source(
+                self.job["id"], "LoadMoss", "https://github.com/acme/other-plugin",
+                manager_id=candidate["manager_id"], install_id=candidate["install_id"], version=candidate["version"],
+                install_type=candidate["install_type"],
+            )
+        selected = self.agent.select_workflow_node_source(
+            self.job["id"], "LoadMoss", candidate["repository"], manager_id=candidate["manager_id"],
+            aux_id=candidate["aux_id"], cnr_id=candidate["cnr_id"], install_id=candidate["install_id"],
+            version=candidate["version"], install_type=candidate["install_type"],
+        )
+        saved = selected["job"]["metadata"]["node_source_selections"]["LoadMoss"]
+        self.assertEqual(saved["install_id"], candidate["install_id"])
+        self.assertEqual(saved["version"], candidate["version"])
+        self.assertEqual(saved["install_type"], candidate["install_type"])
+
+    async def test_manager_install_receives_persisted_candidate_metadata(self):
+        candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "install_id": "load-moss-package",
+            "version": "1.2.3",
+            "install_type": "cnr",
+            "repository": "https://github.com/acme/load-moss",
+            "class_type": "LoadMoss",
+            "provider": "comfyui_manager",
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["LoadMoss"],
+                    "missing_node_instances": [{"id": "1", "class_type": "LoadMoss", "properties": {}}],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_manager_results": {"LoadMoss": {**candidate, "candidates": [candidate]}},
+            },
+        )
+        self.agent.dependency_plan(self.job["id"])
+        manager_result = {"status": "manager_installed", "security": {"status": "manager_managed"}}
+        with patch.object(workflow_manager.ComfyUIManagerClient, "install", return_value=manager_result) as install, patch.object(
+            node_install.NodeInstallerMixin, "scan_installed_manager_node", AsyncMock(return_value={"status": "manager_installed"})
+        ), patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value={"LoadMoss": {}}):
+            result = await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+        self.assertEqual(result["nodes"][0]["status"], "manager_installed")
+        self.assertEqual(install.call_args.args[0], candidate["manager_id"])
+        self.assertEqual(install.call_args.kwargs["version"], candidate["version"])
+        self.assertEqual(install.call_args.kwargs["candidate"]["install_id"], candidate["install_id"])
+
+    async def test_dependency_plan_resolves_instances_and_groups_only_confirmed_plugins(self):
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["SharedNode"],
+                    "missing_node_instances": [
+                        {"id": "1", "class_type": "SharedNode", "aux_id": "owner/plugin-a", "properties": {}},
+                        {"id": "2", "class_type": "SharedNode", "aux_id": "owner/plugin-unknown", "properties": {}},
+                    ],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_search_results": {
+                    "SharedNode": [
+                        {
+                            "manager_id": "owner/plugin-a",
+                            "aux_id": "owner/plugin-a",
+                            "repository": "https://github.com/owner/plugin-a",
+                            "class_type": "SharedNode",
+                            "provider": "comfyui_manager",
+                        },
+                        {
+                            "manager_id": "owner/plugin-b",
+                            "aux_id": "owner/plugin-b",
+                            "repository": "https://github.com/owner/plugin-b",
+                            "class_type": "SharedNode",
+                            "provider": "comfyui_manager",
+                        },
+                    ]
+                },
+            },
+        )
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        node = plan["nodes"][0]
+        self.assertEqual(node["instances"][0]["status"], "resolved")
+        self.assertEqual(node["instances"][1]["status"], "unresolved")
+        self.assertEqual(plan["resolved_node_instance_count"], 1)
+        self.assertEqual(len(plan["plugin_groups"]), 1)
+        self.assertEqual(plan["plugin_groups"][0]["id"], "source:https://github.com/owner/plugin-a")
+        self.assertEqual(plan["plugin_groups"][0]["node_count"], 1)
+        self.assertEqual(plan["unresolved_instances"][0]["id"], "2")
+
+    async def test_dependency_plan_reports_manager_package_names_for_missing_nodes(self):
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["SigmasGraph", "Text"],
+                    "missing_node_instances": [
+                        {"id": "sigmas-1", "class_type": "SigmasGraph", "aux_id": "", "properties": {}},
+                        {"id": "text-1", "class_type": "Text", "aux_id": "", "properties": {}},
+                    ],
+                    "frontend_only_nodes": ["GetNode", "SetNode"],
+                    "frontend_only_type_count": 2,
+                    "frontend_only_node_count": 20,
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+            },
+        )
+        candidates = {
+            "SigmasGraph": [{
+                "manager_id": "supernodes",
+                "install_id": "supernodes",
+                "title": "ComfyUI-SuperNodes",
+                "repository": "https://github.com/sonnybox/ComfyUI-SuperNodes",
+                "class_type": "SigmasGraph",
+                "provider": "comfyui_manager",
+                "verified": True,
+            }],
+            "Text": [{
+                "manager_id": "kaytool",
+                "install_id": "kaytool",
+                "title": "KayTool",
+                "repository": "https://github.com/kk8bit/KayTool",
+                "class_type": "Text",
+                "provider": "comfyui_manager",
+                "verified": True,
+            }],
+        }
+        with patch.object(
+            workflow_manager.ComfyUIManagerClient,
+            "cached_candidates",
+            side_effect=lambda class_type, aux_id="": candidates.get(class_type, []),
+        ):
+            plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["installable_plugin_count"], 2)
+        self.assertEqual(
+            {item["package_name"] for item in plan["installable_plugins"]},
+            {"ComfyUI-SuperNodes", "KayTool"},
+        )
+        self.assertEqual(plan["installable_missing_nodes"], ["SigmasGraph", "Text"])
+        self.assertEqual(plan["installable_missing_node_count"], 2)
+        self.assertEqual(plan["frontend_only_nodes"], ["GetNode", "SetNode"])
+
+    async def test_dependency_plan_keeps_sigmas_graph_unresolved_without_aux_id_evidence(self):
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["SigmasGraph"],
+                    "missing_node_instances": [
+                        {"id": "sigmas-1", "class_type": "SigmasGraph", "aux_id": "unknown/sigmas", "properties": {}}
+                    ],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_search_results": {
+                    "SigmasGraph": [{
+                        "manager_id": "owner/other-plugin",
+                        "aux_id": "owner/other-plugin",
+                        "repository": "https://github.com/owner/other-plugin",
+                        "class_type": "SigmasGraph",
+                    }]
+                },
+            },
+        )
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        node = plan["nodes"][0]
+        self.assertFalse(node["source_selected"])
+        self.assertEqual(node["instances"][0]["status"], "unresolved")
+        self.assertEqual(node["instances"][0]["source_evidence"]["kind"], "aux_id_unmatched")
+        self.assertEqual(plan["plugin_groups"], [])
+        self.assertEqual(plan["unresolved_node_types"], ["SigmasGraph"])
+
+    async def test_missing_manager_mapping_requires_manual_github_and_never_uses_text_search(self):
+        with patch.object(workflow_manager.ComfyUIManagerClient, "resolve", return_value=None), patch.object(
+            node_search.GitHubNodeSearcher, "search"
+        ) as search:
+            result = await self.agent.search_workflow_node_sources(self.job["id"])
+        search.assert_not_called()
+        self.assertEqual(result["results"]["LoadMoss"], [])
+        self.assertFalse(result["results"]["LoadMoss"])
+        selected = self.agent.select_workflow_node_source(
+            self.job["id"], "LoadMoss", "https://github.com/acme/load-moss", manual=True
+        )
+        self.assertEqual(selected["status"], "source_selected")
+        plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(plan["nodes"][0]["source_type"], "manual")
+
+    async def test_selection_preparation_does_not_convert_widgets_without_object_info_schema(self):
+        workflow = {
+            "nodes": [
+                {
+                    "id": 60,
+                    "type": "SetNode",
+                    "inputs": [{"name": "value", "type": "STRING"}],
+                    "widgets_values": ["prepared value"],
+                }
+            ],
+            "links": [],
+        }
+        with patch.object(workflow_manager.RunningHubProvider, "get_workflow", return_value=workflow), patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value={}
+        ):
+            result = await self.agent.inspect_selected_workflow(self.job["id"])
+
+        self.assertEqual(result["status"], "checked")
+        self.assertEqual(result["workflow"], workflow)
+        self.assertEqual(result["workflow"]["nodes"][0]["id"], 60)
+        self.assertNotIn("prompt", result["workflow"])
+        self.assertTrue(result["inspection"]["loaded_nodes_checked"])
+        self.assertEqual(result["inspection"]["missing_nodes"], [])
+        self.assertEqual(result["inspection"]["installable_missing_nodes"], [])
+        self.assertEqual(result["inspection"]["frontend_only_nodes"], ["SetNode"])
+        self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "checking_dependencies")
+
+    async def test_dependency_plan_refreshes_legacy_inspection_before_building_node_card(self):
+        workflow = {
+            "nodes": [
+                {"id": 1, "type": "CurrentMissingNode", "mode": 4, "widgets_values": []},
+                {"id": 2, "type": "Note", "widgets_values": ["canvas note"]},
+            ],
+            "links": [],
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "workflow": workflow,
+                # This is the shape written by the pre-instance-attribution
+                # implementation and must not be treated as authoritative.
+                "inspection": {"missing_nodes": [], "models": []},
+            },
+        )
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "object_info",
+            return_value={"SomeOtherNode": {}},
+        ) as object_info:
+            plan = self.agent.dependency_plan(self.job["id"])
+
+        object_info.assert_called_once()
+        self.assertEqual(plan["workflow_node_count"], 2)
+        self.assertEqual(plan["installable_missing_nodes"], ["CurrentMissingNode"])
+        self.assertEqual(plan["installable_missing_node_count"], 1)
+        self.assertEqual(plan["nodes"][0]["class_type"], "CurrentMissingNode")
+        saved_inspection = self.agent.workflow_job(self.job["id"])["metadata"]["inspection"]
+        self.assertEqual(saved_inspection["inspection_version"], 3)
 
     async def test_repair_route_requires_authorized_action_and_keeps_workflow(self):
         from omniscience.api import deps
@@ -2283,33 +3258,7 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             deps._GLOBAL_CHAT_AGENT = previous_agent
 
-    async def test_github_failure_falls_back_to_gitee(self):
-        candidates = [{"full_name": "acme/load-moss", "source": "https://gitee.com/acme/load-moss"}]
-        with patch.object(node_search.GitHubNodeSearcher, "search", side_effect=ValueError("GitHub unavailable")) as github_search, patch.object(
-            node_search.GiteeNodeSearcher, "search", return_value=candidates
-        ) as gitee_search:
-            result = await self.agent.search_workflow_node_sources(self.job["id"])
-        github_search.assert_called_once_with("LoadMoss")
-        gitee_search.assert_called_once_with("LoadMoss")
-        self.assertEqual(result["results"]["LoadMoss"], candidates)
-
-    async def test_github_empty_results_do_not_trigger_gitee_fallback(self):
-        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=[]) as github_search, patch.object(
-            node_search.GiteeNodeSearcher, "search"
-        ) as gitee_search:
-            result = await self.agent.search_workflow_node_sources(self.job["id"])
-        github_search.assert_called_once_with("LoadMoss")
-        gitee_search.assert_not_called()
-        self.assertEqual(result["results"]["LoadMoss"], [])
-
-    async def test_both_search_failures_report_both_providers(self):
-        with patch.object(node_search.GitHubNodeSearcher, "search", side_effect=ValueError("github offline")), patch.object(
-            node_search.GiteeNodeSearcher, "search", side_effect=ValueError("gitee offline")
-        ):
-            with self.assertRaisesRegex(ValueError, "GitHub 搜索失败：github offline；Gitee 搜索失败：gitee offline"):
-                await self.agent.search_workflow_node_sources(self.job["id"])
-
-    async def test_node_search_batches_classes_and_does_not_starve_after_empty_results(self):
+    async def test_manager_mapping_resolves_all_classes_without_text_search(self):
         classes = [f"Node{index}" for index in range(7)]
         self.agent.store.update_workflow_job(
             self.job["id"],
@@ -2318,19 +3267,19 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
                 "inspection": {"missing_nodes": classes, "unverified_nodes": [], "models": []},
             },
         )
-        with patch.object(node_search.GitHubNodeSearcher, "search", return_value=[]) as search:
+        with patch.object(workflow_manager.ComfyUIManagerClient, "resolve", return_value=None) as resolve, patch.object(
+            node_search.GitHubNodeSearcher, "search"
+        ) as search:
             first = await self.agent.search_workflow_node_sources(self.job["id"])
-            self.assertEqual(search.call_count, 5)
-            self.assertEqual(first["deferred"], 2)
+            self.assertEqual(resolve.call_count, 7)
+            search.assert_not_called()
+            self.assertEqual(first["deferred"], 0)
             second = await self.agent.search_workflow_node_sources(self.job["id"])
-            self.assertEqual(search.call_count, 7)
+            self.assertEqual(resolve.call_count, 7)
             self.assertEqual(set(second["results"]), set(classes))
-            for _ in range(2):
-                await self.agent.search_workflow_node_sources(self.job["id"])
-            self.assertEqual(search.call_count, 17)
 
     async def test_install_confirmation_requires_source_and_pins_commit(self):
-        with self.assertRaisesRegex(ValueError, "尚未选择 Gitee/GitHub 来源"):
+        with self.assertRaisesRegex(ValueError, "尚未选择 ComfyUI-Manager 安装包或手动 GitHub 来源"):
             await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
         self.agent.store.update_workflow_job(
             self.job["id"],
@@ -2342,14 +3291,15 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
-        self.agent.select_workflow_node_source(self.job["id"], "LoadMoss", "https://github.com/acme/load-moss")
+        self.agent.select_workflow_node_source(self.job["id"], "LoadMoss", "https://github.com/acme/load-moss", manual=True)
         self.agent.dependency_plan(self.job["id"])
         installed = {"status": "installed", "folder": "load-moss", "security": {"verdict": "clean"}}
         with patch.object(node_install.NodeInstallerMixin, "_repository_default_branch", return_value="main"), patch.object(
             node_install.NodeInstallerMixin, "_repository_commit", return_value="a" * 40
         ), patch.object(self.agent, "install_comfyui_node", AsyncMock(return_value=installed)) as install:
             result = await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
-        self.assertEqual(result["nodes"], [installed])
+        self.assertEqual(result["nodes"][0]["status"], "installed")
+        self.assertEqual(result["nodes"][0]["security"], installed["security"])
         install.assert_awaited_once_with(
             "https://github.com/acme/load-moss/tree/" + "a" * 40,
             pin_commit=True,
@@ -2866,6 +3816,32 @@ class SearchEngineModelSourceTests(unittest.TestCase):
         self.assertIn("site%3Ahuggingface.co", bing_url)
         self.assertIn("flux2-vae.safetensors", bing_url)
 
+    def test_model_source_accepts_minimax_hyphen_underscore_filename_variant(self):
+        from types import SimpleNamespace
+
+        searcher = model_source.ModelSourceSearcher({})
+        html = (
+            '<a href="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/'
+            'diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors">'
+            "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors</a>"
+        )
+        with patch.object(
+            searcher.router,
+            "endpoint",
+            return_value=("https://hf-mirror.com", SimpleNamespace(selected_region="domestic")),
+        ), patch.object(searcher, "_request_html", return_value=html), patch.object(
+            searcher, "_request_json", side_effect=AssertionError("validated Bing result should avoid API fallback")
+        ):
+            source = searcher.search("MiniMax-H3_fl2va_int8_convrot.safetensors")[0]
+
+        self.assertEqual(source["repo_id"], "Comfy-Org/MiniMax-H3")
+        self.assertEqual(source["filename"], "diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors")
+        self.assertTrue(
+            model_source.model_filenames_match(
+                source["filename"], "MiniMax-H3_fl2va_int8_convrot.safetensors"
+            )
+        )
+
     def test_manual_huggingface_source_rejects_untrusted_or_directory_urls(self):
         for value in (
             "https://evil.example/acme/flux/blob/main/flux2-vae.safetensors",
@@ -3195,6 +4171,48 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         plan = self.agent.dependency_plan(self.job["id"])
         self.assertEqual(plan["models"][0]["source"]["repo_id"], "acme/flux")
         self.assertTrue(plan["model_download_ready"])
+
+    async def test_model_source_search_can_retry_one_model_without_searching_others(self):
+        self._add_missing_models(
+            [("flux2-vae.safetensors", "vae_name"), ("moss.safetensors", "checkpoint_name")]
+        )
+        candidates = [{"repo_id": "acme/flux", "filename": "vae/flux2-vae.safetensors", "sha256": "b" * 64}]
+        with patch.object(model_source.ModelSourceSearcher, "search", return_value=candidates) as search:
+            result = await self.agent.search_workflow_model_sources(self.job["id"], "flux2-vae.safetensors")
+
+        search.assert_called_once_with("flux2-vae.safetensors")
+        self.assertEqual(result["results"], {"flux2-vae.safetensors": candidates})
+        self.assertEqual(result["models"][0]["source_candidates"], candidates)
+        self.assertEqual(result["models"][1]["source_candidates"], [])
+
+    async def test_model_source_search_retry_rejects_unknown_model(self):
+        self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
+        with self.assertRaisesRegex(ValueError, "没有此缺失模型"):
+            await self.agent.search_workflow_model_sources(self.job["id"], "not-in-workflow.safetensors")
+
+    async def test_model_source_search_route_passes_single_model_name(self):
+        from omniscience.api import deps
+
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        deps._GLOBAL_CHAT_AGENT = self.agent
+        try:
+            with patch.object(
+                self.agent,
+                "search_workflow_model_sources",
+                AsyncMock(return_value={"status": "ok"}),
+            ) as search:
+                response = await _registered_routes().handlers[
+                    ("POST", "/cline/global-chat/workflows/{job_id}/dependencies/models/search")
+                ](
+                    _FakeRequest(
+                        body={"name": "flux2-vae.safetensors"},
+                        match_info={"job_id": self.job["id"]},
+                    )
+                )
+            self.assertEqual(response.status, 200)
+            search.assert_awaited_once_with(self.job["id"], "flux2-vae.safetensors")
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
 
     async def test_manual_model_source_is_available_when_search_returns_no_results(self):
         self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
@@ -4305,17 +5323,26 @@ class PersistentCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tasks.sqlite3"
             store = TaskStore(database)
+            workspace = Path(directory) / "project"
+            workspace.mkdir()
+            task = store.create_task(str(workspace), "Keep this task", "act")
             store.append_global_message({"role": "user", "content": "global question"})
             store.append_global_message({"role": "assistant", "content": "global answer"})
+            job = store.create_workflow_job("global workflow")
+            store.save_workflow_candidates(job["id"], [{"id": "candidate", "title": "Workflow"}])
 
             reopened = TaskStore(database)
             self.assertEqual(
                 [message["content"] for message in reopened.global_messages()],
                 ["global question", "global answer"],
             )
-            self.assertEqual(reopened.list_tasks(), [])
+            self.assertEqual([item["id"] for item in reopened.list_tasks()], [task["id"]])
+            self.assertIsNotNone(reopened.get_workflow_job(job["id"]))
             reopened.clear_global_messages()
             self.assertEqual(reopened.global_messages(), [])
+            self.assertIsNone(reopened.get_workflow_job(job["id"]))
+            self.assertEqual(reopened.workflow_candidates(job["id"]), [])
+            self.assertIsNotNone(reopened.get_task(task["id"]))
 
     def test_global_chat_uses_independent_history_and_global_only_tools(self):
         from omniscience import paths, prompts, constants
@@ -5844,6 +6871,47 @@ class WebRegressionTests(unittest.TestCase):
         for selector in ("cline-node-install", "cline-node-install-url", "cline-node-install-actions"):
             self.assertIn(f".{selector}", style)
 
+    def test_workflow_manager_candidate_metadata_is_wired(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+
+        self.assertIn("const managerSelectionBody = (repo, target) =>", source)
+        self.assertIn("body: JSON.stringify(managerSelectionBody(repo, instance))", source)
+        self.assertIn("const body = managerSelectionBody(repo, target)", source)
+        for field in ("cnr_id", "install_id", "install_type", "reference", "pip"):
+            self.assertIn(f'"{field}"', source)
+        self.assertIn("const version = repo.version || repo.selected_version", source)
+
+    def test_workflow_node_install_details_are_displayed(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+
+        self.assertIn("function workflowNodeInstallStatusText(node)", source)
+        self.assertIn("function renderWorkflowNodeInstallDetails(container, plan)", source)
+        self.assertIn('el("strong", "", "安装节点详情")', source)
+        self.assertIn("node.class_type || \"未知节点\"", source)
+        self.assertIn("ComfyUI-Manager：${managerId}", source)
+        self.assertIn("renderWorkflowNodeInstallDetails(nodeInstallDetails, plan)", source)
+        self.assertIn("cline-workflow-node-install-details", style)
+        self.assertIn("cline-workflow-node-install-detail-status", style)
+
+    def test_workflow_model_card_can_retry_one_missing_model(self):
+        source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")
+        self.assertIn('button("重新搜索此模型", "cline-secondary cline-workflow-model-retry-search")', source)
+        self.assertIn('body: JSON.stringify({ name })', source)
+        self.assertIn("modelSearchUrls = { ...modelSearchUrls, ...(searched.search_urls || {}) }", source)
+
+    def test_workflow_node_install_progress_ui_is_wired(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+        self.assertIn("function nodeInstallProgress()", source)
+        self.assertIn("function waitForNodeInstall(jobId", source)
+        self.assertIn("/dependencies/nodes/status", source)
+        self.assertIn("current_plugin", source)
+        self.assertIn("cline-workflow-node-install-progress", style)
+
     def test_global_chat_has_independent_header_button_and_send_route(self):
         source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")
 
@@ -5856,6 +6924,16 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn("requestProjectFolder()", source)
         global_branch = source[source.index("if (state.globalChatActive) {", source.index("async function sendMessage")):source.index("if (!currentTaskId())", source.index("async function sendMessage"))]
         self.assertNotIn("requestProjectFolder()", global_branch)
+
+    def test_global_chat_clear_drops_workflow_card_projections(self):
+        source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")
+        clear_start = source.index("async function clearHistory")
+        clear_end = source.index("async function setMode", clear_start)
+        clear = source[clear_start:clear_end]
+        self.assertIn('request("/cline/global-chat/history", { method: "DELETE" })', clear)
+        self.assertIn("state.globalMessages = []", clear)
+        self.assertIn("state.workflowRepairCards = []", clear)
+        self.assertIn("state.workflowRepairPolling = false", clear)
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
@@ -6215,6 +7293,36 @@ class GlobalChatComposerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent.store.list_tasks(), [])
                 self.assertNotIn("context", agent.store.global_messages()[0])
             finally:
+                paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY = old_paths
+
+    async def test_global_history_route_clears_workflow_card_state_but_keeps_tasks(self):
+        from omniscience.api import deps
+
+        with tempfile.TemporaryDirectory() as directory:
+            agent, old_paths = self._agent(Path(directory))
+            previous_global = deps._GLOBAL_CHAT_AGENT
+            deps._GLOBAL_CHAT_AGENT = agent
+            try:
+                workspace = Path(directory) / "project"
+                workspace.mkdir()
+                task = agent.store.create_task(str(workspace), "Keep task", "act")
+                agent.store.append_global_message({"role": "user", "content": "find a workflow"})
+                job = agent.store.create_workflow_job("find a workflow")
+                agent.store.save_workflow_candidates(job["id"], [{"id": "candidate", "title": "Old card"}])
+
+                recorder = _registered_routes()
+                response = await recorder.handlers[("DELETE", "/cline/global-chat/history")](_FakeRequest())
+
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.body.decode()), {"messages": []})
+                self.assertEqual(agent.store.global_messages(), [])
+                self.assertIsNone(agent.store.get_workflow_job(job["id"]))
+                self.assertEqual(agent.store.workflow_candidates(job["id"]), [])
+                self.assertIsNotNone(agent.store.get_task(task["id"]))
+            finally:
+                deps._GLOBAL_CHAT_AGENT = previous_global
+                from omniscience import paths
+
                 paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY = old_paths
 
 

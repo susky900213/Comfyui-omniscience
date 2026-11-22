@@ -382,8 +382,20 @@ class TaskStore:
         return result
 
     def clear_global_messages(self) -> None:
-        """Delete only the global transcript; task history is untouched."""
+        """Delete global chat state; task history and project data are untouched.
+
+        Workflow search jobs are created by the global conversation and their
+        candidate/dependency metadata is what allows workflow cards to be
+        restored after a page reload.  Keeping those rows after deleting the
+        transcript makes the next global-chat session resurrect cards from a
+        conversation the user explicitly cleared.
+        """
         with self._lock, self._connection() as connection:
+            # Do this explicitly instead of relying on SQLite foreign-key
+            # enforcement: older databases were opened without
+            # ``PRAGMA foreign_keys = ON`` and may otherwise retain candidates.
+            connection.execute("DELETE FROM workflow_candidates")
+            connection.execute("DELETE FROM workflow_jobs")
             connection.execute("DELETE FROM global_messages")
 
     def set_current_workflow(self, task_id: str, workflow: dict[str, Any], source: str = "comfyui_canvas") -> dict[str, Any]:

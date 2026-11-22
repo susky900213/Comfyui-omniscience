@@ -115,17 +115,27 @@ class GitHubSkillInstaller:
         url: str,
         accept: str = "application/vnd.github+json",
         max_bytes: int = MAX_GLOBAL_SKILL_PACKAGE_BYTES,
+        token: str = "",
     ) -> Any:
+        # ``token`` remains accepted for compatibility with older callers, but
+        # GitHub requests are intentionally always anonymous.
         request = Request(
             url,
-            headers={"Accept": accept, "User-Agent": "Comfyui-omniscience-Skill-Installer"},
+            headers={
+                "Accept": accept,
+                "User-Agent": "Comfyui-omniscience-Skill-Installer",
+            },
         )
         opener = build_opener(_GitHubRedirectHandler())
-        with opener.open(request, timeout=20) as response:  # noqa: S310 - URL is constructed from validated public GitHub URL
-            final_host = (urlparse(response.geturl()).hostname or "").lower()
-            if final_host not in {"api.github.com", "raw.githubusercontent.com"}:
-                raise ValueError("GitHub 请求被重定向到不受支持的主机，已拒绝安装。")
-            body = response.read(max_bytes + 1)
+        try:
+            with opener.open(request, timeout=20) as response:  # noqa: S310 - URL is constructed from validated public GitHub URL
+                final_host = (urlparse(response.geturl()).hostname or "").lower()
+                if final_host not in {"api.github.com", "raw.githubusercontent.com"}:
+                    raise ValueError("GitHub 请求被重定向到不受支持的主机，已拒绝安装。")
+                body = response.read(max_bytes + 1)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            # Do not include the authenticated URL from urllib's exception.
+            raise ValueError("GitHub 请求失败。") from exc
         if len(body) > max_bytes:
             raise ValueError("GitHub 返回的数据超过安全大小限制。")
         if "raw.githubusercontent.com" in url:

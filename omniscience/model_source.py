@@ -24,6 +24,27 @@ DEBUG_BING_ENV = "OMNISCIENCE_DEBUG_BING"
 logger = logging.getLogger("Comfyui-omniscience")
 
 
+def normalise_model_filename(value: Any) -> str:
+    """Return a comparison form for model basenames from workflow and Hub data."""
+    basename = Path(str(value or "").replace("\\", "/")).name.strip()
+    if not basename:
+        return ""
+    path = Path(basename)
+    stem = re.sub(r"[-_\s]+", "_", path.stem.casefold())
+    return f"{stem}{path.suffix.casefold()}"
+
+
+def model_filenames_match(actual: Any, expected: Any) -> bool:
+    """Compare safe model basenames while allowing common separator variants."""
+    actual_name = Path(str(actual or "").replace("\\", "/")).name.strip()
+    expected_name = Path(str(expected or "").replace("\\", "/")).name.strip()
+    return bool(
+        actual_name
+        and expected_name
+        and normalise_model_filename(actual_name) == normalise_model_filename(expected_name)
+    )
+
+
 class _SearchResultParser(HTMLParser):
     """Collect anchor text without depending on a search engine's CSS classes."""
 
@@ -251,7 +272,7 @@ class ModelSourceSearcher:
         filename = "/".join(parts[4:])
         if not REPO_ID.fullmatch(repo_id) or not revision or not filename:
             return None
-        if Path(filename).name != basename or ".." in Path(filename).parts:
+        if not model_filenames_match(Path(filename).name, basename) or ".." in Path(filename).parts:
             return None
         return {
             "repo_id": repo_id,
@@ -386,7 +407,7 @@ class ModelSourceSearcher:
                     path, file_info = str(sibling.get("rfilename") or ""), sibling
                 else:
                     continue
-                if Path(path.replace("\\", "/")).name != basename:
+                if not model_filenames_match(Path(path.replace("\\", "/")).name, basename):
                     continue
                 key = (repo_id, path)
                 if key in seen:
