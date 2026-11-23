@@ -1971,6 +1971,40 @@ class WorkflowManagerMixin:
         )
         return progress
 
+    def _migrate_legacy_manager_security_progress(
+        self, job_id: str, progress: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Convert an old Manager security failure into a terminal snapshot."""
+        security_value = progress.get("security")
+        if progress.get("status") != "failed" or (
+            isinstance(security_value, dict) and security_value.get("post_install")
+        ):
+            return progress
+        security = progress.get("security") if isinstance(progress.get("security"), dict) else {}
+        root = str(security.get("root") or "").strip()
+        try:
+            nodes_root = self.settings.comfyui_node_directory()
+            is_manager_package = bool(
+                root
+                and nodes_root is not None
+                and Path(root).expanduser().resolve().is_relative_to(nodes_root.expanduser().resolve())
+            )
+        except (OSError, RuntimeError, ValueError):
+            is_manager_package = False
+        if not is_manager_package:
+            return progress
+        migrated = dict(progress)
+        migrated["status"] = "security_blocked"
+        migrated["phase"] = "security_blocked"
+        migrated["terminal"] = True
+        migrated["manager_installed"] = True
+        security = dict(security)
+        security["post_install"] = True
+        security["manager_managed"] = True
+        security.setdefault("class_type", str(progress.get("current_node") or "").strip())
+        migrated["security"] = security
+        return self._save_node_install_progress(job_id, migrated)
+
     async def start_node_installation(
         self,
         job_id: Any,
@@ -2008,8 +2042,28 @@ class WorkflowManagerMixin:
         if existing is not None and not existing.done():
             return {"status": "installing", "job_id": key, "progress": self.node_install_status(key)["progress"]}
         previous = dict((job.get("metadata") or {}).get("node_install_progress") or {})
+        previous = self._migrate_legacy_manager_security_progress(key, previous)
         if previous.get("status") == "completed":
             return {"status": "completed", "job_id": key, "progress": previous}
+        if previous.get("status") == "security_blocked":
+            # Manager has already put this project in custom_nodes.  A security
+            # refusal is terminal for this installation attempt: retrying here
+            # would enqueue the same Manager package again and show the same
+            # report on every refresh.  Once the user removes/disables that
+            # package, allow a fresh attempt while retaining other completed
+            # node results.
+            security = previous.get("security") if isinstance(previous.get("security"), dict) else {}
+            installed_root = str(security.get("root") or "").strip()
+            if installed_root and Path(installed_root).is_dir():
+                return {"status": "security_blocked", "job_id": key, "progress": previous}
+            metadata = dict(job.get("metadata") or {})
+            prepared = dict(metadata.get("prepared_node_results") or {})
+            blocked_class_type = str(security.get("class_type") or "").strip()
+            if blocked_class_type:
+                prepared.pop(blocked_class_type, None)
+                metadata["prepared_node_results"] = prepared
+            metadata.pop("node_install_progress", None)
+            self.store.update_workflow_job(key, state="selected", error="", metadata=metadata)
         progress = {
             "status": "installing",
             "phase": "starting",
@@ -2050,10 +2104,31 @@ class WorkflowManagerMixin:
             return result
         except Exception as exc:
             progress = dict((self.store.get_workflow_job(job_id) or {}).get("metadata", {}).get("node_install_progress") or {})
-            progress.update({"status": "failed", "phase": "failed", "error": str(exc), "total": total})
             report = getattr(exc, "report", None)
             if isinstance(report, dict):
                 progress["security"] = report
+            manager_managed = isinstance(report, dict) and bool(
+                report.get("post_install") or report.get("manager_managed")
+            )
+            progress.update(
+                {
+                    "status": "security_blocked" if manager_managed else "failed",
+                    "phase": "security_blocked" if manager_managed else "failed",
+                    "terminal": manager_managed,
+                    "manager_installed": manager_managed,
+                    "error": str(exc),
+                    "total": total,
+                }
+            )
+            if manager_managed:
+                blocked_node = str(report.get("class_type") or "").strip()
+                if blocked_node:
+                    progress["blocked_node"] = blocked_node
+                events = list(progress.get("events") or [])
+                event = f"安全复核阻止：{blocked_node or 'Manager 节点'}（Manager 已安装）"
+                if event not in events:
+                    events.append(event)
+                progress["events"] = events[-20:]
             self._save_node_install_progress(job_id, progress)
             raise
 
@@ -2112,6 +2187,7 @@ class WorkflowManagerMixin:
         progress = dict((job.get("metadata") or {}).get("node_install_progress") or {})
         if not progress:
             progress = {"status": "idle", "current": 0, "completed": 0, "total": 0}
+        progress = self._migrate_legacy_manager_security_progress(key, progress)
         tasks = getattr(self, "_node_install_tasks", {})
         active_task = tasks.get(key)
         if progress.get("status") == "installing" and (

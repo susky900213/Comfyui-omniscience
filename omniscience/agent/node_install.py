@@ -315,6 +315,10 @@ class NodeInstallerMixin:
                 # Manager has already placed the project, but the risk report
                 # must still be persisted and returned to the panel.  Do not
                 # silently treat a risky Manager package as a usable node.
+                exc.report["post_install"] = True
+                exc.report["manager_managed"] = True
+                if expected_class_type:
+                    exc.report["class_type"] = expected_class_type
                 self.store.save_node_scan(str(root), exc.report)
                 raise
             self.store.save_node_scan(str(root), report)

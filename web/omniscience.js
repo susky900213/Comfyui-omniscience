@@ -238,11 +238,14 @@ function updateNodeInstallProgress(progress, result) {
     running: "ComfyUI-Manager 安装中",
     installing: "安装中",
     completed: "已完成",
+    security_blocked: "安全复核阻止",
     interrupted: "服务重启中断",
     failed: "失败",
   }[result?.phase] || result?.phase || "安装中";
   const phase = result?.interrupted
     ? "安装已因服务重启中断"
+    : result?.status === "security_blocked"
+      ? "Manager 已安装，但安全复核未通过"
     : result?.status === "failed"
       ? "安装失败"
       : result?.status === "completed"
@@ -284,6 +287,12 @@ async function waitForNodeInstall(jobId, onProgress, shouldContinue = () => true
     );
     onProgress?.(result.progress || result);
     if (result.status === "completed") return result;
+    if (result.status === "security_blocked") {
+      const error = new Error(result.progress?.error || "Manager 已安装节点，但安全复核未通过");
+      error.status = 409;
+      if (result.progress?.security) error.payload = { security: result.progress.security };
+      throw error;
+    }
     if (result.status === "failed") {
       const error = new Error(result.progress?.error || "节点插件安装失败");
       if (result.progress?.security) error.payload = { security: result.progress.security };
@@ -1582,6 +1591,12 @@ function workflowCandidateCard(jobId, candidate) {
           body: JSON.stringify({ confirmed: true, acknowledge_security_for: acknowledgeSecurityFor }),
         });
         updateNodeInstallProgress(nodeProgressUi, started.progress || {});
+        if (started.status === "security_blocked") {
+          const error = new Error(started.progress?.error || "Manager 已安装节点，但安全复核未通过");
+          error.status = 409;
+          if (started.progress?.security) error.payload = { security: started.progress.security };
+          throw error;
+        }
         if (started.status !== "installing") return started;
         const completed = await waitForNodeInstall(
           jobId,
@@ -1596,6 +1611,17 @@ function workflowCandidateCard(jobId, candidate) {
         const security = securityError?.payload?.security;
         if (!security) return showError(securityError);
         const report = securityReport(security);
+        if (security.post_install || security.manager_managed) {
+          card.append(
+            report,
+            el(
+              "p",
+              "cline-workflow-candidate-meta warning",
+              "ComfyUI-Manager 已经把该节点放入 custom_nodes，但安全复核未通过。请在 Manager 中停用或移除该节点后再处理；Omniscience 不会通过手动 GitHub 兜底安装。",
+            ),
+          );
+          return;
+        }
         const retry = button("查看报告后，单独确认仍要安装此风险节点", "cline-secondary cline-workflow-node-risk-confirm");
         retry.onclick = () => {
           const findings = (security.findings || []).map((finding) => `${finding.severity}: ${finding.title}`).join("\n");
@@ -1680,6 +1706,12 @@ function workflowCandidateCard(jobId, candidate) {
                 error.payload = { security: status.progress.security };
                 showNodeSecurityReview(error);
               }
+            } else if (status.status === "security_blocked") {
+              prepare.disabled = true;
+              prepare.textContent = "Manager 已安装，但安全复核未通过";
+              const error = new Error(status.progress?.error || "Manager 已安装节点，但安全复核未通过");
+              if (status.progress?.security) error.payload = { security: status.progress.security };
+              showNodeSecurityReview(error);
             }
           })
           .catch(() => {});

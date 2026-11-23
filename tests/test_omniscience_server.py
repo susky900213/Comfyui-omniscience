@@ -2796,6 +2796,81 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已完成：ComfyUI-SuperNodes", status["progress"]["events"])
         self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "selected")
 
+    async def test_manager_security_block_is_terminal_and_does_not_requeue(self):
+        report_root = Path(self.directory.name) / "custom_nodes" / "KayTool"
+        report_root.mkdir(parents=True)
+        report = {
+            "verdict": "review",
+            "severity": "medium",
+            "root": str(report_root),
+            "class_type": "Text",
+            "post_install": True,
+            "manager_managed": True,
+            "findings": [{"rule": "coverage-limit", "severity": "low", "title": "源码覆盖不完整"}],
+        }
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["dependency_plan"] = {
+            "nodes": [{
+                "class_type": "Text",
+                "manager_id": "kaytool",
+                "package_name": "KayTool",
+            }],
+            "models": [],
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+        blocked = node_install.NodeSecurityBlockedError("KayTool", report)
+
+        with patch.object(
+            workflow_manager.ComfyUIManagerClient,
+            "install",
+            return_value={"status": "manager_installed"},
+        ) as install, patch.object(
+            node_install.NodeInstallerMixin,
+            "scan_installed_manager_node",
+            AsyncMock(side_effect=blocked),
+        ):
+            started = await self.agent.start_node_installation(self.job["id"], confirmed=True)
+            with self.assertRaises(node_install.NodeSecurityBlockedError):
+                await self.agent._node_install_tasks[self.job["id"]]
+
+            status = self.agent.node_install_status(self.job["id"])
+            self.assertEqual(status["status"], "security_blocked")
+            self.assertTrue(status["progress"]["terminal"])
+            self.assertTrue(status["progress"]["manager_installed"])
+            self.assertEqual(status["progress"]["blocked_node"], "Text")
+
+            resumed = await self.agent.start_node_installation(self.job["id"], confirmed=True)
+
+        self.assertEqual(started["status"], "installing")
+        self.assertEqual(resumed["status"], "security_blocked")
+        install.assert_called_once()
+
+    async def test_legacy_manager_security_failure_is_migrated_to_terminal_state(self):
+        nodes_root = Path(self.directory.name) / "custom_nodes"
+        report_root = nodes_root / "KayTool"
+        report_root.mkdir(parents=True)
+        self.agent.settings.update({"comfyui_directory": str(Path(self.directory.name))})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["dependency_plan"] = {
+            "nodes": [{"class_type": "Text", "manager_id": "kaytool", "package_name": "KayTool"}],
+            "models": [],
+        }
+        metadata["node_install_progress"] = {
+            "status": "failed",
+            "phase": "failed",
+            "current_node": "Text",
+            "error": "旧版安全复核失败",
+            "security": {"root": str(report_root), "class_type": "Text"},
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+        self.agent._node_install_tasks = {}
+
+        status = self.agent.node_install_status(self.job["id"])
+
+        self.assertEqual(status["status"], "security_blocked")
+        self.assertTrue(status["progress"]["terminal"])
+        self.assertTrue(status["progress"]["security"]["post_install"])
+
     async def test_node_install_routes_start_and_read_background_progress(self):
         from omniscience.api import deps
 
@@ -6908,6 +6983,9 @@ class WebRegressionTests(unittest.TestCase):
         style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
         self.assertIn("function nodeInstallProgress()", source)
         self.assertIn("function waitForNodeInstall(jobId", source)
+        self.assertIn("security_blocked", source)
+        self.assertIn("Manager 已安装，但安全复核未通过", source)
+        self.assertIn("请在 Manager 中停用或移除该节点后再处理", source)
         self.assertIn("/dependencies/nodes/status", source)
         self.assertIn("current_plugin", source)
         self.assertIn("cline-workflow-node-install-progress", style)
