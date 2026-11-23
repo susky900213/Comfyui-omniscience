@@ -25,6 +25,7 @@ VS Code Extension API，因此本项目使用 ComfyUI custom node 的后端路�
 - 侧栏“工作流”页可读取当前 ComfyUI 画布的实时序列化结果、复制实时 JSON 或下载项目的 `workflow.json`；实时画布包含未保存修改，并通过 Agent 的 `get_current_workflow` 工具按需读取；
 - 可选 MCP stdio/Streamable HTTP 工具，以及可选 Playwright 浏览器工具；
 - 完整 Skill 管理：在侧栏创建、编辑、删除、启用/停用 Skill，支持 JSON 导入导出；对话页可以按消息选择多个 Skill，选中的启用 Skill 会注入模型系统提示词；全局对话可按用户明确给出的公开 GitHub 链接安装标准 `SKILL.md` Skill 包；
+- 全局对话支持上传并安装 ComfyUI 工作流 JSON：输入 `@` 可选择 `@workflow`（`@node` 仅保留扩展入口），也可以说“帮我安装这个工作流”。系统只会校验并复制上传文件到 `ComfyUI/user/default/workflows`，不会执行工作流、安装节点、下载模型或覆盖同名文件；
 - 会话上下文自动压缩：提示词估算达到可配置的最大上下文百分比（默认 80%）时，先调用无工具的摘要请求，再用摘要替换较早历史，同时保留系统提示、最近消息和工具调用结果；摘要失败时回退到本地压缩，不丢失原始会话；设置页会显示当前提示词的 Token、字符数和组成；
 - 文件操作限制在任务所属的项目目录内：工作区任务是配置的工作区子目录，接管的 custom_nodes 项目则是该项目自身目录；
 - 配置保存到 `~/.config/comfyui-omniscience/config.json`，权限尽量设置为 `0600`。

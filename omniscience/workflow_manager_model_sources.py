@@ -198,7 +198,7 @@ class WorkflowModelSourcesMixin:
         metadata = dict(job.get("metadata") or {})
         inspection = metadata.get("inspection") or {}
         model = next((item for item in inspection.get("models", []) if str(item.get("name") or "") == name), None)
-        if model is None or model.get("loader_status") == "recognized":
+        if model is None:
             raise ValueError("该工作流没有此缺失模型，不能选择本地模型文件。")
         if not relative_path or relative_path.startswith("/") or ".." in Path(relative_path).parts:
             raise ValueError("本地模型文件路径无效。")

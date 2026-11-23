@@ -117,7 +117,16 @@ def register_workflows_routes(routes: Any) -> None:
     @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/models/local")
     async def cline_list_local_workflow_models(request):
         try:
-            return _response(deps.global_chat_agent().local_model_inventory(request.match_info["job_id"]))
+            # The inventory may call ComfyUI's /internal/folder_paths endpoint
+            # and scan the local model tree.  This handler itself runs on the
+            # same aiohttp loop as that endpoint, so keep all of that blocking
+            # work off the loop to avoid a self-request deadlock.
+            agent = deps.global_chat_agent()
+            inventory = await asyncio.to_thread(
+                agent.local_model_inventory,
+                request.match_info["job_id"],
+            )
+            return _response(inventory)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
     @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/source")
@@ -135,11 +144,14 @@ def register_workflows_routes(routes: Any) -> None:
     async def cline_select_workflow_local_model(request):
         try:
             values = await _body(request)
-            return _response(
-                deps.global_chat_agent().select_workflow_local_model(
-                    request.match_info["job_id"], values.get("name"), values.get("path")
-                )
+            agent = deps.global_chat_agent()
+            selected = await asyncio.to_thread(
+                agent.select_workflow_local_model,
+                request.match_info["job_id"],
+                values.get("name"),
+                values.get("path"),
             )
+            return _response(selected)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
     @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/confirm")
@@ -316,7 +328,10 @@ def register_workflows_routes(routes: Any) -> None:
             values = await _body(request)
             return _response(
                 await deps.global_chat_agent().chat(
-                    values.get("content", ""), values.get("skill_ids", []), str(values.get("context") or "")
+                    values.get("content", ""),
+                    values.get("skill_ids", []),
+                    str(values.get("context") or ""),
+                    str(values.get("workflow_source") or ""),
                 )
             )
         except (ValueError, RuntimeError, OSError) as exc:

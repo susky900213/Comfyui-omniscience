@@ -31,13 +31,37 @@ class GlobalChatToolMixin:
         install_requested: bool,
         node_install_requested: bool = False,
         workflow_requested: bool = False,
+        workflow_install_requested: bool = False,
     ) -> list[dict[str, Any]]:
         return global_chat_definitions(
             install_requested=install_requested,
             node_install_requested=node_install_requested,
             workflow_requested=workflow_requested,
+            workflow_install_requested=workflow_install_requested,
             network_enabled=self.chat_network_allowed(),
         )
+
+    def uploaded_workflow_sources(self) -> list[str]:
+        """Return uploaded JSON workflow paths visible to global chat."""
+        uploads_root = self.chat_workspace().root / "uploads"
+        uploads_root.mkdir(parents=True, exist_ok=True)
+        return [
+            str(entry.get("path") or "")
+            for entry in self.chat_workspace().list_files("uploads", recursive=False)
+            if entry.get("type") == "file" and str(entry.get("name") or "").casefold().endswith(".json")
+        ]
+
+    def default_uploaded_workflow_source(self) -> str:
+        """Choose the newest uploaded workflow when the user says @workflow."""
+        workspace = self.chat_workspace()
+        candidates = []
+        for source in self.uploaded_workflow_sources():
+            try:
+                path = workspace.resolve(source)
+                candidates.append((path.stat().st_mtime_ns, source))
+            except OSError:
+                continue
+        return max(candidates, default=(0, ""))[1]
 
     def chat_prompt_note(self) -> str:
         workspace = self.chat_workspace()

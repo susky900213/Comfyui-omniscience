@@ -208,3 +208,18 @@ class SettingsStore:
         if not node_directory.is_dir():
             raise ValueError(f"ComfyUI custom_nodes 不是文件夹：{node_directory}")
         return node_directory.resolve()
+
+    def comfyui_workflow_directory(self) -> Path | None:
+        """Return ComfyUI's default user's saved-workflow directory."""
+        data = self.load()
+        value = data["comfyui_directory"] if "comfyui_directory" in data else paths.DEFAULT_COMFYUI_DIRECTORY
+        if not str(value or "").strip():
+            return None
+        comfyui_path = Path(str(value)).expanduser().resolve()
+        if not comfyui_path.is_dir():
+            raise ValueError(f"ComfyUI 目录不存在或不是文件夹：{comfyui_path}")
+        workflow_directory = comfyui_path / "user" / "default" / "workflows"
+        workflow_directory.mkdir(parents=True, exist_ok=True)
+        if not workflow_directory.is_dir():
+            raise ValueError(f"ComfyUI 工作流目录不是文件夹：{workflow_directory}")
+        return workflow_directory.resolve()

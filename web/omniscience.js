@@ -22,6 +22,9 @@ const state = {
   skillMenuOpen: false,
   skillQuery: "",
   skillMenuIndex: 0,
+  toolMenuOpen: false,
+  toolQuery: "",
+  toolMenuIndex: 0,
   fileMenuOpen: false,
   fileQuery: "",
   fileMenuIndex: 0,
@@ -940,7 +943,7 @@ async function pollWorkflowRepairCards() {
   }
 }
 
-function workflowCandidateCard(jobId, candidate) {
+function workflowCandidateCard(jobId, candidate, options = {}) {
   const card = el("div", "cline-workflow-candidate");
   // Keep the persisted workflow job identity on the card from the moment it
   // is rendered.  A failure can happen before dependency preparation adds the
@@ -949,7 +952,12 @@ function workflowCandidateCard(jobId, candidate) {
   card.dataset.workflowRepairGeneration = String(state.workflowRepairGeneration);
   card.appendChild(el("strong", "cline-workflow-candidate-title", `${candidate.title || "未命名工作流"} · ID: ${candidate.id || "未知"}`));
   if (candidate.description) card.appendChild(el("p", "cline-workflow-candidate-description", candidate.description));
-  const meta = [candidate.author, candidate.region ? `站点：${candidate.region === "domestic" ? "国内" : "国外"}` : ""]
+  const meta = [
+    candidate.author,
+    candidate.region
+      ? candidate.region === "local" ? "来源：本地上传" : `站点：${candidate.region === "domestic" ? "国内" : "国外"}`
+      : "",
+  ]
     .filter(Boolean).join(" · ");
   if (meta) card.appendChild(el("p", "cline-workflow-candidate-meta", meta));
   const resource = candidate.resource_assessment;
@@ -963,7 +971,10 @@ function workflowCandidateCard(jobId, candidate) {
   if (["remote", "cloud", "api", "hosted"].includes(String(candidate.execution_mode || "").toLowerCase()) || candidate.remote_endpoint) {
     card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-remote", "非本地模型/云端推理工作流"));
   }
-  const action = button(`选择并准备（ID: ${candidate.id || "未知"}）`, "cline-secondary cline-workflow-select");
+  const actionLabel = options.uploaded
+    ? "检查并准备这个上传工作流"
+    : `选择并准备（ID: ${candidate.id || "未知"}）`;
+  const action = button(actionLabel, "cline-secondary cline-workflow-select");
   action.onclick = async () => {
     const restoring = action.dataset.restore === "true";
     delete action.dataset.restore;
@@ -985,6 +996,7 @@ function workflowCandidateCard(jobId, candidate) {
         }
         const reusableInspection = metadata.inspection
           && metadata.workflow
+          && !options.forceInspection
           && Number(metadata.inspection.inspection_version) === WORKFLOW_INSPECTION_VERSION;
         inspection = reusableInspection
           ? { inspection: metadata.inspection, workflow: metadata.workflow }
@@ -1052,13 +1064,36 @@ function workflowCandidateCard(jobId, candidate) {
           loadCanvas.click();
         }
       }
-      const plan = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
+      let plan = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
       const planSummary = el(
         "p",
         "cline-workflow-candidate-meta",
         `工作流节点：${plan.workflow_node_count ?? report.node_count ?? 0} · 需要安装插件：${plan.installable_plugin_count ?? (plan.plugin_groups || []).length} 个 · 节点：${plan.installable_missing_type_count ?? plan.installable_missing_nodes?.length ?? (plan.nodes || []).length} 种类型/${plan.installable_missing_node_count ?? plan.node_instance_count ?? 0} 个实例 · 模型依赖：${(plan.models || []).length}`,
       );
       card.appendChild(planSummary);
+      const runStatus = el("p", "cline-workflow-candidate-meta cline-workflow-run-status");
+      const renderRunStatus = (currentPlan) => {
+        const blockers = currentPlan.run_blockers || [];
+        const canRun = currentPlan.can_run === true;
+        runStatus.className = `cline-workflow-candidate-meta cline-workflow-run-status ${canRun ? "ready" : "blocked"}`;
+        runStatus.textContent = canRun
+          ? "依赖检查完成：可以运行。请确认后执行。"
+          : `暂不能运行：${blockers.length ? blockers.join("；") : "依赖尚未准备完成。"}`;
+        card.classList.toggle("ready", canRun);
+      };
+      const refreshRunStatus = async () => {
+        try {
+          plan = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
+          renderRunStatus(plan);
+          return plan;
+        } catch (error) {
+          runStatus.className = "cline-workflow-candidate-meta cline-workflow-run-status blocked";
+          runStatus.textContent = `暂不能运行：无法刷新依赖状态（${error.message}）`;
+          return null;
+        }
+      };
+      card.appendChild(runStatus);
+      renderRunStatus(plan);
       const nodeInstallDetails = el("div", "cline-workflow-node-install-details");
       renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
       card.appendChild(nodeInstallDetails);
@@ -1176,8 +1211,10 @@ function workflowCandidateCard(jobId, candidate) {
                   body: JSON.stringify({ name, path: localPicker.value }),
                 });
                 const refreshed = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
-                plan.models = refreshed.models || [];
+                plan = refreshed;
                 await renderModelSources(plan.models, candidatesByName, searchUrlsByName, searchCompleted);
+                renderRunStatus(plan);
+                maybeAppendExecute();
               } catch (error) {
                 localPicker.disabled = false;
                 localPicker.value = "";
@@ -1248,6 +1285,7 @@ function workflowCandidateCard(jobId, candidate) {
                 }
                 modelSearchUrls = { ...modelSearchUrls, ...(searched.search_urls || {}) };
                 await renderModelSources(plan.models || [], searched.results || {}, modelSearchUrls, true);
+                void refreshRunStatus();
                 for (const warning of Object.values(searched.warnings || {})) {
                   localInventoryArea.appendChild(el("p", "cline-workflow-candidate-meta warning", warning));
                 }
@@ -1398,6 +1436,7 @@ function workflowCandidateCard(jobId, candidate) {
             }
             modelSearchUrls = { ...modelSearchUrls, ...(searched.search_urls || {}) };
             await renderModelSources(plan.models || [], searched.results || {}, modelSearchUrls, true);
+            void refreshRunStatus();
             if (searched.message) {
               localInventoryArea.appendChild(el("p", "cline-workflow-candidate-meta", searched.message));
             }
@@ -1621,12 +1660,14 @@ function workflowCandidateCard(jobId, candidate) {
       const hasNodes = (plan.nodes || []).length > 0;
       const nodesReady = hasNodes && (plan.nodes || []).every(nodeSourceReady);
       const hasModels = (plan.models || []).length > 0;
-      let nodesPrepared = !hasNodes;
+      let nodesPrepared = plan.node_dependencies_ready === true || !hasNodes;
       const maybeAppendExecute = () => {
-        const modelsPrepared = (plan.models || []).every((model) => ["installed", "selected_local"].includes(model.status));
-        if (nodesPrepared && modelsPrepared) appendWorkflowExecuteButton(card, jobId);
+        const modelsPrepared = (plan.models || []).every((model) => ["installed", "selected_local", "recognized"].includes(model.status));
+        if (nodesPrepared && modelsPrepared && plan.can_run === true) appendWorkflowExecuteButton(card, jobId);
       };
-      modelSourceArea.addEventListener("workflow-model-prepared", maybeAppendExecute);
+      modelSourceArea.addEventListener("workflow-model-prepared", () => {
+        void refreshRunStatus().then(() => maybeAppendExecute());
+      });
       const prepare = button(hasNodes ? (nodesReady ? `安装并安全检查缺少节点（工作流 ID: ${candidate.id || "未知"}）` : "先选择缺少节点的安装来源") : "检查工作流准备状态", "cline-secondary cline-workflow-prepare");
       const nodeProgressUi = nodeInstallProgress();
       const runNodeInstallation = async (acknowledgeSecurityFor = "") => {
@@ -1724,7 +1765,7 @@ function workflowCandidateCard(jobId, candidate) {
               nodesPrepared = true;
               prepare.disabled = false;
               prepare.textContent = "节点安全检测通过并已安装";
-              maybeAppendExecute();
+              void refreshRunStatus().then(() => maybeAppendExecute());
             } else if (status.status === "installing") {
               prepare.disabled = true;
               prepare.textContent = "正在安装节点插件…";
@@ -1736,7 +1777,7 @@ function workflowCandidateCard(jobId, candidate) {
                 nodesPrepared = true;
                 prepare.disabled = false;
                 prepare.textContent = "节点安全检测通过并已安装";
-                maybeAppendExecute();
+                void refreshRunStatus().then(() => maybeAppendExecute());
               }).catch((error) => {
                 prepare.disabled = false;
                 if (error?.payload?.security) showNodeSecurityReview(error);
@@ -1760,7 +1801,8 @@ function workflowCandidateCard(jobId, candidate) {
           })
           .catch(() => {});
       }
-      card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-next-step", "节点安装需单独确认；模型可优先选择本地相似量化文件，也可搜索并选择包含目标文件的仓库，选定远程来源后会立即下载该文件。"));
+      card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-next-step", "节点安装需单独确认；模型可优先选择本地相似量化文件，也可搜索并选择包含目标文件的仓库，选定远程来源后会立即下载该文件。只有依赖检查通过后才会显示运行按钮。"));
+      void refreshRunStatus().then(() => maybeAppendExecute());
       maybeAppendExecute();
       } catch (error) {
       action.disabled = false;
@@ -1768,10 +1810,17 @@ function workflowCandidateCard(jobId, candidate) {
     }
   };
   card.appendChild(action);
+  if (options.autoPrepare) {
+    action.textContent = "正在检查工作流…";
+    action.dataset.restore = "true";
+    queueMicrotask(() => action.click());
+  }
   // The conversation transcript contains the candidate, while selection,
   // source choice, and download progress live in the persisted workflow job.
   // Re-entering the conversation must therefore restore the selected card
-  // instead of asking the user to select it again.
+  // instead of asking the user to select it again. Uploaded workflows start
+  // this same preparation flow automatically after the safe copy.
+  if (options.autoRestore === false) return card;
   void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}`)
     .then((job) => {
       // A failed job must be rendered even when the selected candidate field
@@ -1864,6 +1913,69 @@ function appendWorkflowCandidates(content, article) {
   article.appendChild(list);
 }
 
+function parseToolResult(content) {
+  try {
+    const parsed = JSON.parse(String(content || ""));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function workflowInstallCard(content) {
+  const result = parseToolResult(content) || {};
+  const failed = Boolean(result.error) || result.status === "failed";
+  const card = el("div", `cline-workflow-install-card ${failed ? "failed" : "installed"}`);
+  const heading = el("div", "cline-workflow-install-heading");
+  heading.appendChild(el("strong", "", "工作流安装"));
+  heading.appendChild(el("span", `cline-workflow-install-status ${failed ? "failed" : "installed"}`, failed ? "安装失败" : "安装成功"));
+  card.appendChild(heading);
+
+  if (failed) {
+    card.appendChild(el("p", "cline-workflow-install-error", String(result.error || "工作流安装失败。")));
+    card.appendChild(el("p", "cline-workflow-install-hint", "请修复问题或更换文件名后重试；原上传文件不会被删除。"));
+    return card;
+  }
+
+  const source = String(result.source || "");
+  const destination = String(result.destination || "");
+  const fileName = source.split("/").filter(Boolean).pop() || destination.split(/[\\/]/).filter(Boolean).pop() || "未命名工作流";
+  const details = el("div", "cline-workflow-install-details");
+  const fields = [
+    ["文件", fileName],
+    ["格式", result.format || "未知"],
+    ["节点", `${Number(result.node_count) || 0} 个`],
+    ["模型引用", `${Number(result.model_count) || 0} 个`],
+    ["目标", destination || "ComfyUI 用户工作流目录"],
+  ];
+  for (const [label, value] of fields) {
+    const row = el("div", "cline-workflow-install-detail");
+    row.appendChild(el("span", "cline-workflow-install-label", label));
+    row.appendChild(el("span", "cline-workflow-install-value", String(value)));
+    details.appendChild(row);
+  }
+  card.appendChild(details);
+
+  const safety = el("div", "cline-workflow-install-safety");
+  safety.appendChild(el("strong", "", "安全说明"));
+  for (const text of ["未执行工作流", "未安装节点", "未下载模型", "未覆盖同名文件"]) {
+    safety.appendChild(el("span", "cline-workflow-install-safe-item", `✓ ${text}`));
+  }
+  card.appendChild(safety);
+  if (result.workflow_job_id && result.candidate_id && result.candidate) {
+    const preparation = el("div", "cline-workflow-install-preparation");
+    preparation.appendChild(el("strong", "cline-workflow-install-preparation-title", "工作流准备"));
+    preparation.appendChild(el("p", "cline-workflow-install-next-step", "文件已安全复制，正在按普通工作流卡片流程检查节点和模型依赖；不会自动执行工作流。"));
+    preparation.appendChild(workflowCandidateCard(
+      result.workflow_job_id,
+      result.candidate,
+      { uploaded: true, autoRestore: false, autoPrepare: true, forceInspection: true },
+    ));
+    card.appendChild(preparation);
+  }
+  return card;
+}
+
 function toolResultView(content) {
   const text = String(content || "");
   const limit = 2400;
@@ -1893,12 +2005,25 @@ function renderMessages() {
       : "创建或选择一个任务，然后描述要检查、规划或修改的内容。Plan 模式只允许读取或浏览；Act 模式会直接执行允许的写入、命令及外部工具调用。"));
     log.appendChild(welcome);
   }
+  const toolNames = new Map();
+  for (const message of messages) {
+    for (const call of message.tool_calls || []) {
+      const callId = String(call.id || "").trim();
+      const name = String(call.function?.name || "").trim();
+      if (callId && name) toolNames.set(callId, name);
+    }
+  }
   for (const message of messages) {
     const role = message.role || "assistant";
     const article = el("article", `cline-message ${role}`);
     article.appendChild(el("div", "cline-message-role", role === "user" ? "你" : role === "assistant" ? "Omniscience" : "工具结果"));
     const content = el("div", "cline-message-content");
-    content.appendChild(role === "tool" ? toolResultView(message.content || "") : lines(message.content || ""));
+    const toolName = role === "tool" ? toolNames.get(String(message.tool_call_id || "")) : "";
+    const isWorkflowInstall = role === "tool" && (
+      toolName === "install_uploaded_workflow"
+      || message.tool_call_id === "workflow-install-fallback"
+    );
+    content.appendChild(isWorkflowInstall ? workflowInstallCard(message.content || "") : role === "tool" ? toolResultView(message.content || "") : lines(message.content || ""));
     article.appendChild(content);
     appendWorkflowCandidates(message.content, article);
     if (message.tool_calls?.length) {
@@ -2336,10 +2461,71 @@ function selectSkillFromMenu(skillId) {
   input?.focus();
 }
 
+function toolCommand(value) {
+  if (!state.globalChatActive) return null;
+  const match = String(value || "").match(/(?:^|\s)@([^\s]*)$/);
+  if (!match) return null;
+  const raw = match[1] || "";
+  const query = raw.toLocaleLowerCase();
+  if (query && !"workflow".startsWith(query) && !"node".startsWith(query)) return null;
+  return {
+    query,
+    start: match.index + match[0].lastIndexOf("@"),
+    end: match.index + match[0].lastIndexOf("@") + raw.length + 1,
+  };
+}
+
+function matchingTools() {
+  const query = state.toolQuery.trim().toLocaleLowerCase();
+  return [
+    { id: "workflow", label: "@workflow", description: "安装最近上传的 JSON 工作流" },
+    { id: "node", label: "@node", description: "节点安装（后续支持）", disabled: true },
+  ].filter((tool) => !query || tool.id.startsWith(query));
+}
+
+function resetToolMenu() {
+  state.toolMenuOpen = false;
+  state.toolQuery = "";
+  state.toolMenuIndex = 0;
+}
+
+function renderToolMenu(area) {
+  area.querySelector(".cline-tool-command-menu")?.remove();
+  if (!state.toolMenuOpen) return;
+  const menu = el("div", "cline-tool-command-menu");
+  const matches = matchingTools();
+  if (!matches.length) {
+    menu.appendChild(el("p", "cline-hint", "没有匹配的工具。"));
+  } else {
+    const list = el("div", "cline-tool-command-list");
+    matches.forEach((tool, index) => {
+      const item = button("", `cline-tool-command-item${index === state.toolMenuIndex ? " active" : ""}`);
+      item.disabled = !!tool.disabled;
+      item.append(el("strong", "", tool.label), el("span", "cline-tool-command-description", tool.description));
+      if (!tool.disabled) item.onclick = () => selectToolFromMenu(tool.id);
+      list.appendChild(item);
+    });
+    menu.appendChild(list);
+  }
+  area.appendChild(menu);
+}
+
+function selectToolFromMenu(toolId) {
+  if (toolId !== "workflow") return;
+  const input = composerInput();
+  const command = toolCommand(input?.value || "");
+  if (input && command) input.value = `${input.value.slice(0, command.start)}@workflow `;
+  resetToolMenu();
+  resetFileMenu();
+  input?.dispatchEvent(new Event("input"));
+  input?.focus();
+}
+
 function fileCommand(value) {
   const match = String(value || "").match(/(?:^|\s)@([^\s]*)$/);
   if (!match) return null;
   const raw = match[1] || "";
+  if (!raw || /^(?:workflow|node)$/i.test(raw)) return null;
   return { query: raw, start: match.index + match[0].lastIndexOf("@") };
 }
 
@@ -2347,6 +2533,7 @@ function resetFileMenu() {
   state.fileMenuOpen = false;
   state.fileQuery = "";
   state.fileMenuIndex = 0;
+  resetToolMenu();
 }
 
 function matchingFiles() {
@@ -2405,6 +2592,7 @@ function selectFileFromMenu(path) {
 function renderFileMenu() {
   const area = document.querySelector(`#${PANEL_ID} .cline-composer-actions`);
   if (!area) return;
+  renderToolMenu(area);
   area.querySelector(".cline-file-command-menu")?.remove();
   const upload = area.querySelector(".cline-upload-file");
   const mention = area.querySelector(".cline-mention-file");
@@ -2448,6 +2636,11 @@ function uploadEndpoint() {
   return state.globalChatActive
     ? "/cline/global/upload"
     : `/cline/tasks/${encodeURIComponent(currentTaskId())}/upload`;
+}
+
+function workflowSourceFromContent(content) {
+  const match = String(content || "").match(/(?:^|\s)@?(uploads\/[^\s@]+\.json)(?=$|\s)/i);
+  return match ? match[1].replace(/\\/g, "/") : "";
 }
 
 async function uploadFilesToTask(files) {
@@ -2508,7 +2701,9 @@ async function toggleNetworkAccess() {
 
 async function expandFileMentions(content) {
   if (!composerHasScope()) return "";
-  const paths = [...new Set([...String(content || "").matchAll(/(?:^|\s)@([^\s@]+)/g)].map((match) => match[1]))];
+  const paths = [...new Set([...String(content || "").matchAll(/(?:^|\s)@([^\s@]+)/g)]
+    .map((match) => match[1])
+    .filter((path) => !/^(?:workflow|node)$/i.test(path)))];
   const chunks = [];
   const scopeQuery = state.globalChatActive ? "scope=global" : `task_id=${encodeURIComponent(currentTaskId())}`;
   for (const path of paths) {
@@ -2774,7 +2969,12 @@ async function sendMessage() {
       renderPanel();
       const result = await request("/cline/global-chat/messages", {
         method: "POST",
-        body: JSON.stringify({ content, skill_ids: [...state.selectedSkillIds], context: mentioned }),
+        body: JSON.stringify({
+          content,
+          skill_ids: [...state.selectedSkillIds],
+          context: mentioned,
+          workflow_source: workflowSourceFromContent(content),
+        }),
       });
       state.globalMessages = result.messages || [...state.globalMessages, result.message].filter(Boolean);
       try {
@@ -3647,6 +3847,32 @@ function buildPanel() {
   textarea.placeholder = "描述你要完成的编程任务…";
   textarea.rows = 3;
   textarea.onkeydown = (event) => {
+    if (state.toolMenuOpen) {
+      const matches = matchingTools();
+      if (event.key === "ArrowDown" && matches.length) {
+        event.preventDefault();
+        state.toolMenuIndex = (state.toolMenuIndex + 1) % matches.length;
+        renderFileMenu();
+        return;
+      }
+      if (event.key === "ArrowUp" && matches.length) {
+        event.preventDefault();
+        state.toolMenuIndex = (state.toolMenuIndex - 1 + matches.length) % matches.length;
+        renderFileMenu();
+        return;
+      }
+      if (event.key === "Enter" && !event.metaKey && !event.ctrlKey && matches.length) {
+        event.preventDefault();
+        if (!matches[state.toolMenuIndex]?.disabled) selectToolFromMenu(matches[state.toolMenuIndex]?.id || matches[0].id);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        resetToolMenu();
+        renderFileMenu();
+        return;
+      }
+    }
     if (state.fileMenuOpen) {
       const matches = matchingFiles();
       if (event.key === "ArrowDown" && matches.length) {
@@ -3705,11 +3931,16 @@ function buildPanel() {
   };
   textarea.oninput = () => {
     const command = skillCommand(textarea.value);
-    const mention = command ? null : fileCommand(textarea.value);
+    const tool = command ? null : toolCommand(textarea.value);
+    const mention = command || tool ? null : fileCommand(textarea.value);
     state.skillMenuOpen = !!command;
     state.skillQuery = command?.query || "";
     const matches = matchingSkills();
     state.skillMenuIndex = Math.min(state.skillMenuIndex, Math.max(0, matches.length - 1));
+    state.toolMenuOpen = !!tool;
+    state.toolQuery = tool?.query || "";
+    const toolMatches = matchingTools();
+    state.toolMenuIndex = Math.min(state.toolMenuIndex, Math.max(0, toolMatches.length - 1));
     state.fileMenuOpen = !!mention;
     state.fileQuery = mention?.query || "";
     state.fileMenuIndex = 0;
@@ -3744,6 +3975,7 @@ function buildPanel() {
       textarea.value = `${value}${needsSpace ? " " : ""}@`;
     }
     state.fileMenuOpen = true;
+    resetToolMenu();
     state.fileQuery = "";
     state.fileMenuIndex = 0;
     textarea.dispatchEvent(new Event("input"));

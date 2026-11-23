@@ -7,6 +7,7 @@ keeps the historical ``WorkflowManagerMixin`` import path stable for callers.
 from .workflow_manager_common import *
 from .workflow_manager_dependencies import WorkflowDependencyMixin
 from .workflow_manager_execution import WorkflowExecutionMixin
+from .workflow_manager_install import WorkflowInstallMixin
 from .workflow_manager_inspection import WorkflowInspectionMixin
 from .workflow_manager_model_download import WorkflowModelDownloadMixin
 from .workflow_manager_model_files import WorkflowModelFilesMixin
@@ -32,5 +33,6 @@ class WorkflowManagerMixin(
     WorkflowNodeInstallMixin,
     WorkflowModelDownloadMixin,
     WorkflowExecutionMixin,
+    WorkflowInstallMixin,
 ):
     """Compatibility facade combining the workflow manager responsibilities."""

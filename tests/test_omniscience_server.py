@@ -29,6 +29,8 @@ from omniscience_server import (
 from omniscience import access_tokens, archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
 from omniscience import model_downloader, model_source, node_search, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
+from omniscience.workflow_manager_install import WorkflowInstallMixin
+from omniscience.tools.defs import global_chat_definitions
 from omniscience_core import CheckpointManager, ContextManager, SkillStore, TaskStore
 from omniscience_mcp import MCPManager
 
@@ -1807,6 +1809,152 @@ class NodeInstallRequestTests(unittest.TestCase):
         self.assertFalse(GlobalChatAgent._install_node_source_allowed(archive, "uploads/other.zip"))
 
 
+class WorkflowInstallRequestTests(unittest.TestCase):
+    def test_request_detection_and_tool_surface(self):
+        self.assertTrue(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "@workflow"))
+        self.assertTrue(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "帮我安装这个工作流"))
+        self.assertTrue(
+            GlobalChatAgent.workflow_install_requested(
+                GlobalChatAgent, "导入 @uploads/photo-style.json"
+            )
+        )
+        self.assertFalse(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "帮我安装 MOSS 文生图工作流"))
+        self.assertFalse(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "我需要搜索一个工作流"))
+        self.assertFalse(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "不要安装这个工作流"))
+        names = [
+            item["function"]["name"]
+            for item in global_chat_definitions(
+                install_requested=False,
+                node_install_requested=False,
+                workflow_requested=True,
+                workflow_install_requested=False,
+                network_enabled=False,
+            )
+        ]
+        self.assertIn("search_runninghub_workflows", names)
+        self.assertNotIn("install_uploaded_workflow", names)
+
+
+class GlobalWorkflowSearchRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def _agent(self, root):
+        from omniscience import paths
+
+        workspace = root / "workspace"
+        workspace.mkdir()
+        settings = SettingsStore(root / "settings.json")
+        settings.update({"workspace": str(workspace), "model": "global-test-model"})
+        old = (paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY)
+        paths.TASK_DATABASE = root / "tasks.sqlite3"
+        paths.SKILL_DATABASE = root / "skills.sqlite3"
+        paths.STATE_DIRECTORY = root / "state"
+        return GlobalChatAgent(settings), old
+
+    async def test_installing_named_workflow_keeps_runninghub_search_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, old_paths = self._agent(Path(directory))
+            captured_tools = []
+            searched = []
+
+            async def search(query, *, limit=10, filters=None, region=None):
+                searched.append((query, limit, filters, region))
+                return {"status": "not_found", "candidates": [], "query": query}
+
+            async def model_call(messages, tools=None, **kwargs):
+                captured_tools.append(tools or [])
+                if not any(message.get("role") == "tool" for message in messages):
+                    return {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [{
+                                    "id": "search-1",
+                                    "function": {
+                                        "name": "search_runninghub_workflows",
+                                        "arguments": json.dumps({"query": "MOSS 文生图"}),
+                                    },
+                                }],
+                            }
+                        }]
+                    }
+                return {"choices": [{"message": {"content": "已完成搜索。"}}]}
+
+            agent.search_runninghub_workflows = search
+            agent.model._call_model = model_call
+            try:
+                result = await agent.chat("帮我安装 MOSS 文生图工作流", [], "")
+                names = [item["function"]["name"] for item in captured_tools[0]]
+                self.assertIn("search_runninghub_workflows", names)
+                self.assertNotIn("install_uploaded_workflow", names)
+                self.assertEqual(searched[0][0], "MOSS 文生图")
+                self.assertEqual(result["message"]["content"], "已完成搜索。")
+            finally:
+                paths.TASK_DATABASE, paths.SKILL_DATABASE, paths.STATE_DIRECTORY = old_paths
+
+
+class _TestWorkflowInstaller(WorkflowInstallMixin):
+    def __init__(self, workspace: Path, settings: SettingsStore):
+        self._workspace = Workspace(workspace)
+        self.settings = settings
+        self.store = TaskStore(workspace / "tasks.sqlite3")
+
+    def chat_workspace(self):
+        return self._workspace
+
+
+class UploadedWorkflowInstallTests(unittest.TestCase):
+    def test_valid_upload_is_validated_and_copied_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            global_workspace = root / "global"
+            (global_workspace / "uploads").mkdir(parents=True)
+            comfyui = root / "ComfyUI"
+            comfyui.mkdir()
+            settings = SettingsStore(root / "settings.json")
+            settings.update({"workspace": str(root / "workspace"), "comfyui_directory": str(comfyui)})
+            workflow = {"prompt": {"1": {"class_type": "ExampleNode", "inputs": {}}}}
+            source = global_workspace / "uploads" / "photo-style.json"
+            source.write_text(json.dumps(workflow), encoding="utf-8")
+            installer = _TestWorkflowInstaller(global_workspace, settings)
+
+            result = installer.install_uploaded_workflow("uploads/photo-style.json")
+
+            destination = comfyui / "user" / "default" / "workflows" / "photo-style.json"
+            self.assertEqual(result["status"], "installed")
+            self.assertEqual(result["format"], "api")
+            self.assertEqual(result["node_count"], 1)
+            self.assertTrue(result["workflow_job_id"])
+            self.assertEqual(result["candidate"]["id"], result["candidate_id"])
+            job = installer.store.get_workflow_job(result["workflow_job_id"])
+            self.assertEqual(job["state"], "checking_dependencies")
+            self.assertEqual(job["selected_candidate_id"], result["candidate_id"])
+            self.assertEqual(job["metadata"]["inspection"]["format"], "api")
+            self.assertEqual(job["metadata"]["workflow"], workflow)
+            self.assertEqual(destination.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertFalse(result["executed"])
+            with self.assertRaisesRegex(ValueError, "已存在"):
+                installer.install_uploaded_workflow("uploads/photo-style.json")
+
+    def test_invalid_and_outside_sources_are_rejected_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            global_workspace = root / "global"
+            (global_workspace / "uploads").mkdir(parents=True)
+            comfyui = root / "ComfyUI"
+            comfyui.mkdir()
+            settings = SettingsStore(root / "settings.json")
+            settings.update({"workspace": str(root / "workspace"), "comfyui_directory": str(comfyui)})
+            (global_workspace / "uploads" / "not-workflow.json").write_text("{}", encoding="utf-8")
+            (root / "outside.json").write_text("{}", encoding="utf-8")
+            installer = _TestWorkflowInstaller(global_workspace, settings)
+
+            with self.assertRaises(ValueError):
+                installer.install_uploaded_workflow("uploads/not-workflow.json")
+            with self.assertRaises(ValueError):
+                installer.install_uploaded_workflow("../outside.json")
+            self.assertFalse((comfyui / "user").exists())
+
+
 class WorkflowParserTests(unittest.TestCase):
     def test_legacy_loader_inputs_accept_model_suffix_fallback_but_ignore_non_loader_fields(self):
         from omniscience.workflow_parser import inspect_workflow
@@ -3392,6 +3540,117 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["inspection"]["installable_missing_nodes"], [])
         self.assertEqual(result["inspection"]["frontend_only_nodes"], ["SetNode"])
         self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "checking_dependencies")
+
+    async def test_uploaded_workflow_inspection_uses_persisted_json_without_runninghub(self):
+        workflow = {"prompt": {"1": {"class_type": "UploadedNode", "inputs": {}}}}
+        candidate = {
+            "id": "uploaded-candidate",
+            "title": "uploaded",
+            "source_type": "uploaded",
+            "execution_mode": "local",
+            "node_sources": [],
+            "model_sources": [],
+        }
+        self.agent.store.save_workflow_candidates(self.job["id"], [candidate])
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            selected_candidate_id=candidate["id"],
+            metadata={"candidate": candidate, "workflow": workflow},
+        )
+        with patch.object(
+            workflow_manager.RunningHubProvider,
+            "get_workflow",
+            side_effect=AssertionError("uploaded workflows must not use RunningHub"),
+        ), patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value={}):
+            result = await self.agent.inspect_selected_workflow(self.job["id"])
+
+        self.assertEqual(result["status"], "checked")
+        self.assertEqual(result["workflow"], workflow)
+        self.assertEqual(result["inspection"]["format"], "api")
+
+    async def test_workflow_inspection_reads_model_folders_off_the_event_loop(self):
+        workflow = {"prompt": {"1": {"class_type": "UploadedNode", "inputs": {}}}}
+        candidate = {
+            "id": "uploaded-candidate",
+            "title": "uploaded",
+            "source_type": "uploaded",
+            "execution_mode": "local",
+            "node_sources": [],
+            "model_sources": [],
+        }
+        self.agent.store.save_workflow_candidates(self.job["id"], [candidate])
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            selected_candidate_id=candidate["id"],
+            metadata={"candidate": candidate, "workflow": workflow},
+        )
+        called_from = []
+
+        def model_folders(_comfyui_root):
+            called_from.append(threading.current_thread().name)
+            return {}, "legacy", ""
+
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "object_info",
+            return_value={},
+        ), patch.object(
+            workflow_manager.WorkflowManagerMixin,
+            "_model_folders",
+            side_effect=model_folders,
+        ):
+            result = await self.agent.inspect_selected_workflow(self.job["id"])
+
+        self.assertEqual(result["status"], "checked")
+        self.assertEqual(len(called_from), 1)
+        self.assertNotEqual(called_from[0], threading.current_thread().name)
+
+    def test_dependency_plan_exposes_run_readiness_and_blockers(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata.update({
+            "candidate": {"id": "candidate", "source_type": "uploaded", "execution_mode": "local"},
+            "inspection": {
+                "loaded_nodes_checked": True,
+                "missing_nodes": ["MissingNode"],
+                "missing_node_instances": [{"id": "1", "class_type": "MissingNode", "aux_id": "", "properties": {}}],
+                "unverified_nodes": [],
+                "models": [{
+                    "name": "missing.safetensors",
+                    "directory": "checkpoints",
+                    "local_status": "missing",
+                    "loader_status": "unrecognized",
+                }],
+            },
+        })
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        blocked = self.agent.dependency_plan(self.job["id"])
+
+        self.assertFalse(blocked["can_run"])
+        self.assertFalse(blocked["node_dependencies_ready"])
+        self.assertFalse(blocked["model_dependencies_ready"])
+        self.assertTrue(any("缺少节点" in item for item in blocked["run_blockers"]))
+        self.assertTrue(any("缺少模型" in item for item in blocked["run_blockers"]))
+
+    def test_dependency_plan_marks_checked_workflow_without_dependencies_runnable(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata.update({
+            "candidate": {"id": "candidate", "source_type": "uploaded", "execution_mode": "local"},
+            "inspection": {
+                "loaded_nodes_checked": True,
+                "missing_nodes": [],
+                "unverified_nodes": [],
+                "models": [],
+            },
+        })
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        plan = self.agent.dependency_plan(self.job["id"])
+
+        self.assertTrue(plan["can_run"])
+        self.assertTrue(plan["node_dependencies_ready"])
+        self.assertTrue(plan["model_dependencies_ready"])
+        self.assertEqual(plan["run_blockers"], [])
 
     async def test_dependency_plan_refreshes_legacy_inspection_before_building_node_card(self):
         workflow = {
@@ -5555,6 +5814,63 @@ class NodeInstallRouteTests(unittest.IsolatedAsyncioTestCase):
                 deps._TASK_AGENT = previous_agent
 
 
+class WorkflowLocalModelRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_model_inventory_route_runs_off_the_event_loop(self):
+        from omniscience.api import deps
+
+        recorder = _registered_routes()
+        route = recorder.handlers[("GET", "/cline/global-chat/workflows/{job_id}/dependencies/models/local")]
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        called_from = []
+
+        class Agent:
+            def local_model_inventory(self, job_id):
+                called_from.append(threading.current_thread().name)
+                return {"status": "ok", "job_id": job_id, "models": []}
+
+        deps._GLOBAL_CHAT_AGENT = Agent()
+        try:
+            response = await route(_FakeRequest(match_info={"job_id": "job-1"}))
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.text)["job_id"], "job-1")
+        self.assertEqual(len(called_from), 1)
+        self.assertNotEqual(called_from[0], threading.current_thread().name)
+
+    async def test_local_model_selection_route_runs_off_the_event_loop(self):
+        from omniscience.api import deps
+
+        recorder = _registered_routes()
+        route = recorder.handlers[("POST", "/cline/global-chat/workflows/{job_id}/dependencies/models/local")]
+        previous_agent = deps._GLOBAL_CHAT_AGENT
+        called_from = []
+
+        class Agent:
+            def select_workflow_local_model(self, job_id, name, path):
+                called_from.append(threading.current_thread().name)
+                return {"status": "local_model_selected", "job_id": job_id, "name": name, "path": path}
+
+        deps._GLOBAL_CHAT_AGENT = Agent()
+        try:
+            response = await route(
+                _FakeRequest(
+                    {"name": "model.safetensors", "path": "checkpoints/model.safetensors"},
+                    {"job_id": "job-2"},
+                )
+            )
+        finally:
+            deps._GLOBAL_CHAT_AGENT = previous_agent
+
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.text)
+        self.assertEqual(payload["job_id"], "job-2")
+        self.assertEqual(payload["path"], "checkpoints/model.safetensors")
+        self.assertEqual(len(called_from), 1)
+        self.assertNotEqual(called_from[0], threading.current_thread().name)
+
+
 class GitHubSkillSecurityTests(unittest.TestCase):
     """Repository content is scanned before anything reaches the Skill library."""
 
@@ -7422,6 +7738,49 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn('request("/cline/skills/scan"', source)
         for selector in ("cline-security-badge", "cline-security-report", "cline-severity"):
             self.assertIn(f".{selector}", style)
+
+    def test_global_workflow_install_ui_is_wired(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+        self.assertIn("function toolCommand(value)", source)
+        self.assertIn('if (!state.globalChatActive) return null;', source)
+        self.assertIn('label: "@workflow"', source)
+        self.assertIn('label: "@node"', source)
+        self.assertIn("workflow_source: workflowSourceFromContent(content)", source)
+        self.assertIn("function workflowSourceFromContent(content)", source)
+        self.assertIn("function renderToolMenu(area)", source)
+        self.assertIn("cline-tool-command-menu", style)
+
+    def test_global_workflow_install_result_has_a_dedicated_card(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+        self.assertIn("function parseToolResult(content)", source)
+        self.assertIn("function workflowInstallCard(content)", source)
+        self.assertIn('toolName === "install_uploaded_workflow"', source)
+        self.assertIn('message.tool_call_id === "workflow-install-fallback"', source)
+        self.assertIn('"安装成功"', source)
+        self.assertIn('"安装失败"', source)
+        self.assertIn('"未执行工作流"', source)
+        self.assertIn('"未安装节点"', source)
+        self.assertIn('"未下载模型"', source)
+        self.assertIn('"未覆盖同名文件"', source)
+        self.assertIn("workflowCandidateCard(", source)
+        self.assertIn("{ uploaded: true, autoRestore: false, autoPrepare: true, forceInspection: true }", source)
+        self.assertIn("result.workflow_job_id", source)
+        self.assertIn("result.candidate_id", source)
+        self.assertLess(
+            source.index('const preparation = el("div", "cline-workflow-install-preparation");'),
+            source.index('preparation.appendChild(el("p", "cline-workflow-install-next-step"'),
+        )
+        for selector in (
+            ".cline-workflow-install-card",
+            ".cline-workflow-install-status",
+            ".cline-workflow-install-details",
+            ".cline-workflow-install-safety",
+        ):
+            self.assertIn(selector, style)
 
     def test_node_security_ui_is_wired(self):
         root = Path(__file__).resolve().parents[1]

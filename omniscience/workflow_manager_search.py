@@ -81,6 +81,22 @@ class WorkflowSearchMixin:
         # search tool even when the user did not use a verb like “搜索”.
         return not bool(re.search(r"不要|无需|不需要|别|禁止|don't|do not", text))
 
+    def workflow_install_requested(self, content: Any) -> bool:
+        """Whether this turn explicitly asks to install an uploaded workflow."""
+        text = str(content or "").casefold()
+        if re.search(r"(?:^|\s)@workflow(?:\s|$)", text):
+            return not bool(re.search(r"(?:不要|无需|不需要|别|禁止|don't|do not)", text))
+        # A generic request such as “安装 MOSS 文生图工作流” still needs the
+        # RunningHub search flow.  Only an explicit uploaded JSON path denotes
+        # the separate local-install flow.
+        if not re.search(r"@?uploads/[^\s@]+\.json", text):
+            return False
+        if re.search(r"节点|node|插件|plugin", text):
+            return False
+        return bool(re.search(r"安装|装上|导入|添加|加载|放入|install|import|add|load", text)) and not bool(
+            re.search(r"(?:不要|无需|不需要|别|禁止|don't|do not).{0,24}(?:安装|导入|添加|加载|install|import|add|load)", text)
+        )
+
 
     def _record_workflow_execution_failure(
         self,

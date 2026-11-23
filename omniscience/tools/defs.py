@@ -184,6 +184,26 @@ GLOBAL_CHAT_WORKFLOW_DEFINITIONS: list[dict[str, Any]] = [
     ),
 ]
 
+GLOBAL_CHAT_WORKFLOW_INSTALL_DEFINITIONS: list[dict[str, Any]] = [
+    _function(
+        "install_uploaded_workflow",
+        (
+            "Install one user-uploaded ComfyUI workflow JSON into ComfyUI's user workflow library. "
+            "Call only when the user explicitly asked to install/import a workflow or used @workflow. "
+            "The source must be the exact uploaded path under uploads/ supplied for this message. "
+            "The JSON is parsed and validated before it is copied; this never executes the workflow, "
+            "installs custom nodes, downloads models, or overwrites an existing same-named file."
+        ),
+        {
+            "source": {
+                "type": "string",
+                "description": "Exact global workspace path of the uploaded JSON, for example uploads/my-workflow.json.",
+            }
+        },
+        ["source"],
+    )
+]
+
 
 GLOBAL_CHAT_FILE_TOOL_DEFINITIONS: list[dict[str, Any]] = FILE_TOOL_DEFINITIONS
 
@@ -218,6 +238,7 @@ def global_chat_definitions(
     network_enabled: bool,
     node_install_requested: bool = False,
     workflow_requested: bool = False,
+    workflow_install_requested: bool = False,
 ) -> list[dict[str, Any]]:
     """Tool surface for the task-independent conversation."""
     tools: list[dict[str, Any]] = list(GLOBAL_CHAT_FILE_TOOL_DEFINITIONS)
@@ -227,6 +248,8 @@ def global_chat_definitions(
         tools += GLOBAL_CHAT_NODE_INSTALL_DEFINITIONS
     if workflow_requested:
         tools += GLOBAL_CHAT_WORKFLOW_DEFINITIONS
+    if workflow_install_requested:
+        tools += GLOBAL_CHAT_WORKFLOW_INSTALL_DEFINITIONS
     if network_enabled:
         tools += GLOBAL_CHAT_BROWSER_TOOL_DEFINITIONS
     return tools

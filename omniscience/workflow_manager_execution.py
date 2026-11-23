@@ -220,6 +220,14 @@ class WorkflowExecutionMixin:
             execution_mode = str(candidate.get("execution_mode") or "local").lower()
             if execution_mode in {"remote", "cloud", "api", "hosted"} or candidate.get("remote_endpoint"):
                 raise ValueError("该工作流需要非本地模型或云端推理，请使用候选卡片显示的远程服务，不会在本机 ComfyUI 上执行。")
+            inspection = metadata.get("inspection")
+            if isinstance(inspection, dict) and (
+                candidate.get("source_type") == "uploaded" or "loaded_nodes_checked" in inspection
+            ):
+                dependency_plan = await asyncio.to_thread(self.dependency_plan, job["id"])
+                if not dependency_plan.get("can_run"):
+                    blockers = dependency_plan.get("run_blockers") or ["工作流依赖尚未准备完成"]
+                    raise ValueError("工作流还不能运行：" + "；".join(str(item) for item in blockers[:5]))
             # Resource assessments are heuristics used for search ranking.  A
             # candidate may have been selected hours ago, and an old estimate
             # must not turn the execute button into a generic preparation error.

@@ -178,7 +178,6 @@ class WorkflowInspectionMixin:
         candidate = self.store.workflow_candidate(job["id"], job.get("selected_candidate_id"))
         if candidate is None:
             raise ValueError("请先选择一个工作流候选。")
-        provider = RunningHubProvider(self.settings)
         node_info: dict[str, Any] | None = None
         if loaded_nodes is None:
             loaded_nodes_error = ""
@@ -194,7 +193,13 @@ class WorkflowInspectionMixin:
         else:
             loaded_nodes_checked = True
             loaded_nodes_error = ""
-        workflow = await asyncio.to_thread(provider.get_workflow, candidate)
+        if candidate.get("source_type") == "uploaded":
+            workflow = (job.get("metadata") or {}).get("workflow")
+            if not isinstance(workflow, dict):
+                raise ValueError("上传工作流的内容已不存在，无法重新检查。")
+        else:
+            provider = RunningHubProvider(self.settings)
+            workflow = await asyncio.to_thread(provider.get_workflow, candidate)
         report = inspect_workflow(
             workflow,
             loaded_nodes=loaded_nodes,
@@ -210,7 +215,16 @@ class WorkflowInspectionMixin:
         # execution preflight and is performed by execute_workflow instead.
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
-        folders, folder_source, folder_warning = self._model_folders(comfyui_root)
+        # ``_model_folders`` may call ComfyUI's /internal/folder_paths endpoint.
+        # The workflow inspection handler itself runs on ComfyUI's aiohttp event
+        # loop, so doing this synchronously here would deadlock that loop while
+        # waiting for a request served by the same process and surface as a
+        # browser-side "Fetch timeout".  Keep all blocking local HTTP/filesystem
+        # work off the event loop, just like the /object_info request above.
+        folders, folder_source, folder_warning = await asyncio.to_thread(
+            self._model_folders,
+            comfyui_root,
+        )
         for model in report.get("models", []):
             category = self._model_category(model, workflow)
             metadata_directory_invalid = bool(model.get("metadata_directory_invalid")) or self._model_directory_invalid(model)

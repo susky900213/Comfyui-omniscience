@@ -105,6 +105,10 @@
 .cline-workflow-execute { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
 .cline-workflow-load-canvas { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
 .cline-workflow-candidate.completed { border-color: #4d9b79; background: #21382f; }
+.cline-workflow-candidate.ready { border-color: #4d9b79; background: #21382f; }
+.cline-workflow-run-status { font-weight: 600; }
+.cline-workflow-run-status.ready { color: #9be0b7; }
+.cline-workflow-run-status.blocked { color: #f0a8a8; }
 .cline-workflow-candidate.failed { border-color: #a75a5a; background: #39252b; }
 .cline-workflow-execution-error { margin-top: 8px; padding: 8px; border: 1px solid #8d4e58; border-radius: 6px; background: #2e2027; }
 .cline-workflow-execution-error strong { color: #ffd1d1; }
@@ -190,6 +194,24 @@
 .cline-message.tool { background: #242630; }
 .cline-message-role { margin-bottom: 5px; color: #a99bf2; font-weight: 600; }
 .cline-tool-calls { margin-top: 8px; color: #aaa5b8; font-size: 11px; }
+.cline-workflow-install-card { margin-top: 4px; border: 1px solid #4c6f5b; border-radius: 8px; padding: 10px; color: #dcefe3; background: #202d27; }
+.cline-workflow-install-card.failed { border-color: #704450; color: #f3d9dd; background: #30232a; }
+.cline-workflow-install-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cline-workflow-install-status { flex: 0 0 auto; border-radius: 999px; padding: 2px 8px; color: #d8f5e5; background: #286046; font-size: 11px; }
+.cline-workflow-install-status.failed { color: #ffd1d1; background: #713b46; }
+.cline-workflow-install-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 5px 10px; margin-top: 9px; font-size: 11px; }
+.cline-workflow-install-detail { display: contents; }
+.cline-workflow-install-label { color: #a9c9b4; }
+.cline-workflow-install-value { min-width: 0; overflow-wrap: anywhere; color: #e7f5eb; }
+.cline-workflow-install-error, .cline-workflow-install-hint { margin: 9px 0 0; overflow-wrap: anywhere; }
+.cline-workflow-install-error { color: #ffb8c0; }
+.cline-workflow-install-hint { color: #d0bac0; font-size: 11px; }
+.cline-workflow-install-safety { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #365241; color: #a9c9b4; font-size: 11px; }
+.cline-workflow-install-safe-item { white-space: nowrap; }
+.cline-workflow-install-next-step { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid #365241; color: #dcefe3; font-size: 11px; line-height: 1.45; }
+.cline-workflow-install-preparation { margin-top: 8px; }
+.cline-workflow-install-preparation-title { display: block; margin-bottom: 6px; color: #e7f5eb; font-size: 11px; }
+.cline-workflow-install-preparation .cline-workflow-candidate { border-color: #426b55; background: #25352d; }
 .cline-line { min-height: 1.45em; }
 .cline-status, .cline-hint, .cline-context-label, .cline-workspace-label { color: #aaa5b8; }
 .cline-context-label { padding: 7px 0; font-size: 12px; }
@@ -216,6 +238,12 @@
 .cline-skill-command-item { display: flex; flex-direction: column; gap: 2px; border: 0; border-radius: 4px; padding: 7px 9px; color: #e9e7f2; background: transparent; text-align: left; cursor: pointer; }
 .cline-skill-command-item:hover, .cline-skill-command-item.active { background: #3b3560; }
 .cline-skill-command-description { overflow: hidden; color: #aaa5b8; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.cline-tool-command-menu { position: absolute; bottom: calc(100% - 2px); left: 0; z-index: 7; width: 100%; border: 1px solid #5a536e; border-radius: 6px; padding: 4px; background: #24212f; box-shadow: 0 5px 15px #0007; }
+.cline-tool-command-list { display: flex; max-height: 190px; flex-direction: column; overflow-y: auto; }
+.cline-tool-command-item { display: flex; flex-direction: column; gap: 2px; border: 0; border-radius: 4px; padding: 7px 9px; color: #e9e7f2; background: transparent; text-align: left; cursor: pointer; }
+.cline-tool-command-item:hover, .cline-tool-command-item.active { background: #3b3560; }
+.cline-tool-command-item:disabled { color: #777285; background: transparent; cursor: not-allowed; }
+.cline-tool-command-description { overflow: hidden; color: #aaa5b8; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .cline-skill-selector-list { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 7px; }
 .cline-skill-check { display: inline-flex; align-items: center; gap: 5px; color: #d5d0e2; cursor: pointer; }
 .cline-skill-check input { accent-color: #7665e6; }

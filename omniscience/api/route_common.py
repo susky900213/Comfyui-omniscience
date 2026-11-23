@@ -11,7 +11,7 @@ FEATURES = [
     "tasks", "global_chat", "cancellation", "checkpoints", "mcp", "browser",
     "live_workflow", "upload", "network_switch", "global_workspace", "skill_security",
     "custom_node_projects", "node_security", "node_install", "workflow_node_search",
-    "workflow_diagnostics",
+    "workflow_diagnostics", "workflow_install",
 ]
 
 

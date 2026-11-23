@@ -137,7 +137,13 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
         available = {skill["id"]: skill for skill in self.skills.list()}
         return [available[skill_id] for skill_id in self._validated_skill_ids(skill_ids) if skill_id in available]
 
-    async def chat(self, content: str, skill_ids: Any = None, context: str = "") -> dict[str, Any]:
+    async def chat(
+        self,
+        content: str,
+        skill_ids: Any = None,
+        context: str = "",
+        workflow_source: str = "",
+    ) -> dict[str, Any]:
         text = str(content or "").strip()
         if not text:
             raise ValueError("请输入对话内容。")
@@ -151,12 +157,26 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                 GLOBAL_CHAT_SYSTEM_PROMPT + self.chat_prompt_note() + skill_prompt(self.selected_skills(selected_skill_ids))
             )
             node_install_requested = self._explicit_node_install_request(text)
-            workflow_requested = self.workflow_search_requested(text)
+            workflow_install_requested = self.workflow_install_requested(text)
+            effective_workflow_source = str(workflow_source or "").strip().replace("\\", "/")
+            if effective_workflow_source:
+                workflow_install_requested = True
+            if workflow_install_requested and not effective_workflow_source:
+                uploaded_match = re.search(r"(?:^|\s)@?(uploads/[^\s@]+\.json)(?=$|\s)", text, re.IGNORECASE)
+                effective_workflow_source = uploaded_match.group(1).replace("\\", "/") if uploaded_match else ""
+            if workflow_install_requested and not effective_workflow_source:
+                effective_workflow_source = self.default_uploaded_workflow_source()
+            workflow_requested = self.workflow_search_requested(text) and not workflow_install_requested
             # A node request must not also offer the Skill installer: the same
             # "install <github link>" phrasing matches both, and the wrong tool
             # would write to the other library.
             install_requested = self._explicit_install_request(text) and not node_install_requested
-            tools = self.chat_tools(install_requested, node_install_requested, workflow_requested)
+            tools = self.chat_tools(
+                install_requested,
+                node_install_requested,
+                workflow_requested,
+                workflow_install_requested,
+            )
             system_prompt += self._tool_catalog(tools)
             tool_names = [tool.get("function", {}).get("name") for tool in tools]
             search_injected = "search_runninghub_workflows" in tool_names
@@ -168,13 +188,14 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
             )
             print(
                 f"[omniscience] global-chat tools: workflow_requested={workflow_requested} "
+                f"workflow_install_requested={workflow_install_requested} "
                 f"search_runninghub_workflows_injected={search_injected} tools={tool_names}",
                 flush=True,
             )
             # "required" only forces the very first call; once a tool result
             # is in the transcript the model must answer with text, otherwise
             # providers keep re-invoking the tool until the step limit.
-            force_tool = install_requested or node_install_requested or workflow_requested
+            force_tool = install_requested or node_install_requested or workflow_requested or workflow_install_requested
             for _ in range(MAX_GLOBAL_CHAT_STEPS):
                 model_messages = self._model_messages(self.store.global_messages(), extra_context)
                 reserved = ContextManager.estimate_tokens(system_prompt) + ContextManager.estimate_tokens(
@@ -204,6 +225,16 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                         result = {"error": str(exc)}
                     self.store.append_global_message(
                         {"role": "tool", "tool_call_id": "workflow-search-fallback", "content": json_text(result)}
+                    )
+                    force_tool = False
+                    continue
+                if not calls and force_tool and workflow_install_requested:
+                    try:
+                        result = self.install_uploaded_workflow(effective_workflow_source)
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                    self.store.append_global_message(
+                        {"role": "tool", "tool_call_id": "workflow-install-fallback", "content": json_text(result)}
                     )
                     force_tool = False
                     continue
@@ -255,6 +286,13 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                             if selected is None or not job or job.get("selected_candidate_id") != candidate_id:
                                 raise ValueError("候选工作流不存在或尚未被用户选择。")
                             result = await self.inspect_selected_workflow(job_id)
+                        elif tool_name == "install_uploaded_workflow":
+                            if not workflow_install_requested:
+                                raise ValueError("只有在用户明确请求安装工作流时才允许调用此工具。")
+                            source = str(arguments.get("source") or effective_workflow_source).strip().replace("\\", "/")
+                            if not effective_workflow_source or source != effective_workflow_source:
+                                raise ValueError("工具参数必须对应本轮待安装的上传工作流文件。")
+                            result = self.install_uploaded_workflow(source)
                         else:
                             result = await self.execute_chat_tool(tool_name, arguments)
                     except Exception as exc:

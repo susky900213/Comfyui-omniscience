@@ -446,13 +446,41 @@ class WorkflowDependencyMixin:
             # card because ComfyUI already knows how to load it.  Keep it only
             # when the current filesystem contains a selectable quantized/local
             # variant; otherwise the old omission behavior remains unchanged.
-            if model.get("loader_status") == "recognized" and not similar_local_candidates:
+            if model.get("loader_status") == "recognized" and not similar_local_candidates and not local_candidates:
                 continue
             planned_models.append(planned)
         # ``models`` is also used below to decide whether the card requires user
         # confirmation.  It must describe the same visible model set as the
         # serialized plan, not the pre-filter inspection list.
         models = planned_models
+        prepared_node_results = job_metadata.get("prepared_node_results") or {}
+        node_dependencies_ready = not nodes or all(
+            isinstance(prepared_node_results.get(str(item.get("class_type") or "")), dict)
+            and prepared_node_results[str(item.get("class_type") or "")].get("node_registered") is True
+            and prepared_node_results[str(item.get("class_type") or "")].get("verification_status") == "loaded"
+            for item in nodes
+        )
+        model_dependencies_ready = all(
+            item.get("status") in {"installed", "selected_local", "recognized"}
+            for item in planned_models
+        )
+        inspection_checked = bool(inspection.get("loaded_nodes_checked"))
+        unverified_dependency_nodes = [str(name) for name in unverified_nodes if str(name).strip()]
+        run_blockers: list[str] = []
+        if not inspection_checked:
+            run_blockers.append("尚未完成 ComfyUI 节点检查")
+        if unverified_dependency_nodes:
+            run_blockers.append("有节点未完成核对：" + "、".join(unverified_dependency_nodes[:8]))
+        if missing_nodes and not node_dependencies_ready:
+            run_blockers.append("缺少节点尚未安装并在 ComfyUI 中注册")
+        missing_model_names = [
+            str(item.get("name") or "")
+            for item in planned_models
+            if item.get("status") not in {"installed", "selected_local", "recognized"}
+        ]
+        if missing_model_names:
+            run_blockers.append("缺少模型尚未准备：" + "、".join(missing_model_names[:8]))
+        can_run = bool(inspection_checked and not unverified_dependency_nodes and node_dependencies_ready and model_dependencies_ready)
         plan = {
             "job_id": job["id"],
             "state": job.get("state"),
@@ -494,8 +522,13 @@ class WorkflowDependencyMixin:
                 item.get("status") in {"installed", "selected_local", "recognized"} or item.get("download_allowed")
                 for item in planned_models
             ),
+            "inspection_checked": inspection_checked,
+            "node_dependencies_ready": node_dependencies_ready,
+            "model_dependencies_ready": model_dependencies_ready,
+            "can_run": can_run,
+            "run_blockers": run_blockers,
             "restart_required": bool(missing_nodes),
-            "requires_user_confirmation": bool(missing_nodes or models),
+            "requires_user_confirmation": not can_run,
             "folder_paths_source": folder_source,
             "folder_paths": {
                 category: [str(path) for path in paths]
