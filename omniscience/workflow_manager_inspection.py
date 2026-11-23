@@ -221,9 +221,16 @@ class WorkflowInspectionMixin:
                 model["metadata_directory_invalid"] = True
             model["directory_invalid"] = directory_invalid
             local_paths = [] if directory_invalid else [
-                str(path) for path in self._local_model_matches(folders, category, model.get("name"))
+                str(path) for path in self._local_model_exact_matches(folders, category, model.get("name"))
             ]
+            similar_local_candidates = [] if directory_invalid else self._local_model_similar_candidates(
+                folders, category, model.get("name")
+            )
             model["local_paths"] = local_paths
+            if similar_local_candidates:
+                model["similar_local_candidates"] = similar_local_candidates
+            else:
+                model.pop("similar_local_candidates", None)
             model["local_status"] = "missing_directory" if directory_invalid else "installed" if local_paths else "missing"
             model["download_status"] = "missing_directory" if directory_invalid else "ready" if local_paths else "source_required"
             model["category"] = category

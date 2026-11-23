@@ -4548,6 +4548,29 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         matches = self.agent._local_model_matches(folders, "vae", "models/vae/flux-vae.safetensors")
         self.assertEqual(matches, [model_file.resolve()])
 
+    def test_local_model_match_accepts_common_quantized_variants(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "checkpoints"
+        model_dir.mkdir(parents=True)
+        variants = [
+            "flux-2-klein-9b-fp8.safetensors",
+            "flux_2_klein_9b-4bit.safetensors",
+            "flux 2 klein 9b-nvfp8.safetensors",
+            "flux-2-klein-9b-6bit.safetensors",
+            "flux-2-klein-9b-q4_k_m.safetensors",
+            "flux-2-klein-9b-mlx4bit.safetensors",
+        ]
+        for name in variants:
+            (model_dir / name).write_bytes(name.encode())
+
+        matches = self.agent._local_model_matches(
+            {"checkpoints": [model_dir.resolve()]},
+            "checkpoints",
+            "flux-2-klein-9b.safetensors",
+        )
+
+        self.assertEqual({path.name for path in matches}, set(variants))
+
     def test_local_model_inventory_preserves_symlinked_model_outside_registered_folder(self):
         comfyui = Path(self.directory.name) / "ComfyUI"
         registered_vae = Path(self.directory.name) / "shared-models" / "vae"
@@ -4562,6 +4585,7 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         except (OSError, NotImplementedError):
             self.skipTest("Symlinks are not available in this environment")
 
+        self._add_missing_models([("moss-vae.safetensors", "vae_name")])
         self.agent.settings.update({"comfyui_directory": str(comfyui)})
         with patch.object(
             workflow_manager.ComfyUIWorkflowExecutor,
@@ -4576,6 +4600,54 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         registered_model_path = registered_vae.resolve() / cached_model.name
         self.assertEqual(self.agent._local_model_matches(folders, "vae", cached_model.name), [registered_model_path])
         self.assertEqual(self.agent._selected_local_file(folders, "vae", cached_model.name), registered_model_path)
+
+    def test_local_model_inventory_returns_only_current_workflow_dependencies(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        vae_dir = comfyui / "models" / "vae"
+        vae_dir.mkdir(parents=True)
+        (vae_dir / "required-vae.safetensors").write_bytes(b"required")
+        (vae_dir / "unrelated-vae.safetensors").write_bytes(b"unrelated")
+        self._add_missing_models(
+            [
+                ("required-vae.safetensors", "vae_name"),
+                ("missing-vae.safetensors", "vae_name_2"),
+            ]
+        )
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "folder_paths", return_value={}):
+            inventory = self.agent.local_model_inventory(self.job["id"])
+
+        self.assertEqual(inventory["count"], 1)
+        self.assertEqual(inventory["by_category"]["vae"], ["vae/required-vae.safetensors"])
+        self.assertEqual([item["path"] for item in inventory["models"]], ["vae/required-vae.safetensors"])
+        self.assertEqual(
+            {(item["name"], item["status"]) for item in inventory["dependencies"]},
+            {
+                ("required-vae.safetensors", "matched"),
+                ("missing-vae.safetensors", "missing"),
+            },
+        )
+        self.assertEqual(
+            [item["name"] for item in inventory["missing"]],
+            ["missing-vae.safetensors"],
+        )
+        self.assertNotIn("unrelated-vae.safetensors", "\n".join(inventory["by_category"]["vae"]))
+
+    def test_local_model_inventory_does_not_return_global_models_without_workflow_dependencies(self):
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "unrelated-vae.safetensors").write_bytes(b"unrelated")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "folder_paths", return_value={}):
+            inventory = self.agent.local_model_inventory(self.job["id"])
+
+        self.assertEqual(inventory["dependencies"], [])
+        self.assertEqual(inventory["missing"], [])
+        self.assertEqual(inventory["models"], [])
+        self.assertEqual(inventory["count"], 0)
 
     def test_local_model_selection_rejects_traversal_even_when_target_exists_outside_folder(self):
         registered_vae = Path(self.directory.name) / "shared-models" / "vae"
@@ -4602,6 +4674,7 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         model_dir.mkdir(parents=True)
         model_file = model_dir / "flux-vae.sft"
         model_file.write_bytes(b"sft model")
+        self._add_missing_models([("flux-vae.sft", "vae_name")])
         self.agent.settings.update({"comfyui_directory": str(comfyui)})
 
         inventory = self.agent.local_model_inventory(self.job["id"])
@@ -4715,19 +4788,19 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         comfyui = Path(self.directory.name) / "ComfyUI"
         model_dir = comfyui / "models" / "vae"
         model_dir.mkdir(parents=True)
-        (model_dir / "existing-vae.safetensors").write_bytes(b"local model")
+        (model_dir / "flux2-vae.safetensors").write_bytes(b"local model")
         self.agent.settings.update({"comfyui_directory": str(comfyui)})
 
         inventory = self.agent.local_model_inventory(self.job["id"])
         self.assertEqual(inventory["status"], "ok")
         self.assertEqual(inventory["count"], 1)
-        self.assertEqual(inventory["models"][0]["path"], "vae/existing-vae.safetensors")
+        self.assertEqual(inventory["models"][0]["path"], "vae/flux2-vae.safetensors")
 
         with patch.object(model_source.ModelSourceSearcher, "search") as search:
             result = await self.agent.search_workflow_model_sources(self.job["id"])
-        search.assert_called_once_with("flux2-vae.safetensors")
-        self.assertEqual(result["local_results"]["flux2-vae.safetensors"], ["vae/existing-vae.safetensors"])
-        self.assertEqual(result["results"]["flux2-vae.safetensors"], [])
+        search.assert_not_called()
+        self.assertEqual(result["local_results"], {})
+        self.assertNotIn("flux2-vae.safetensors", result["results"])
 
     async def test_remote_model_search_rate_limit_is_non_fatal(self):
         self._add_missing_models([("flux2-vae.safetensors", "vae_name")])
@@ -4989,6 +5062,7 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
             }
         }
         metadata["inspection"]["models"][0]["nodes"] = ["7"]
+        metadata["inspection"]["models"][0]["loader_status"] = "recognized"
         self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
 
         plan = self.agent.dependency_plan(self.job["id"])
@@ -5000,6 +5074,45 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
         job = self.agent.workflow_job(self.job["id"])
         self.assertEqual(job["metadata"]["workflow"]["prompt"]["7"]["inputs"]["vae_name"], "existing-vae.safetensors")
         self.assertEqual(job["metadata"]["local_model_selections"]["missing-model.safetensors"]["category"], "vae")
+        refreshed_plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual(refreshed_plan["models"][0]["status"], "selected_local")
+        self.assertEqual(refreshed_plan["missing_models"], [])
+
+    async def test_quantized_local_model_is_presented_as_a_selectable_similar_candidate(self):
+        self._add_missing_models([("flux-2-klein-9b.safetensors", "ckpt_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "checkpoints"
+        model_dir.mkdir(parents=True)
+        quantized = model_dir / "flux-2-klein-9b-fp8.safetensors"
+        quantized.write_bytes(b"quantized model")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["workflow"] = {
+            "prompt": {
+                "7": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "flux-2-klein-9b.safetensors"},
+                }
+            }
+        }
+        metadata["inspection"]["models"][0]["nodes"] = ["7"]
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        plan = self.agent.dependency_plan(self.job["id"])
+        model = plan["models"][0]
+        self.assertEqual(model["status"], "source_required")
+        self.assertEqual(model["similar_local_candidates"], ["checkpoints/flux-2-klein-9b-fp8.safetensors"])
+        self.assertEqual(model["local_paths"], [])
+
+        selected = self.agent.select_workflow_local_model(
+            self.job["id"], "flux-2-klein-9b.safetensors", "checkpoints/flux-2-klein-9b-fp8.safetensors"
+        )
+        self.assertEqual(selected["status"], "local_model_selected")
+        job = self.agent.workflow_job(self.job["id"])
+        self.assertEqual(
+            job["metadata"]["workflow"]["prompt"]["7"]["inputs"]["ckpt_name"],
+            "flux-2-klein-9b-fp8.safetensors",
+        )
         refreshed_plan = self.agent.dependency_plan(self.job["id"])
         self.assertEqual(refreshed_plan["models"][0]["status"], "selected_local")
         self.assertEqual(refreshed_plan["missing_models"], [])
@@ -7381,6 +7494,15 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn('button("重新搜索此模型", "cline-secondary cline-workflow-model-retry-search")', source)
         self.assertIn('body: JSON.stringify({ name })', source)
         self.assertIn("modelSearchUrls = { ...modelSearchUrls, ...(searched.search_urls || {}) }", source)
+
+    def test_workflow_model_card_can_select_a_similar_local_model(self):
+        source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")
+        self.assertIn("model.similar_local_candidates || []", source)
+        self.assertIn("&& !similarLocalCandidates.length", source)
+        self.assertIn("|| (model.similar_local_candidates || []).length > 0", source)
+        self.assertIn("选择相似的本地模型", source)
+        self.assertIn("/dependencies/models/local`, {", source)
+        self.assertIn("JSON.stringify({ name, path: localPicker.value })", source)
 
     def test_workflow_node_install_progress_ui_is_wired(self):
         root = Path(__file__).resolve().parents[1]

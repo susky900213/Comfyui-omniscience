@@ -35,6 +35,17 @@ from .workflow_provider import RunningHubProvider
 
 MODEL_SUFFIXES = {".safetensors", ".sft", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx", ".pkl"}
 MODEL_HASH_CHUNK_SIZE = 1024 * 1024
+MODEL_QUANTIZATION_MARKER_RE = re.compile(
+    r"(?:"
+    r"bitsandbytes|bnb(?:\d+bit)?|gptq|awq|nf\d+|gguf|ggml|"
+    r"mlx(?:\d+bit|\d+)?|"
+    r"(?:nv|mx)?fp\d+(?:e\d+m\d+[a-z]*)?|"
+    r"bf\d+|tf\d+|f(?:4|8|16|32)|(?:u?int)\d+|\d+bit|"
+    r"w\d+a\d+|"
+    r"i?q\d+(?:k(?:[msl])?|(?:xxs|xs|s|m|l)|[01])?|"
+    r"e(?:4m3(?:fn|fnuz)?|5m2)"
+    r")"
+)
 MODEL_FOLDER_ALIASES = {
     "checkpoints": ("checkpoints",),
     "vae": ("vae",),
@@ -351,10 +362,44 @@ class WorkflowModelInventoryMixin:
         return files
 
 
+    @staticmethod
+    def _local_model_filename_key(value: Any) -> str:
+        """Normalize a basename for matching unquantized and quantized variants."""
+        basename = Path(str(value or "").replace("\\", "/")).name.strip()
+        if not basename:
+            return ""
+        path = Path(basename)
+        stem = re.sub(r"[-_\s]+", "", path.stem.casefold())
+        stem = MODEL_QUANTIZATION_MARKER_RE.sub("", stem)
+        return f"{stem}{path.suffix.casefold()}"
+
+
     @classmethod
     def _local_model_matches(
         cls, folders: dict[str, list[Path]], category: str, model_name: Any
     ) -> list[Path]:
+        matches = cls._local_model_exact_matches(folders, category, model_name)
+        if matches:
+            return matches
+        target_variant_key = cls._local_model_filename_key(
+            Path(cls._normalise_model_reference(model_name, category)).name
+        )
+        if not target_variant_key:
+            return []
+        for folder in folders.get(category, []):
+            for path, path_relative in cls._local_model_files(folder):
+                if (
+                    cls._local_model_filename_key(Path(path_relative).name) == target_variant_key
+                    and path not in matches
+                ):
+                    matches.append(path)
+        return matches
+
+    @classmethod
+    def _local_model_exact_matches(
+        cls, folders: dict[str, list[Path]], category: str, model_name: Any
+    ) -> list[Path]:
+        """Return only exact-path or exact-basename matches for a workflow file."""
         relative = cls._normalise_model_reference(model_name, category)
         if not relative:
             return []
@@ -378,7 +423,111 @@ class WorkflowModelInventoryMixin:
             for path, _path_relative in files:
                 if path.name.casefold() == target_name and path not in matches:
                     matches.append(path)
+            if matches:
+                continue
         return matches
+
+    @classmethod
+    def _local_model_similar_candidates(
+        cls, folders: dict[str, list[Path]], category: str, model_name: Any
+    ) -> list[str]:
+        """Return quantized/local filename variants without selecting one."""
+        logger = logging.getLogger("Comfyui-omniscience")
+        exact_matches = cls._local_model_exact_matches(folders, category, model_name)
+        relative = cls._normalise_model_reference(model_name, category)
+        logger.debug(
+            "[model-similar-candidates] start category=%s model_name=%r "
+            "normalized_relative=%r exact_matches=%s folders=%s",
+            category,
+            model_name,
+            relative,
+            [str(path) for path in exact_matches],
+            [str(path) for path in folders.get(category, [])],
+        )
+        if exact_matches:
+            logger.debug(
+                "[model-similar-candidates] skip category=%s model_name=%r "
+                "reason=exact_match_found exact_matches=%s",
+                category,
+                model_name,
+                [str(path) for path in exact_matches],
+            )
+            return []
+        target_variant_key = cls._local_model_filename_key(Path(relative).name)
+        logger.debug(
+            "[model-similar-candidates] target category=%s model_name=%r "
+            "basename=%r target_variant_key=%r",
+            category,
+            model_name,
+            Path(relative).name,
+            target_variant_key,
+        )
+        if not target_variant_key:
+            logger.debug(
+                "[model-similar-candidates] skip category=%s model_name=%r "
+                "reason=empty_target_variant_key normalized_relative=%r",
+                category,
+                model_name,
+                relative,
+            )
+            return []
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for folder in folders.get(category, []):
+            files = cls._local_model_files(folder)
+            logger.debug(
+                "[model-similar-candidates] scan category=%s folder=%s "
+                "exists=%s model_files=%d",
+                category,
+                folder,
+                folder.is_dir(),
+                len(files),
+            )
+            for _path, path_relative in files:
+                candidate_variant_key = cls._local_model_filename_key(Path(path_relative).name)
+                if candidate_variant_key != target_variant_key:
+                    logger.debug(
+                        "[model-similar-candidates] non-match category=%s folder=%s "
+                        "relative=%s candidate_variant_key=%r target_variant_key=%r",
+                        category,
+                        folder,
+                        path_relative,
+                        candidate_variant_key,
+                        target_variant_key,
+                    )
+                    continue
+                value = f"{category}/{path_relative}"
+                if value not in seen:
+                    seen.add(value)
+                    candidates.append(value)
+                    logger.debug(
+                        "[model-similar-candidates] matched category=%s folder=%s "
+                        "relative=%s variant_key=%r candidate=%s",
+                        category,
+                        folder,
+                        path_relative,
+                        candidate_variant_key,
+                        value,
+                    )
+                else:
+                    logger.debug(
+                        "[model-similar-candidates] duplicate category=%s folder=%s "
+                        "relative=%s candidate=%s",
+                        category,
+                        folder,
+                        path_relative,
+                        value,
+                    )
+        logger.debug(
+            "[model-similar-candidates] complete category=%s model_name=%r "
+            "target_variant_key=%r candidate_count=%d candidates=%s",
+            category,
+            model_name,
+            target_variant_key,
+            len(candidates),
+            candidates,
+        )
+        return candidates
 
 
     @classmethod

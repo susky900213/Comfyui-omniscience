@@ -149,7 +149,7 @@ class WorkflowModelFilesMixin:
 
 
     def local_model_inventory(self, job_id: Any) -> dict[str, Any]:
-        """List files in the model folders currently registered by ComfyUI."""
+        """List only local files relevant to the selected workflow dependencies."""
         job = self.workflow_job(job_id)
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
         comfyui_root = str(settings_data.get("comfyui_directory") or "").strip()
@@ -158,20 +158,92 @@ class WorkflowModelFilesMixin:
                 "status": "unconfigured",
                 "job_id": job["id"],
                 "models": [],
+                "dependencies": [],
+                "missing": [],
                 "by_category": {},
                 "message": "尚未配置 ComfyUI 目录，无法查看本地模型。",
             }
 
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
-        by_category: dict[str, list[str]] = {category: [] for category in sorted(CATEGORIES)}
-        for category in sorted(CATEGORIES):
-            by_category[category] = self._local_model_candidates(folders, category)
-
-        models = [
-            {"category": category, "path": model_path, "filename": Path(model_path).name}
-            for category, paths in by_category.items()
-            for model_path in paths
+        plan = self.dependency_plan(job["id"])
+        # dependency_plan may refresh a legacy inspection report before
+        # returning. Reload the job so historical cards use that refreshed
+        # complete dependency set rather than the stale pre-refresh snapshot.
+        job = self.workflow_job(job["id"])
+        metadata = job.get("metadata") or {}
+        workflow = metadata.get("workflow")
+        dependency_items: list[dict[str, Any]] = []
+        seen_dependencies: set[tuple[str, str]] = set()
+        # ``dependency_plan["models"]`` is intentionally an install-only list
+        # and therefore omits dependencies already installed in ComfyUI.  The
+        # persisted inspection report is the complete workflow dependency set;
+        # plan results are retained as a fallback for legacy jobs that have no
+        # inspection report yet.
+        inspection = metadata.get("inspection") or {}
+        dependency_sources = [
+            inspection.get("models") or [],
+            plan.get("models") or [],
+            plan.get("missing_models") or [],
+            plan.get("recognized_models") or [],
         ]
+        for source in dependency_sources:
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                item = dict(item)
+                item["category"] = str(item.get("category") or self._model_category(item, workflow) or "").strip()
+                item["name"] = str(item.get("name") or "").strip()
+                name = item["name"]
+                category = item["category"]
+                key = (category.casefold(), name.casefold())
+                if name and key not in seen_dependencies:
+                    seen_dependencies.add(key)
+                    dependency_items.append(item)
+
+        dependencies: list[dict[str, Any]] = []
+        models: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        by_category: dict[str, list[str]] = {category: [] for category in sorted(CATEGORIES)}
+        seen_paths: set[str] = set()
+        for item in dependency_items:
+            name = str(item.get("name") or "").strip()
+            category = str(item.get("category") or self._model_category(item, workflow) or "").strip()
+            local_paths = [
+                str(path)
+                for path in self._local_model_matches(folders, category, name)
+            ] if category in CATEGORIES else []
+            dependency = {
+                "name": name,
+                "category": category,
+                "status": "matched" if local_paths else "missing",
+                "local_paths": local_paths,
+            }
+            dependencies.append(dependency)
+            if local_paths:
+                for local_path in local_paths:
+                    relative_path = next(
+                        (
+                            f"{category}/{relative}"
+                            for folder in folders.get(category, [])
+                            for path, relative in self._local_model_files(folder)
+                            if str(path) == local_path
+                        ),
+                        "",
+                    )
+                    if relative_path and relative_path not in seen_paths:
+                        seen_paths.add(relative_path)
+                        by_category.setdefault(category, []).append(relative_path)
+                        models.append(
+                            {
+                                "category": category,
+                                "path": relative_path,
+                                "filename": Path(relative_path).name,
+                                "dependency": name,
+                            }
+                        )
+            else:
+                missing.append(dependency)
+
         return {
             "status": "ok",
             "job_id": job["id"],
@@ -182,12 +254,14 @@ class WorkflowModelFilesMixin:
                 for category, paths in folders.items()
                 if paths
             },
+            "dependencies": dependencies,
             "models": models,
+            "missing": missing,
             "by_category": by_category,
             "count": len(models),
             "message": (
-                "已读取 ComfyUI 实际注册的模型目录中的本地模型文件。"
+                "已按当前工作流依赖匹配 ComfyUI 实际注册的本地模型文件。"
                 if folder_source == "comfyui"
-                else "已读取 ComfyUI models 目录中的本地模型文件。"
+                else "已按当前工作流依赖匹配 ComfyUI models 目录中的本地模型文件。"
             ) + (f" {folder_warning}" if folder_warning else ""),
         }

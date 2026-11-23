@@ -1143,11 +1143,49 @@ function workflowCandidateCard(jobId, candidate) {
       const renderModelSources = async (models, candidatesByName = {}, searchUrlsByName = {}, searchCompleted = false) => {
         modelSourceArea.replaceChildren();
         for (const model of models || []) {
-          if (["installed", "selected_local", "recognized"].includes(model.status) || model.loader_status === "recognized") continue;
+          const similarLocalCandidates = model.similar_local_candidates || [];
+          if (
+            (["installed", "selected_local", "recognized"].includes(model.status) || model.loader_status === "recognized")
+            && !similarLocalCandidates.length
+          ) continue;
           const name = model.name;
           const group = el("div", "cline-workflow-node-source-group");
           group.appendChild(el("strong", "", `模型文件：${name}`));
           const candidates = candidatesByName[name] || model.source_candidates || (model.source ? [model.source] : []);
+          if (similarLocalCandidates.length && !model.local_selection) {
+            group.appendChild(el(
+              "p",
+              "cline-workflow-candidate-meta",
+              "发现名称相似的本地量化模型；请选择后替换工作流中的模型文件名：",
+            ));
+            const localPicker = el("select", "cline-workflow-model-picker");
+            const localPlaceholder = el("option", "", "选择相似的本地模型");
+            localPlaceholder.value = "";
+            localPicker.appendChild(localPlaceholder);
+            similarLocalCandidates.forEach((path) => {
+              const option = el("option", "", path);
+              option.value = path;
+              localPicker.appendChild(option);
+            });
+            localPicker.onchange = async () => {
+              if (!localPicker.value) return;
+              localPicker.disabled = true;
+              try {
+                await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/models/local`, {
+                  method: "POST",
+                  body: JSON.stringify({ name, path: localPicker.value }),
+                });
+                const refreshed = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
+                plan.models = refreshed.models || [];
+                await renderModelSources(plan.models, candidatesByName, searchUrlsByName, searchCompleted);
+              } catch (error) {
+                localPicker.disabled = false;
+                localPicker.value = "";
+                showError(error);
+              }
+            };
+            group.appendChild(localPicker);
+          }
           if (model.source) {
             group.appendChild(el("p", "cline-workflow-candidate-meta", `已选择：${modelSourceLabel(model.source)}`));
             if (model.source.title || model.source.snippet) {
@@ -1337,7 +1375,13 @@ function workflowCandidateCard(jobId, candidate) {
       const sourceSearchArea = el("div", "cline-workflow-node-sources");
       const searchButton = button("解析缺失节点（ComfyUI-Manager）", "cline-secondary cline-workflow-node-search");
       const modelSearchButton = button("搜索缺失模型文件（Hugging Face）", "cline-secondary cline-workflow-model-search");
-      const pendingModels = (plan.models || []).filter((model) => !["installed", "selected_local"].includes(model.status));
+      // A quantized local variant is still actionable even when a legacy
+      // inspection report marked the dependency as installed. Do not hide the
+      // model source area until all similar-local candidates have been handled.
+      const pendingModels = (plan.models || []).filter((model) => (
+        !["installed", "selected_local"].includes(model.status)
+        || (model.similar_local_candidates || []).length > 0
+      ));
       card.append(localInventoryButton, localInventoryArea);
       void refreshLocalInventory();
       if (pendingModels.length) card.appendChild(modelSourceArea);
@@ -1716,7 +1760,7 @@ function workflowCandidateCard(jobId, candidate) {
           })
           .catch(() => {});
       }
-      card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-next-step", "节点安装需单独确认；模型可搜索并选择包含目标文件的仓库，选定后会立即下载该文件。"));
+      card.appendChild(el("p", "cline-workflow-candidate-meta cline-workflow-next-step", "节点安装需单独确认；模型可优先选择本地相似量化文件，也可搜索并选择包含目标文件的仓库，选定远程来源后会立即下载该文件。"));
       maybeAppendExecute();
       } catch (error) {
       action.disabled = false;

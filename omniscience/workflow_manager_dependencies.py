@@ -143,8 +143,7 @@ class WorkflowDependencyMixin:
         local_model_selections = dict((job.get("metadata") or {}).get("local_model_selections") or {})
         models = [
             model for model in (inspection.get("models") or [])
-            if model.get("local_status") != "installed" and str(model.get("name") or "") not in prepared_names
-            and model.get("loader_status") != "recognized"
+            if str(model.get("name") or "") not in prepared_names
         ]
         recognized_models = [
             model for model in (inspection.get("models") or [])
@@ -324,6 +323,21 @@ class WorkflowDependencyMixin:
                 group["node_instances"].append(resolved)
                 group["node_count"] += 1
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
+        installable_models = []
+        for model in models:
+            if model.get("local_status") != "installed":
+                installable_models.append(model)
+                continue
+            category = self._model_category(model, job_metadata.get("workflow"))
+            # Older inspection reports treated quantized filename variants as
+            # installed. Re-check those reports against exact paths so the
+            # variant can be offered as a user-selectable local candidate.
+            if not folders.get(category) or self._local_model_exact_matches(
+                folders, category, model.get("name")
+            ):
+                continue
+            installable_models.append(model)
+        models = installable_models
         planned_models = []
         model_source_selections = dict(job_metadata.get("model_source_selections") or {})
         model_search_results = job_metadata.get("model_search_results") or {}
@@ -355,8 +369,13 @@ class WorkflowDependencyMixin:
                     or digest and not re.fullmatch(r"[0-9a-f]{64}", digest)
                 ):
                     source = None
-            local_matches = [] if directory_invalid else self._local_model_matches(folders, category, model.get("name"))
+            local_matches = [] if directory_invalid else self._local_model_exact_matches(
+                folders, category, model.get("name")
+            )
             local_candidates = [] if directory_invalid else self._local_model_candidates(folders, category)
+            similar_local_candidates = [] if directory_invalid else self._local_model_similar_candidates(
+                folders, category, model.get("name")
+            )
             source_candidates = model_search_results.get(model_name, [])
             if not isinstance(source_candidates, list):
                 source_candidates = []
@@ -414,11 +433,26 @@ class WorkflowDependencyMixin:
                 "source_candidates": source_candidates,
                 "local_paths": [str(item) for item in local_matches],
                 "local_candidates": local_candidates,
+                "similar_local_candidates": similar_local_candidates,
                 "local_selection": local_selection,
                 "category": category,
                 "download_allowed": bool(source) and not directory_invalid,
             }
+            if similar_local_candidates:
+                planned["similar_local_candidates"] = similar_local_candidates
+            else:
+                planned.pop("similar_local_candidates", None)
+            # A loader-recognized model is normally omitted from the dependency
+            # card because ComfyUI already knows how to load it.  Keep it only
+            # when the current filesystem contains a selectable quantized/local
+            # variant; otherwise the old omission behavior remains unchanged.
+            if model.get("loader_status") == "recognized" and not similar_local_candidates:
+                continue
             planned_models.append(planned)
+        # ``models`` is also used below to decide whether the card requires user
+        # confirmation.  It must describe the same visible model set as the
+        # serialized plan, not the pre-filter inspection list.
+        models = planned_models
         plan = {
             "job_id": job["id"],
             "state": job.get("state"),

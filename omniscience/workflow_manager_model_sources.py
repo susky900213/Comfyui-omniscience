@@ -198,12 +198,17 @@ class WorkflowModelSourcesMixin:
         metadata = dict(job.get("metadata") or {})
         inspection = metadata.get("inspection") or {}
         model = next((item for item in inspection.get("models", []) if str(item.get("name") or "") == name), None)
-        if model is None or model.get("local_status") == "installed" or model.get("loader_status") == "recognized":
+        if model is None or model.get("loader_status") == "recognized":
             raise ValueError("该工作流没有此缺失模型，不能选择本地模型文件。")
         if not relative_path or relative_path.startswith("/") or ".." in Path(relative_path).parts:
             raise ValueError("本地模型文件路径无效。")
         plan = metadata.get("dependency_plan") or self.dependency_plan(job["id"])
         planned = next((item for item in plan.get("models", []) if item.get("name") == name), None)
+        if planned is None or (
+            model.get("local_status") == "installed"
+            and not planned.get("similar_local_candidates")
+        ):
+            raise ValueError("该工作流没有此缺失模型，不能选择本地模型文件。")
         if planned is None or relative_path not in (planned.get("local_candidates") or []):
             raise ValueError("所选文件不在本次 ComfyUI 模型列表中，请刷新依赖计划。")
         settings_data = self.settings.load() if hasattr(self.settings, "load") else dict(self.settings or {})
