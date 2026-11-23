@@ -3,7 +3,7 @@ import { api } from "../../scripts/api.js";
 
 const STYLE_ID = "comfyui-omniscience-style";
 const PANEL_ID = "comfyui-omniscience-panel";
-const WORKFLOW_INSPECTION_VERSION = 3;
+const WORKFLOW_INSPECTION_VERSION = 6;
 
 const state = {
   tasks: [],
@@ -1002,8 +1002,8 @@ function workflowCandidateCard(jobId, candidate) {
       }
       const report = inspection.inspection || {};
       card.classList.add("selected");
-      const installedModels = (report.models || []).filter((model) => model.local_status === "installed").length;
-      const missingModels = (report.models || []).filter((model) => model.local_status !== "installed").length;
+      const installedModels = (report.models || []).filter((model) => ["installed", "recognized"].includes(model.local_status) || model.loader_status === "recognized").length;
+      const missingModels = (report.models || []).filter((model) => !["installed", "recognized"].includes(model.local_status) && model.loader_status !== "recognized").length;
       const matchedNodeCount = report.canvas_matched_node_count
         ?? report.matched_node_count
         ?? report.loaded_nodes_count
@@ -1143,7 +1143,7 @@ function workflowCandidateCard(jobId, candidate) {
       const renderModelSources = async (models, candidatesByName = {}, searchUrlsByName = {}, searchCompleted = false) => {
         modelSourceArea.replaceChildren();
         for (const model of models || []) {
-          if (["installed", "selected_local"].includes(model.status)) continue;
+          if (["installed", "selected_local", "recognized"].includes(model.status) || model.loader_status === "recognized") continue;
           const name = model.name;
           const group = el("div", "cline-workflow-node-source-group");
           group.appendChild(el("strong", "", `模型文件：${name}`));

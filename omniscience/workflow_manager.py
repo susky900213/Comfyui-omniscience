@@ -48,6 +48,26 @@ MODEL_FOLDER_ALIASES = {
     "embeddings": ("embeddings",),
 }
 
+MODEL_DIRECTORY_CATEGORIES = {
+    "checkpoints": "checkpoints",
+    "checkpoint": "checkpoints",
+    "vae": "vae",
+    "loras": "loras",
+    "lora": "loras",
+    "controlnet": "controlnet",
+    "controlnets": "controlnet",
+    "clip": "clip",
+    "clip_gguf": "clip",
+    "text_encoders": "clip",
+    "text_encoder": "clip",
+    "unet": "unet",
+    "unet_gguf": "unet",
+    "diffusion_models": "diffusion_models",
+    "diffusion_model": "diffusion_models",
+    "upscale_models": "upscale_models",
+    "embeddings": "embeddings",
+}
+
 
 class WorkflowManagerMixin:
     """Persisted RunningHub search and candidate selection for global chat."""
@@ -378,6 +398,7 @@ class WorkflowManagerMixin:
             if isinstance(item, dict)
             and str(item.get("name")) not in prepared_models
             and str(item.get("local_status") or "") not in {"installed", "selected_local"}
+            and item.get("loader_status") != "recognized"
             and isinstance(model_sources.get(str(item.get("name"))), dict)
         ]
         return {"nodes": nodes, "models": models}
@@ -767,6 +788,7 @@ class WorkflowManagerMixin:
         if candidate is None:
             raise ValueError("请先选择一个工作流候选。")
         provider = RunningHubProvider(self.settings)
+        node_info: dict[str, Any] | None = None
         if loaded_nodes is None:
             loaded_nodes_error = ""
             loaded_nodes_checked = False
@@ -787,6 +809,7 @@ class WorkflowManagerMixin:
             loaded_nodes=loaded_nodes,
             loaded_nodes_error=loaded_nodes_error,
             loaded_nodes_checked=loaded_nodes_checked,
+            loader_choices=node_info,
         )
         # Keep the provider's workflow untouched during selection/preparation.
         # UI canvas exports may contain widget values for nodes that are not
@@ -799,11 +822,21 @@ class WorkflowManagerMixin:
         folders, folder_source, folder_warning = self._model_folders(comfyui_root)
         for model in report.get("models", []):
             category = self._model_category(model, workflow)
-            local_paths = [str(path) for path in self._local_model_matches(folders, category, model.get("name"))]
+            metadata_directory_invalid = bool(model.get("metadata_directory_invalid")) or self._model_directory_invalid(model)
+            directory_invalid = metadata_directory_invalid and not self._model_directory_resolved(
+                model, category, folders, folder_source
+            )
+            if metadata_directory_invalid:
+                model["metadata_directory_invalid"] = True
+            model["directory_invalid"] = directory_invalid
+            local_paths = [] if directory_invalid else [
+                str(path) for path in self._local_model_matches(folders, category, model.get("name"))
+            ]
             model["local_paths"] = local_paths
-            model["local_status"] = "installed" if local_paths else "missing"
-            model["download_status"] = "ready" if local_paths else "source_required"
+            model["local_status"] = "missing_directory" if directory_invalid else "installed" if local_paths else "missing"
+            model["download_status"] = "missing_directory" if directory_invalid else "ready" if local_paths else "source_required"
             model["category"] = category
+            model["directory_resolved"] = bool(category and folders.get(category))
         report["folder_paths_source"] = folder_source
         report["folder_paths"] = {
             category: [str(path) for path in paths]
@@ -856,18 +889,13 @@ class WorkflowManagerMixin:
                     job_metadata["workflow"],
                     loaded_nodes=loaded,
                     loaded_nodes_checked=True,
+                    loader_choices=loaded,
                 )
-                old_models = {
-                    (str(item.get("field") or ""), str(item.get("name") or "")): item
-                    for item in inspection.get("models") or []
-                    if isinstance(item, dict)
-                }
+                old_models = [item for item in inspection.get("models") or [] if isinstance(item, dict)]
                 for model in refreshed.get("models") or []:
-                    previous = old_models.get((str(model.get("field") or ""), str(model.get("name") or "")))
+                    previous = self._find_previous_model(model, old_models)
                     if isinstance(previous, dict):
-                        for key in ("local_paths", "local_status", "download_status", "category"):
-                            if key in previous:
-                                model[key] = previous[key]
+                        self._merge_persisted_model_state(model, previous)
                 inspection = refreshed
                 job_metadata["inspection"] = inspection
                 self.store.update_workflow_job(job["id"], metadata=job_metadata)
@@ -916,6 +944,11 @@ class WorkflowManagerMixin:
         models = [
             model for model in (inspection.get("models") or [])
             if model.get("local_status") != "installed" and str(model.get("name") or "") not in prepared_names
+            and model.get("loader_status") != "recognized"
+        ]
+        recognized_models = [
+            model for model in (inspection.get("models") or [])
+            if model.get("loader_status") == "recognized"
         ]
         candidate = (job.get("metadata") or {}).get("candidate") or {}
         node_sources = candidate.get("node_sources") or []
@@ -1100,11 +1133,18 @@ class WorkflowManagerMixin:
         for model in models:
             model_name = str(model.get("name") or "")
             basename = Path(model_name.replace("\\", "/")).name
+            category = self._model_category(model, job_metadata.get("workflow"))
+            metadata_directory_invalid = bool(model.get("metadata_directory_invalid")) or self._model_directory_invalid(model)
+            directory_invalid = metadata_directory_invalid and not self._model_directory_resolved(
+                model, category, folders, folder_source
+            )
             source = model_source_selections.get(model_name)
             if isinstance(source, dict):
                 source = dict(source)
                 source.setdefault("filename", basename)
-                source.setdefault("category", self._model_category(model, job_metadata.get("workflow")))
+                # The workflow's directory is authoritative for both download
+                # classification and the eventual ComfyUI link destination.
+                source["category"] = category
                 repo_id = str(source.get("repo_id") or "")
                 source_filename = str(source.get("filename") or "").replace("\\", "/")
                 digest = str(source.get("sha256") or "").lower()
@@ -1115,9 +1155,8 @@ class WorkflowManagerMixin:
                     or digest and not re.fullmatch(r"[0-9a-f]{64}", digest)
                 ):
                     source = None
-            category = self._model_category(model, job_metadata.get("workflow"))
-            local_matches = self._local_model_matches(folders, category, model.get("name"))
-            local_candidates = self._local_model_candidates(folders, category)
+            local_matches = [] if directory_invalid else self._local_model_matches(folders, category, model.get("name"))
+            local_candidates = [] if directory_invalid else self._local_model_candidates(folders, category)
             source_candidates = model_search_results.get(model_name, [])
             if not isinstance(source_candidates, list):
                 source_candidates = []
@@ -1129,11 +1168,14 @@ class WorkflowManagerMixin:
                 for digest in [self._valid_model_hash(item.get("sha256"))]
                 if digest
             }
-            matching_local_candidates = self._local_model_candidates_with_hash(
+            matching_local_candidates = [] if directory_invalid else self._local_model_candidates_with_hash(
                 folders, category, expected_hashes, basename
             )
             local_selection = local_model_selections.get(model_name)
-            if isinstance(local_selection, dict):
+            if directory_invalid:
+                local_selection = None
+                local_model_selections.pop(model_name, None)
+            elif isinstance(local_selection, dict):
                 selected_path = str(local_selection.get("workflow_path") or "").replace("\\", "/")
                 selected_category = str(local_selection.get("category") or "")
                 selected_file = self._selected_local_file(folders, selected_category, selected_path)
@@ -1164,14 +1206,17 @@ class WorkflowManagerMixin:
                     source = None
             planned = {
                 **model,
-                "status": "selected_local" if local_selection else "installed" if local_matches else "ready" if source else "source_required",
+                "directory_invalid": directory_invalid,
+                "metadata_directory_invalid": metadata_directory_invalid,
+                "directory_resolved": bool(category and folders.get(category)),
+                "status": "missing_directory" if directory_invalid else "selected_local" if local_selection else "installed" if local_matches else "ready" if source else "source_required",
                 "source": source,
                 "source_candidates": source_candidates,
                 "local_paths": [str(item) for item in local_matches],
                 "local_candidates": local_candidates,
                 "local_selection": local_selection,
                 "category": category,
-                "download_allowed": bool(source),
+                "download_allowed": bool(source) and not directory_invalid,
             }
             planned_models.append(planned)
         plan = {
@@ -1209,8 +1254,12 @@ class WorkflowManagerMixin:
                 for name in unverified_nodes
             ],
             "models": planned_models,
-            "missing_models": [item for item in planned_models if item.get("status") not in {"installed", "selected_local"}],
-            "model_download_ready": bool(planned_models) and all(item.get("source") or item.get("status") in {"installed", "selected_local"} for item in planned_models),
+            "recognized_models": recognized_models,
+            "missing_models": [item for item in planned_models if item.get("status") not in {"installed", "selected_local", "recognized"}],
+            "model_download_ready": bool(planned_models) and all(
+                item.get("status") in {"installed", "selected_local", "recognized"} or item.get("download_allowed")
+                for item in planned_models
+            ),
             "restart_required": bool(missing_nodes),
             "requires_user_confirmation": bool(missing_nodes or models),
             "folder_paths_source": folder_source,
@@ -1232,7 +1281,90 @@ class WorkflowManagerMixin:
         return plan
 
     @staticmethod
+    def _model_compatibility_key(model: dict[str, Any]) -> tuple[str, str]:
+        """Build a refresh/deduplication key from directory and model basename."""
+        directory = str(model.get("directory") or "").strip().replace("\\", "/").strip("/")
+        parts = [part for part in directory.split("/") if part]
+        if parts and parts[0].casefold() in {"model", "models"}:
+            parts = parts[1:]
+        directory_key = "/".join(parts).casefold()
+        category = WorkflowManagerMixin._model_directory_category(directory)
+        if category:
+            directory_key = category.casefold()
+        name = str(model.get("name") or "").strip().replace("\\", "/")
+        return directory_key, (Path(name).name or name).casefold()
+
+    @staticmethod
+    def _model_legacy_key(model: dict[str, Any]) -> tuple[str, str]:
+        return (
+            str(model.get("field") or ""),
+            str(model.get("name") or ""),
+        )
+
+    @classmethod
+    def _find_previous_model(
+        cls, model: dict[str, Any], previous_models: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Find persisted state across inspection schema versions.
+
+        New metadata uses ``directory`` and may omit the old input ``field``.
+        Prefer the normalized directory/basename key; then retain the exact
+        legacy ``(field, name)`` lookup.  A unique basename-only match bridges
+        old field-based reports to new directory-based metadata without merging
+        two same-named models from different categories.
+        """
+        key = cls._model_compatibility_key(model)
+        for previous in previous_models:
+            if cls._model_compatibility_key(previous) == key:
+                return previous
+        legacy_key = cls._model_legacy_key(model)
+        if legacy_key != ("", ""):
+            for previous in previous_models:
+                previous_key = cls._model_compatibility_key(previous)
+                if cls._model_legacy_key(previous) == legacy_key and (
+                    not previous_key[0] or (key[0] and previous_key[0] == key[0])
+                ):
+                    return previous
+        basename = key[1]
+        candidates = [
+            previous
+            for previous in previous_models
+            if cls._model_compatibility_key(previous)[1] == basename
+            and not cls._model_compatibility_key(previous)[0]
+            and (not key[0] or not cls._model_compatibility_key(previous)[0])
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _merge_persisted_model_state(model: dict[str, Any], previous: dict[str, Any]) -> None:
+        """Retain user/source state when an old inspection is refreshed."""
+        for key in (
+            "url",
+            "source",
+            "source_url",
+            "source_candidates",
+            "local_paths",
+            "local_status",
+            "download_status",
+            "local_selection",
+            "download_allowed",
+        ):
+            if key in previous and previous[key] not in (None, "", [], {}):
+                model[key] = previous[key]
+        if "directory_invalid" in previous:
+            model["directory_invalid"] = bool(model.get("directory_invalid")) or bool(previous["directory_invalid"])
+        if model.get("directory_invalid"):
+            model["local_paths"] = []
+            model["local_status"] = "missing_directory"
+            model["download_status"] = "missing_directory"
+            model["local_selection"] = None
+            model["download_allowed"] = False
+
+    @staticmethod
     def _model_category(model: dict[str, Any], workflow: dict[str, Any] | None = None) -> str:
+        directory_category = WorkflowManagerMixin._model_directory_category(model.get("directory"))
+        if directory_category:
+            return directory_category
         field = str(model.get("field") or "").casefold()
         name = str(model.get("name") or "").casefold()
         node_ids = {str(item) for item in model.get("nodes") or []}
@@ -1271,6 +1403,55 @@ class WorkflowManagerMixin:
         if "unet" in field or "diffusion_models" in field:
             return "diffusion_models"
         return "checkpoints"
+
+    @staticmethod
+    def _model_directory_category(directory: Any) -> str:
+        """Map ComfyUI's frontend model directory to a supported category.
+
+        ``properties.models`` is the frontend's authoritative dependency
+        metadata.  The value is normally a folder name, but older/custom node
+        exports can include a ``models/`` prefix or use a registered alias.
+        Keep the normalization deliberately category-only so an arbitrary path
+        can never become a filesystem destination.
+        """
+        value = str(directory or "").strip().replace("\\", "/").strip("/")
+        if not value:
+            return ""
+        parts = [part for part in value.split("/") if part]
+        if parts and parts[0].casefold() in {"models", "model"}:
+            parts = parts[1:]
+        if not parts:
+            return ""
+        return MODEL_DIRECTORY_CATEGORIES.get(parts[-1].casefold(), "")
+
+    @staticmethod
+    def _model_directory_invalid(model: dict[str, Any]) -> bool:
+        value = model.get("directory_invalid")
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _model_directory_resolved(
+        model: dict[str, Any],
+        category: str,
+        folders: dict[str, list[Path]],
+        folder_source: str = "",
+    ) -> bool:
+        """Return whether current ComfyUI folder registration validates a directory.
+
+        ``directory_invalid`` is frontend export-time state.  A current
+        ``/internal/folder_paths`` response is stronger evidence: it confirms
+        that the named category is registered, including extra model paths.
+        Unknown or unregistered categories remain blocked from unsafe downloads.
+        """
+        directory = str(model.get("directory") or "").strip()
+        return bool(
+            directory
+            and folder_source != "legacy"
+            and WorkflowManagerMixin._model_directory_category(directory) == category
+            and folders.get(category)
+        )
 
     def _model_folders(self, comfyui_root: str) -> tuple[dict[str, list[Path]], str, str]:
         """Resolve model folders from ComfyUI, with the legacy layout as fallback.
@@ -1594,7 +1775,7 @@ class WorkflowManagerMixin:
         inspection = metadata.get("inspection") or {}
         models = inspection.get("models") or []
         match = next((model for model in models if str(model.get("name") or "") == name), None)
-        if match is None or match.get("local_status") == "installed":
+        if match is None or match.get("local_status") == "installed" or match.get("loader_status") == "recognized":
             raise ValueError("该工作流没有此缺失模型，不能选择下载来源。")
         if not name or name in {".", ".."}:
             raise ValueError("模型名称无效。")
@@ -1646,7 +1827,7 @@ class WorkflowManagerMixin:
         metadata = dict(job.get("metadata") or {})
         inspection = metadata.get("inspection") or {}
         model = next((item for item in inspection.get("models", []) if str(item.get("name") or "") == name), None)
-        if model is None or model.get("local_status") == "installed":
+        if model is None or model.get("local_status") == "installed" or model.get("loader_status") == "recognized":
             raise ValueError("该工作流没有此缺失模型，不能选择本地模型文件。")
         if not relative_path or relative_path.startswith("/") or ".." in Path(relative_path).parts:
             raise ValueError("本地模型文件路径无效。")
@@ -2458,6 +2639,8 @@ class WorkflowManagerMixin:
         if not selected_models:
             raise ValueError("当前没有待下载的缺失模型。")
         for item in selected_models:
+            if self._model_directory_invalid(item) or item.get("status") == "missing_directory":
+                raise ValueError(f"模型 {item.get('name')} 的 ComfyUI 模型目录无效，已禁止下载或安装。")
             if not isinstance(item.get("source"), dict):
                 raise ValueError(f"模型 {item.get('name')} 没有可信下载来源，请先搜索并选择 Hugging Face 文件。")
             source_filename = str(item["source"].get("filename") or item.get("name") or "").replace("\\", "/")
@@ -2532,7 +2715,7 @@ class WorkflowManagerMixin:
                 downloaded = await asyncio.to_thread(
                     downloader.download,
                     repo_id=source.get("repo_id"), filename=source.get("filename") or item.get("name"),
-                    category=source.get("category") or self._model_category(item), cache_root=cache_root,
+                    category=str(item.get("category") or ""), cache_root=cache_root,
                     expected_sha256=source.get("sha256") or "",
                     source_url=source.get("source_url") or "",
                     on_progress=report_progress,

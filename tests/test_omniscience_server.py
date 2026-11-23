@@ -1808,6 +1808,220 @@ class NodeInstallRequestTests(unittest.TestCase):
 
 
 class WorkflowParserTests(unittest.TestCase):
+    def test_legacy_loader_inputs_accept_model_suffix_fallback_but_ignore_non_loader_fields(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "prompt": {
+                    "1": {
+                        "class_type": "CustomLoader",
+                        "inputs": {
+                            "weights": "models/vae/flux-vae.sft",
+                            "description": "not-a-model.safetensors",
+                        },
+                    },
+                    "2": {
+                        "class_type": "StringProcessor",
+                        "inputs": {"weights": "arbitrary.safetensors", "text": "prompt"},
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(
+            report["models"],
+            [
+                {
+                    "field": "weights",
+                    "name": "models/vae/flux-vae.sft",
+                    "directory": "",
+                    "nodes": ["1"],
+                    "node_types": ["CustomLoader"],
+                },
+                {
+                    "field": "description",
+                    "name": "not-a-model.safetensors",
+                    "directory": "",
+                    "nodes": ["1"],
+                    "node_types": ["CustomLoader"],
+                },
+            ],
+        )
+
+    def test_nested_model_metadata_is_deduplicated_and_preserves_invalid_directory(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {
+                        "id": 1,
+                        "type": "NestedLoader",
+                        "properties": {
+                            "models": [
+                                {"name": "vae/flux.safetensors", "directory": "models/vae", "url": "https://example/flux"},
+                            ]
+                        },
+                    }
+                ],
+                "definitions": {
+                    "subgraphs": [
+                        {
+                            "nodes": [
+                                {
+                                    "id": 2,
+                                    "type": "NestedLoader",
+                                    "properties": {
+                                        "models": [
+                                            {
+                                                "name": "FLUX.SAFETENSORS",
+                                                "directory": "models/vae",
+                                                "directory_invalid": True,
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual(len(report["models"]), 1)
+        model = report["models"][0]
+        self.assertEqual(model["name"], "FLUX.SAFETENSORS")
+        self.assertEqual(model["directory"], "models/vae")
+        self.assertEqual(model["url"], "https://example/flux")
+        self.assertTrue(model["directory_invalid"])
+        self.assertEqual(model["nodes"], ["1", "2"])
+        self.assertEqual(model["node_types"], ["NestedLoader"])
+
+    def test_loader_widgets_replace_stale_metadata_and_add_unlisted_lora(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {
+                        "id": 101,
+                        "type": "UNETLoader",
+                        "inputs": [
+                            {"name": "unet_name", "link": None},
+                            {"name": "weight_dtype", "link": None},
+                        ],
+                        "widgets_values": ["MiniMax-H3_fl2va_int8_convrot.safetensors", "default"],
+                        "widgets_values_named": {
+                            "unet_name": "MiniMax-H3_fl2va_int8_convrot.safetensors",
+                            "weight_dtype": "default",
+                        },
+                        "properties": {
+                            "models": [
+                                {
+                                    "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                                    "directory": "diffusion_models",
+                                    "url": "https://example.invalid/stale.safetensors",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "id": 125,
+                        "type": "LoraLoaderModelOnly",
+                        "inputs": [
+                            {"name": "model", "link": 1},
+                            {"name": "lora_name", "link": None},
+                            {"name": "strength_model", "link": None},
+                        ],
+                        "widgets_values": ["minimax_h3_turbo_4步加速_comfyui.safetensors", 0.75],
+                        "widgets_values_named": {
+                            "lora_name": "minimax_h3_turbo_4步加速_comfyui.safetensors",
+                            "strength_model": 0.75,
+                        },
+                        "properties": {},
+                    },
+                ]
+            }
+        )
+
+        models = {item["name"]: item for item in report["models"]}
+        self.assertEqual(
+            set(models),
+            {
+                "MiniMax-H3_fl2va_int8_convrot.safetensors",
+                "minimax_h3_turbo_4步加速_comfyui.safetensors",
+            },
+        )
+        unet = models["MiniMax-H3_fl2va_int8_convrot.safetensors"]
+        self.assertEqual(unet["directory"], "diffusion_models")
+        self.assertTrue(unet["metadata_mismatch"])
+        self.assertEqual(unet["metadata_name"], "minimax_h3_fl2va_pruned_int8_convrot.safetensors")
+        self.assertEqual(unet["metadata_url"], "https://example.invalid/stale.safetensors")
+        self.assertNotIn("url", unet)
+        self.assertEqual(models["minimax_h3_turbo_4步加速_comfyui.safetensors"]["field"], "lora_name")
+
+    def test_loader_choices_distinguish_recognized_and_unrecognized_selections(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {
+                        "id": 1,
+                        "type": "VAELoader",
+                        "widgets_values_named": {"vae_name": "installed-vae.safetensors"},
+                        "properties": {},
+                    },
+                    {
+                        "id": 2,
+                        "type": "UNETLoader",
+                        "widgets_values_named": {"unet_name": "selected-unet.safetensors"},
+                        "properties": {},
+                    },
+                ]
+            },
+            loader_choices={
+                "VAELoader": {"input": {"required": {"vae_name": [["installed-vae.safetensors"]]}}},
+                "UNETLoader": {"input": {"required": {"unet_name": [["other-unet.safetensors"]]}}},
+            },
+        )
+
+        statuses = {item["name"]: item["loader_status"] for item in report["models"]}
+        self.assertEqual(statuses, {
+            "installed-vae.safetensors": "recognized",
+            "selected-unet.safetensors": "unrecognized",
+        })
+
+    def test_nested_loader_widget_without_metadata_is_extracted(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        report = inspect_workflow(
+            {
+                "nodes": [],
+                "definitions": {
+                    "subgraphs": [
+                        {
+                            "nodes": [
+                                {
+                                    "id": 125,
+                                    "type": "LoraLoaderModelOnly",
+                                    "widgets_values": ["nested-lora.safetensors", 0.75],
+                                    "widgets_values_named": {
+                                        "lora_name": "nested-lora.safetensors",
+                                        "strength_model": 0.75,
+                                    },
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertEqual([item["name"] for item in report["models"]], ["nested-lora.safetensors"])
+        self.assertEqual(report["models"][0]["nodes"], ["125"])
+
     def test_inspection_matches_exact_registered_class_types_and_counts_instances(self):
         from omniscience.workflow_parser import inspect_workflow
 
@@ -3210,7 +3424,9 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["installable_missing_node_count"], 1)
         self.assertEqual(plan["nodes"][0]["class_type"], "CurrentMissingNode")
         saved_inspection = self.agent.workflow_job(self.job["id"])["metadata"]["inspection"]
-        self.assertEqual(saved_inspection["inspection_version"], 3)
+        from omniscience.workflow_parser import WORKFLOW_INSPECTION_VERSION
+
+        self.assertEqual(saved_inspection["inspection_version"], WORKFLOW_INSPECTION_VERSION)
 
     async def test_repair_route_requires_authorized_action_and_keeps_workflow(self):
         from omniscience.api import deps
@@ -4108,6 +4324,195 @@ class WorkflowModelSourceTests(unittest.IsolatedAsyncioTestCase):
             "models": [{"name": name, "field": field, "local_status": "missing"} for name, field in models],
         }
         self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+    def test_inspection_refresh_matching_prefers_directory_and_basename_over_other_directories(self):
+        current = {"name": "nested/Flux.SAFETENSORS", "directory": "models\\vae"}
+        matching = {"field": "vae_name", "name": "flux.safetensors", "directory": "vae"}
+        other_directory = {"field": "checkpoint_name", "name": "flux.safetensors", "directory": "checkpoints"}
+
+        self.assertIs(
+            workflow_manager.WorkflowManagerMixin._find_previous_model(current, [other_directory, matching]),
+            matching,
+        )
+        self.assertIsNone(workflow_manager.WorkflowManagerMixin._find_previous_model(current, [other_directory]))
+
+    def test_inspection_refresh_matching_keeps_legacy_field_name_fallback(self):
+        current = {
+            "field": "vae_name",
+            "name": "flux.safetensors",
+            "directory": "models/vae",
+        }
+        previous = {
+            "field": "vae_name",
+            "name": "flux.safetensors",
+            "directory": "",
+        }
+
+        self.assertIs(workflow_manager.WorkflowManagerMixin._find_previous_model(current, [previous]), previous)
+
+    def test_inspection_refresh_does_not_bridge_directoryless_model_to_valid_directory_state(self):
+        current = {
+            "field": "vae_name",
+            "name": "flux.safetensors",
+            "directory": "",
+        }
+        previous = {
+            "field": "vae_name",
+            "name": "flux.safetensors",
+            "directory": "models/vae",
+        }
+
+        self.assertIsNone(workflow_manager.WorkflowManagerMixin._find_previous_model(current, [previous]))
+
+    def test_inspection_refresh_merges_user_state_and_invalid_directory_blocks_it(self):
+        model = {
+            "name": "flux.safetensors",
+            "directory": "models/vae",
+            "directory_invalid": False,
+        }
+        previous = {
+            "url": "https://example/flux",
+            "source": {"repo_id": "acme/flux"},
+            "source_url": "https://huggingface.co/acme/flux/resolve/main/flux.safetensors",
+            "source_candidates": [{"repo_id": "acme/flux", "filename": "vae/flux.safetensors"}],
+            "local_paths": ["/models/vae/flux.safetensors"],
+            "local_status": "installed",
+            "download_status": "completed",
+            "local_selection": {"path": "/models/vae/flux.safetensors"},
+            "download_allowed": True,
+            "directory_invalid": True,
+        }
+
+        workflow_manager.WorkflowManagerMixin._merge_persisted_model_state(model, previous)
+
+        self.assertEqual(model["url"], previous["url"])
+        self.assertEqual(model["source"], previous["source"])
+        self.assertEqual(model["source_url"], previous["source_url"])
+        self.assertEqual(model["source_candidates"], previous["source_candidates"])
+        self.assertTrue(model["directory_invalid"])
+        self.assertEqual(model["local_paths"], [])
+        self.assertEqual(model["local_status"], "missing_directory")
+        self.assertEqual(model["download_status"], "missing_directory")
+        self.assertIsNone(model["local_selection"])
+        self.assertFalse(model["download_allowed"])
+
+    def test_current_comfyui_folder_registration_overrides_stale_invalid_metadata(self):
+        self._add_missing_models([("minimax_h3_video_vae_fp16.safetensors", "vae_name")])
+        comfyui = Path(self.directory.name) / "ComfyUI"
+        model_dir = comfyui / "models" / "vae"
+        model_dir.mkdir(parents=True)
+        (model_dir / "minimax_h3_video_vae_fp16.safetensors").write_bytes(b"vae")
+        self.agent.settings.update({"comfyui_directory": str(comfyui)})
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["inspection"]["models"][0].update(
+            {"directory": "models/vae", "directory_invalid": True}
+        )
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        with patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "folder_paths",
+            return_value={"vae": [str(model_dir)]},
+        ):
+            model = self.agent.dependency_plan(self.job["id"])["models"][0]
+
+        self.assertEqual(model["status"], "installed")
+        self.assertFalse(model["directory_invalid"])
+        self.assertTrue(model["metadata_directory_invalid"])
+        self.assertTrue(model["directory_resolved"])
+        self.assertEqual(
+            model["local_paths"],
+            [str((model_dir / "minimax_h3_video_vae_fp16.safetensors").resolve())],
+        )
+
+    def test_dependency_plan_excludes_loader_recognized_models_from_missing_models(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["candidate"] = {"id": "candidate", "node_sources": [], "model_sources": []}
+        metadata["inspection"] = {
+            "missing_nodes": [],
+            "unverified_nodes": [],
+            "models": [
+                {
+                    "name": "minimax_h3_video_vae_fp16.safetensors",
+                    "directory": "vae",
+                    "loader_status": "recognized",
+                    "local_status": "missing",
+                },
+                {
+                    "name": "MiniMax-H3_fl2va_int8_convrot.safetensors",
+                    "directory": "diffusion_models",
+                    "loader_status": "unrecognized",
+                    "local_status": "missing",
+                },
+            ],
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        plan = self.agent.dependency_plan(self.job["id"])
+
+        self.assertEqual(
+            [item["name"] for item in plan["models"]],
+            ["MiniMax-H3_fl2va_int8_convrot.safetensors"],
+        )
+        self.assertEqual(
+            [item["name"] for item in plan["missing_models"]],
+            ["MiniMax-H3_fl2va_int8_convrot.safetensors"],
+        )
+        self.assertEqual(
+            [item["name"] for item in plan["recognized_models"]],
+            ["minimax_h3_video_vae_fp16.safetensors"],
+        )
+
+    def test_dependency_plan_refresh_preserves_legacy_model_source_state(self):
+        workflow = {
+            "prompt": {
+                "7": {
+                    "class_type": "CustomLoader",
+                    "inputs": {},
+                    "properties": {
+                        "models": [{"name": "vae/flux.safetensors", "directory": "models/vae"}],
+                    },
+                }
+            }
+        }
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["workflow"] = workflow
+        metadata["inspection"] = {
+            "inspection_version": 3,
+            "missing_nodes": [],
+            "unverified_nodes": [],
+            "models": [
+                {
+                    "field": "vae_name",
+                    "name": "flux.safetensors",
+                    "directory": "",
+                    "source": {"repo_id": "acme/flux"},
+                    "source_candidates": [{"repo_id": "acme/flux", "filename": "vae/flux.safetensors"}],
+                    "local_paths": ["/models/vae/flux.safetensors"],
+                    "local_status": "installed",
+                    "download_status": "completed",
+                    "local_selection": {"path": "/models/vae/flux.safetensors"},
+                    "download_allowed": True,
+                }
+            ],
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value={}), patch.object(
+            self.agent,
+            "_model_folders",
+            return_value=({"vae": []}, "test", ""),
+        ):
+            plan = self.agent.dependency_plan(self.job["id"])
+
+        refreshed = self.agent.workflow_job(self.job["id"])["metadata"]["inspection"]["models"][0]
+        self.assertEqual(refreshed["directory"], "models/vae")
+        self.assertEqual(refreshed["source"], {"repo_id": "acme/flux"})
+        self.assertEqual(refreshed["source_candidates"], metadata["inspection"]["models"][0]["source_candidates"])
+        self.assertEqual(refreshed["local_paths"], ["/models/vae/flux.safetensors"])
+        self.assertEqual(refreshed["download_status"], "completed")
+        self.assertEqual(plan["models"], [])
+        self.assertEqual(plan["missing_models"], [])
 
     def test_registered_folder_paths_are_preferred_with_category_level_legacy_fallback(self):
         comfyui = Path(self.directory.name) / "ComfyUI"
