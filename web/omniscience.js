@@ -35,6 +35,7 @@ const state = {
   uploadBusy: false,
   networkBusy: false,
   nodeInstallBusy: false,
+  nodeScans: {},
   editingSkillId: "",
   cursor: -1,
   view: "chat",
@@ -2327,21 +2328,32 @@ function renderMessages() {
   if (shouldFollow) log.scrollTop = log.scrollHeight;
 }
 
-function nodeActions(control, onClick) {
+function nodeScanStateKey(kind, value) {
+  return `${kind}:${value}`;
+}
+
+function nodeActions(control, onClick, scanKey) {
   const wrap = el("span", "omniscience-node-actions");
+  const scanning = state.nodeScans[scanKey]?.status === "scanning";
   // The project rows are buttons, so the scan control has to stay a span.
-  const scan = el("span", "omniscience-node-scan", "安全检测");
+  const scan = el("span", "omniscience-node-scan", scanning ? "检测中…" : "安全检测");
   scan.setAttribute("role", "button");
+  scan.setAttribute("aria-busy", scanning ? "true" : "false");
+  scan.setAttribute("aria-disabled", scanning ? "true" : "false");
   scan.title = "按设置里的检测方式扫描该项目源码（AI/混合模式会调用模型）";
+  if (scanning) scan.classList.add("busy");
   const run = async () => {
-    if (scan.classList.contains("busy")) return;
-    scan.classList.add("busy");
+    if (state.nodeScans[scanKey]?.status === "scanning") return;
+    state.nodeScans[scanKey] = { status: "scanning", error: "" };
+    renderTasks();
     try {
       await onClick();
+      delete state.nodeScans[scanKey];
     } catch (error) {
+      state.nodeScans[scanKey] = { status: "failed", error: error.message };
       setNodeScanStatus(`检测失败：${error.message}`);
     } finally {
-      scan.classList.remove("busy");
+      renderTasks();
     }
   };
   scan.onclick = (event) => {
@@ -2508,13 +2520,19 @@ async function deleteTask(task) {
 
 function taskNodeRow(task) {
   const active = !state.globalChatActive && task.id === currentTaskId();
+  const scanKey = nodeScanStateKey("task", task.id);
+  const scanState = state.nodeScans[scanKey];
+  const nodeStatus = scanState?.status === "scanning" ? "检测中" : scanState?.status === "failed" ? "检测失败" : statusText(task.status);
+  const nodeStatusClass = scanState?.status === "scanning" ? "running" : scanState?.status === "failed" ? "failed" : statusClass(task.status);
   const row = button("", `omniscience-task-node${active ? " active" : ""}`);
-  const port = el("span", `omniscience-task-node-port ${statusClass(task.status)}`);
+  const port = el("span", `omniscience-task-node-port ${nodeStatusClass}`);
   port.setAttribute("aria-hidden", "true");
   const header = el("span", "omniscience-task-node-header");
+  const status = el("span", `omniscience-task-node-status ${nodeStatusClass}`, nodeStatus);
+  if (scanState?.status === "failed") status.title = scanState.error || "安全检测失败，可重新检测。";
   header.append(
     el("strong", "omniscience-task-title", task.folder || task.title || "未命名项目"),
-    el("span", `omniscience-task-node-status ${statusClass(task.status)}`, statusText(task.status)),
+    status,
   );
   const description = el("span", "omniscience-task-node-description", task.title || "未命名任务");
   const footer = el("span", "omniscience-task-node-footer");
@@ -2524,7 +2542,7 @@ function taskNodeRow(task) {
     el("span", "omniscience-task-node-date", taskDate(task)),
   );
   row.append(port, header, description, footer);
-  row.appendChild(nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id)));
+  row.appendChild(nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id), scanKey));
   const open = el("span", "omniscience-node-open", "打开工作流");
   open.setAttribute("role", "button");
   open.tabIndex = 0;
@@ -2581,7 +2599,7 @@ function externalProjectRow(project) {
     el("span", "omniscience-task-node-date", taskDate({ updated_at: project.modified_at })),
   );
   row.append(port, header, description, footer);
-  row.appendChild(nodeActions(skillSecurityControl(project.security), () => scanProject(project.folder)));
+  row.appendChild(nodeActions(skillSecurityControl(project.security), () => scanProject(project.folder), nodeScanStateKey("project", project.folder)));
   row.title = project.path;
   row.onclick = () => adoptProject(project.folder);
   return row;
@@ -3789,6 +3807,42 @@ function renderSettings() {
     finally { save.disabled = false; }
   };
   area.append(contextLabel, hint, save);
+  appendDonationSection(area);
+}
+
+function appendDonationSection(area) {
+  const section = el("section", "omniscience-donation");
+  section.appendChild(el("h4", "omniscience-workflow-section-title", "支持项目"));
+  section.appendChild(el("p", "omniscience-hint", "如果这个项目对你有帮助，可以自愿打赏支持后续开发。打赏不影响任何功能。"));
+  const options = el("div", "omniscience-donation-options");
+  section.appendChild(options);
+  const regionSelect = area.querySelector("select[name=network_region]");
+  const render = () => {
+    options.replaceChildren();
+    const region = regionSelect?.value || "domestic";
+    if (region !== "international") {
+      const alipay = el("div", "omniscience-donation-item");
+      alipay.appendChild(el("strong", "", "国内用户 · 支付宝"));
+      const image = document.createElement("img");
+      image.className = "omniscience-donation-qr";
+      image.src = new URL("./assets/donation/alipay-qr.jpg", import.meta.url).href;
+      image.alt = "支付宝打赏收款码";
+      image.loading = "lazy";
+      alipay.appendChild(image);
+      options.appendChild(alipay);
+    }
+    if (region !== "domestic") {
+      const usdt = el("div", "omniscience-donation-item");
+      usdt.appendChild(el("strong", "", "海外用户 · USDT"));
+      usdt.appendChild(el("p", "omniscience-hint", "BNB Smart Chain (BEP-20)"));
+      usdt.appendChild(el("code", "omniscience-donation-address", "0x31babbb634bb46df0298d0edb93c1f4eaac73f85"));
+      usdt.appendChild(el("p", "omniscience-hint", "转账前请核对网络与地址，加密货币转账不可撤销。"));
+      options.appendChild(usdt);
+    }
+  };
+  regionSelect?.addEventListener("change", render);
+  render();
+  area.appendChild(section);
 }
 
 function skillEditorField(label, name, value, multiline = false) {

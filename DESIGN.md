@@ -1,11 +1,12 @@
 # ComfyUI Omniscience 编程插件设计文档
 
-本文档描述 ComfyUI Omniscience 侧栏编程助手的架构设计，参照
-`ref_code/omniscience/apps/vscode/ARCHITECTURE.md` 中 Cline VS Code 扩展的分层方式：
-激活与初始化、前后端通信通道、Controller/Coordinator 协调边界、任务与 Session 生命周期、
-事件回灌、工具执行与审批、取消 fence，以及关键设计约束。
+本文档描述 ComfyUI Omniscience 侧栏编程助手的独立架构设计。插件运行在 ComfyUI
+进程内，由前端扩展、HTTP 路由、持久化层与 Agent 运行时共同组成。设计重点是明确
+初始化、通信、任务与会话生命周期、事件回灌、工具执行、审批和取消机制之间的边界，
+使交互体验、并发正确性与安全约束可以分别演进。
 
-文档同时标注每一层的**当前实现位置**与**目标设计**，作为后续迭代的依据。
+文档同时标注每一层的**当前实现**与**目标设计**。当前实现以模块和符号定位，不依赖
+易随代码漂移的行号；目标设计说明拆分动机、职责与验收条件，作为后续迭代依据。
 
 ## 范围
 
@@ -16,8 +17,9 @@
 - 浏览器工具：`omniscience_browser.py`
 - 下游边界：OpenAI-compatible LLM 接口、Playwright、MCP server、Shadow Git
 
-本文档不覆盖 Cline SDK 包（`@omniscience/core`、`@omniscience/agents` 等）的内部实现；
-本项目不依赖 Cline 运行时，只参考其架构模式。
+本文档只描述 ComfyUI Omniscience 自身的模块、协议与运行时，不依赖其他编程助手或
+Agent SDK 的实现。OpenAI-compatible 接口、Playwright、MCP server 与 Shadow Git
+仅作为可替换的下游能力出现。
 
 ## 总体链路
 
@@ -49,13 +51,9 @@ ComfyUI 前端
                                 └─ LLM host:   OpenAI-compatible /chat/completions
 ```
 
-对照 Cline：`extension.ts` 对应 `__init__.py`；`VscodeWebviewProvider + grpc-handler`
-对应 aiohttp 路由层；`SdkController + coordinators` 对应目标 `OmniscienceController`；
-`ClineCore / VscodeSessionHost` 对应 `PersistentClineAgent` 内部的 Agent 循环与工具执行。
-
-当前 `PersistentClineAgent`（omniscience_server.py:1585）同时承担了 Controller、
-Session 生命周期、Agent 循环、工具分发和检查点五种职责。本文档第 4 节给出的拆分方式
-是对 Cline coordinator 边界的直接移植。
+当前主任务 Agent 同时承担了 Controller、Session 生命周期、Agent 循环、工具分发和
+检查点五种职责。第 4 节按变化频率与故障边界拆分：路由协议、任务控制、会话生命周期、
+模型循环、消息持久化和检查点分别演进，避免一次修改牵动整条执行链。
 
 ---
 
@@ -67,15 +65,14 @@ Session 生命周期、Agent 循环、工具分发和检查点五种职责。本
 __init__.py
 ```
 
-激活阶段（对应 Cline 的 `activate()`）：
+后端激活阶段：
 
 1. 声明 `WEB_DIRECTORY = "./web"`，由 ComfyUI 逐文件加载 `web/omniscience.js`。
 2. `from server import PromptServer` 后调用 `register_routes(PromptServer.instance)`。
 3. 注册失败仅打印告警，不阻断 ComfyUI 启动。
 4. `NODE_CLASS_MAPPINGS` 为空——本插件是纯"后端路由 + 前端扩展"，不提供节点。
 
-前端初始化（对应 Cline 的 `VscodeWebviewProvider.resolveWebviewView`）在
-`omniscience.js:1236` 的 `registerExtension.setup()` 中完成：
+前端初始化在 `omniscience.js` 的 `registerExtension.setup()` 中完成：
 
 - `ensureStyle()` 动态注入 CSS；
 - `installLauncher()` 注册右上角 `Omniscience` 按钮；
@@ -84,27 +81,25 @@ __init__.py
 
 ### Host 抽象
 
-Cline 用 `HostProvider` 隔离 `vscode` API；本项目的全局依赖是
-`PromptServer.instance` 与 ComfyUI 前端 `app` 对象。目标设计是把二者收敛为两个薄
-adapter，其余代码不直接引用：
+ComfyUI 宿主依赖目前直接表现为 `PromptServer.instance` 与前端 `app` 对象。目标设计是
+把二者收敛为两个薄 adapter，其余代码不直接引用：
 
 - 后端 `ComfyUIHost`：画布序列化接口、custom_nodes 软链目录、输出目录；
 - 前端 `ComfyUIApp`：`app.canvas` 序列化、toast 通知。
 
-当前软链与工作流同步逻辑已分散在 `PersistentClineAgent._ensure_comfyui_link`
-（omniscience_server.py:1798）和 `omniscience.js:92`，是收敛的第一批候选。
+当前软链与工作流同步逻辑已分散在主任务 Agent 的 `_ensure_comfyui_link`
+和 `web/omniscience.js` 中，是收敛的第一批候选。
 
 ---
 
 ## 2. 前后端通信通道
 
-### Cline 的做法
+### 通信模型取舍
 
-Webview 通过 `postMessage` 上的 gRPC-over-bridge 与 Extension Host 通信，核心特征：
-
-- unary request（UUID 标识、单请求单响应）；
-- streaming request（多次 `grpc_response`，显式取消）；
-- 两条独立通道：`subscribeToPartialMessage`（低延迟增量）与 `subscribeToState`（完整快照）。
+侧栏需要同时满足两类需求：用户提交动作后立即得到确认，多步 Agent 执行期间持续看到
+文本与工具进度。仅使用阻塞请求会把 HTTP 连接生命周期与任务生命周期绑定；仅使用全量
+快照则会增加带宽并放大刷新时的状态覆盖风险。因此目标模型区分动作、增量事件与完整
+状态三条通道。
 
 ### 当前实现
 
@@ -119,14 +114,13 @@ omniscience.js                          omniscience_server.py
 
 1. `POST messages` 阻塞到整轮结束，模型多步循环期间 UI 只靠轮询感知进度；
 2. 浏览器刷新或切换页面会取消该 HTTP 请求，aiohttp handler 收到
-   `CancelledError`，虽然状态由 `finally` 兜底（omniscience_server.py:1924、2217），
-   但该轮响应内容丢失；
+   `CancelledError`，虽然状态由 `finally` 兜底，但该轮响应内容丢失；
 3. 事件 payload（`assistant_text`、`tool_result` 已带内容）在前端 `applyEvents`
-   （omniscience.js:454）只被用来翻转 busy 状态，随后整仓重拉消息——事件流退化为心跳。
+   只被用来翻转 busy 状态，随后整仓重拉消息——事件流退化为心跳。
 
 ### 目标设计：请求与推送解耦
 
-保留 REST 的简单性，同时移植 Cline 的"partial + state 双通道"模型：
+保留 REST 的简单性，同时建立“partial + state 双通道”模型：
 
 | 通道 | 端点 | 目的 | 特性 |
 | --- | --- | --- | --- |
@@ -134,10 +128,10 @@ omniscience.js                          omniscience_server.py
 | partial 通道 | `GET /tasks/{id}/events?after=`（SSE 化） | 低延迟显示流式文本与工具进度 | fire-and-forget、按 seq 收敛；轮询作为 SSE 不可用时的降级 |
 | state 通道 | `GET /tasks/{id}` | 完整 task/messages/history/settings 快照 | 断线重连、页面刷新后的重新同步 |
 
-关键原则与 Cline 一致：
+关键原则：
 
 - **消息发送不阻塞 agent turn**：agent 运行在后端独立任务中，HTTP 连接断开不影响运行；
-- **持久事件日志即 partial 流**：`TaskStore.append_event`（omniscience_core.py:351）
+- **持久事件日志即 partial 流**：`TaskStore.append_event`
   已经是带单调游标的事件表，天然满足"按 seq/epoch 收敛、丢弃 stale"的要求，只需前端
   真正消费 payload 并按 `task_id + seq` 合并；
 - **state 快照负责最终一致**：任何 seq 缺口或客户端重启后，以 `GET /tasks/{id}` 收敛。
@@ -146,17 +140,14 @@ omniscience.js                          omniscience_server.py
 
 ## 3. 事件模型与消息回灌
 
-Cline 的回路：`CoreSessionEvent → SdkSessionEventCoordinator → message translator →
-WebviewGrpcBridge → partial/state streams`。
-
-本项目的对应回路（已存在，需补齐语义）：
+本项目的回路（已存在，需补齐语义）：
 
 ```text
 Agent 循环阶段完成
   ↓
-_event(task_id, kind, payload)            omniscience_server.py:1719
+_event(task_id, kind, payload)
   ↓
-TaskStore.append_event（SQLite, WAL）      omniscience_core.py:351
+TaskStore.append_event（SQLite, WAL）
   ↓
 前端 pollEvents / SSE
   ↓
@@ -173,42 +164,42 @@ applyEvents：按 kind 更新本地消息副本 + turn 状态
    `turn_started`、`text_delta`（引入流式后）、`tool_started`（工具开始执行，区别于结果），
    使 UI 能显示"正在执行 write_file…"而不是一步结束后才出现结果。
 2. **active session 过滤**。事件 payload 增加 `session_id`（见第 4 节），前端与后端
-   都丢弃非当前 session 的迟到事件——对应 Cline 约束"session event 必须按 active
-   session 过滤"。
-3. **前端不做二次翻译**。消息在写入事件时即为最终展示形态（对应 Cline 的
-   "WebviewGrpcBridge 不会再次翻译已翻译过的 session event"）。
+   都丢弃非当前 session 的迟到事件，防止旧运行覆盖当前任务状态；
+3. **前端不做二次翻译**。消息在写入事件时即为最终展示形态；展示所需的模式标记
+   剥离与格式化只发生在前端边界，不改变持久化事实。
 
 ---
 
 ## 4. Controller 与 Coordinator 拆分
 
-Cline 把任务/session 协调集中在 `SdkController`，按职责拆出多个 coordinator。
+任务协调应集中于 `OmniscienceController`，并按职责拆出多个 coordinator。这样路由
+只关心协议，控制操作各有独立边界，模型循环不再承担会话与检查点管理。
 本项目当前是三个并存的 Agent 类：
 
 | 类 | 位置 | 现状职责 |
 | --- | --- | --- |
-| `ClineAgent` | omniscience_server.py:838 | 旧版无状态 `/omniscience/chat` 兼容 |
-| `GlobalChatAgent` | omniscience_server.py:1145 | 全局对话 + GitHub Skill 安装 |
-| `PersistentClineAgent` | omniscience_server.py:1585 | 主运行时：任务、循环、工具、检查点 |
+| 兼容对话 Agent | `omniscience_server.py` | 旧版无状态 `/omniscience/chat` 兼容 |
+| 全局对话 Agent | `omniscience_server.py` | 全局对话 + GitHub Skill 安装 |
+| 主任务 Agent | `omniscience_server.py` | 主运行时：任务、循环、工具、检查点 |
 
 目标设计（不要求一步到位，允许在单文件内先拆为私有类）：
 
 | 组件 | 主要职责 | 现状来源 |
 | --- | --- | --- |
-| `OmniscienceController` | 路由 handler 的唯一入口；暴露 `initTask/askResponse/cancelTask/clearTask/showTaskWithId/getState/dispose` | `register_routes` 内的三处单例（omniscience_server.py:2443-2468） |
-| `TaskStartCoordinator` | 新建任务：项目目录、workflow 模板、custom_nodes 软链、session input、启动 | `create_task` L1847 + `chat` L1896 前半 |
-| `TaskControlCoordinator` | 取消、清理历史、切换任务 | `cancel_task` L1756、`clear_history` L1771 |
+| `OmniscienceController` | 路由 handler 的唯一入口；暴露 `initTask/askResponse/cancelTask/clearTask/showTaskWithId/getState/dispose` | `register_routes` 内的三处单例 |
+| `TaskStartCoordinator` | 新建任务：项目目录、workflow 模板、custom_nodes 软链、session input、启动 | `create_task` 与 `chat` 前半 |
+| `TaskControlCoordinator` | 取消、清理历史、切换任务 | `cancel_task`、`clear_history` |
 | `FollowupCoordinator` | 后续消息：运行中入队 / idle 续跑 / 无 live session 时从 transcript 恢复 | 当前只有"串行排队"，无队列与 resume 分支 |
 | `SessionLifecycle` | 每任务一个 session：start、active 引用、subscribe、stop、销毁 | 隐式散布在 `_running_tasks`/`_cancel_requested` |
-| `AgentRuntime` | 模型 → 工具 → 结果回灌循环（≤ MAX_AGENT_STEPS） | `_run_loop` L2155 |
-| `MessageCoordinator` | 消息持久化、上下文压缩触发、事件写出 | `_compact_messages` L2019、`_event` L1719 |
-| `CheckpointCoordinator` | 写类工具后快照、diff、恢复 | `_checkpoint_after_tool` L2421 |
+| `AgentRuntime` | 模型 → 工具 → 结果回灌循环（≤ MAX_AGENT_STEPS） | `_run_loop` |
+| `MessageCoordinator` | 消息持久化、上下文压缩触发、事件写出 | `_compact_messages`、`_event` |
+| `CheckpointCoordinator` | 写类工具后快照、diff、恢复 | `_checkpoint_after_tool` |
 | `InteractionCoordinator` | 工具审批（若恢复审批）、`ask_question` | 当前审批链路为兼容壳，见第 6 节 |
 
 ### Session 隔离（最重要的结构性改动）
 
-Cline 每个任务一个 `SdkSession`，事件按 session id 过滤。本项目当前用
-**一把全局 `asyncio.Lock`**（omniscience_server.py:1616，`_run_loop` L2156 持有）
+每个任务需要独立 Session，事件也应按 session id 过滤。本项目当前用
+**一把全局 `asyncio.Lock`**（主任务 Agent 的 `_lock`，由 `_run_loop` 持有）
 串行化所有任务的 agent 运行：任务 A 编码时，任务 B 的对话完全排队。
 
 目标设计：
@@ -233,8 +224,8 @@ SessionLifecycle
 
 ### 5.1 新任务启动链路（目标）
 
-对照 Cline 的 `newTask → initTask → SdkTaskStartCoordinator → startNewSession →
-fireAndForgetSend`：
+新任务必须完成初始化并持久化用户消息，再异步启动 Session；HTTP 层不应等待模型
+循环结束。目标链路如下：
 
 ```text
 前端 sendMessage()（新任务先 createTask）
@@ -242,18 +233,18 @@ fireAndForgetSend`：
 POST /omniscience/tasks                       controller.create_task
   ↓
 TaskStartCoordinator.init_task()
-  ├─ _project_folder_name 校验（防穿越，L134）；重名目录明确拒绝
-  ├─ 创建目录 + 写 workflow.json 模板（exclusive-open，L227）
-  ├─ 软链到 ComfyUI custom_nodes（L1798），失败回滚
+  ├─ _project_folder_name 校验（防穿越）；重名目录明确拒绝
+  ├─ 创建目录 + 写 workflow.json 模板（exclusive-open）
+  ├─ 软链到 ComfyUI custom_nodes（_ensure_comfyui_link），失败回滚
   ├─ SQLite 记录 task，写 task_created/task_started 事件
-  ├─ 用户消息先入库并发事件（UI 立刻可见，对应 Cline"初始消息先于 session 启动加入"）
+  ├─ 用户消息先入库并发事件，确保 UI 在模型运行前即可见
   └─ SessionLifecycle.start(task_id) → AgentRuntime 以 fire-and-forget 启动
        （HTTP 立即返回 202，进度走事件通道）
 ```
 
 ### 5.2 一轮对话的 Agent 循环
 
-当前实现即 Cline 18.5 节"模型—工具循环"的精简版：
+当前实现采用有步数上限的“模型—工具”循环：
 
 ```text
 _run_loop (≤ MAX_AGENT_STEPS=8)
@@ -284,62 +275,60 @@ tool-result 以 role:"tool" 消息写 SQLite → 下一次迭代携带完整历�
 1. **流式模型调用**：payload 加 `"stream": true`，解析
    `delta.content`/`delta.tool_calls`，产出 `text_delta`/`tool_call_started` 事件；
    这也让取消能在模型输出中途生效；
-2. **follow-up 队列**：session 运行中收到新消息时入 Core 队列（对应 Cline
-   `SdkFollowupCoordinator` 分支 3），在下一轮 `prepareModelRequest` 边界消费，
-   而不是等整轮结束或拒绝输入；
+2. **follow-up 队列**：session 运行中收到新消息时入 Core 队列，在下一轮
+   `prepareModelRequest` 边界消费，而不是等整轮结束或拒绝输入；
 3. **resume**：任务有历史但无 live session 时，直接从 SQLite transcript 继续——
    当前已等价实现（每轮读全量消息），保留即可；
 4. **MCP 工具目录缓存**：`list_tools` 不应每步 spawn（见第 8 节）。
 
 ### 5.3 文件写入执行路径
 
-Cline 的结论（18.6 节）：**模型只提出编辑意图，写盘永远发生在 host 层**。本项目
+**模型只提出编辑意图，写盘永远发生在 host 层**。这条边界让文件结果可校验、可审计，
+也避免模型输出被直接当作可信文件内容。本项目
 三类写文件入口共走同一条路径：
 
 ```text
 模型发出 write_file / apply_patch tool call
   ↓
-_process_tool_calls (L2224)
+_process_tool_calls
   ├─ schema 校验（参数缺失/类型错误 → 错误 tool result 回灌，不执行）
-  ├─ Plan 模式：不在 PLAN_TOOL_NAMES → 直接返回错误 tool result（L2237）
+  ├─ Plan 模式：不在 PLAN_TOOL_NAMES → 直接返回错误 tool result
   ↓
-_execute_tool (L2384) → Workspace.write_file / apply_patch (L454)
-  ├─ _safe_relative (L442)：拒绝绝对路径与 ../ 穿越
-  ├─ stays_inside (L475)：解析 symlink 后仍在任务目录内
-  └─ apply_unified_patch (L587)：纯 Python 应用 unified diff
+_execute_tool → Workspace.write_file / apply_patch
+  ├─ _safe_relative：拒绝绝对路径与 ../ 穿越
+  ├─ stays_inside：解析 symlink 后仍在任务目录内
+  └─ apply_unified_patch：纯 Python 应用 unified diff
   ↓
 成功/失败都构造 tool result → role:"tool" 消息写入 SQLite
   ↓
-_checkpoint_after_tool (L2421)：shadow-git commit 或 tar 快照
+_checkpoint_after_tool：shadow-git commit 或 tar 快照
   ↓
 下一次模型请求携带"编辑结果 + 检查点"继续
 ```
 
-借鉴 Cline 的三处设计（`sdk/packages/core/src/extensions/tools/definitions.ts`）：
+文件编辑工具围绕三个目标设计：
 
-1. **精确编辑优先于整写。** Cline `editor` 工具描述明确要求"small, precise edits
-   用 editor 而不是 shell 命令"，输入是 `path + old_text/new_text`（或
-   `insert_line`），而不是整文件覆盖。当前 `write_file` 只支持全文覆盖，长文件
-   小改动消耗大量输出 token 且易截断。目标：新增 `editor` 等价工具承载
-   `old_text → new_text` 替换语义（复用 `apply_unified_patch` 的上下文匹配），
-   保留整写作为新建文件路径；
-2. **apply_patch 采用规范化文法并写进工具描述。** Cline 的 `apply_patch` 描述给出
-   完整文法（`*** Begin Patch / *** Update File: <path> / @@ / -old / +new /
-   *** End Patch`，支持 Add/Delete/Move 与 `*** Move to:`），基于上下文匹配、
+1. **精确编辑优先于整写。** 长文件的小改动如果要求整文件覆盖，会消耗大量输出 token
+   且易截断。工具应优先提供 `path + old_text/new_text`（或 `insert_line`）的精确编辑
+   语义，复用 `apply_unified_patch` 的上下文匹配；整写只作为新建文件或明确替换的路径。
+   当前 `write_file` 只支持全文覆盖，目标新增精确编辑工具；
+2. **apply_patch 采用规范化文法并写进工具描述。** 输入可使用
+   `*** Begin Patch / *** Update File: <path> / @@ / -old / +new /
+   *** End Patch`，支持 Add/Delete/Move 与 `*** Move to:`，基于上下文匹配、
    不带行号，并在描述中写明"`@@` 用于消歧重复代码块、不要使用行号"。这比裸
-   unified diff 对模型更友好（行号偏移、hunk 计数错误是主要失败源）。目标：
+   unified diff 对模型更友好，因为行号偏移与 hunk 计数错误是主要失败源。目标：
    把 `apply_unified_patch` 的输入描述升级为受控子集文法；
-3. **写类工具不可自动重试。** Cline 对 editor/apply_patch 设 `retryable: false`
-   ——编辑是有状态操作，重试会重复插入。本项目同样禁止后端静默重试：失败必须
-   把原因（哪一段上下文没匹配上）作为 tool result 回灌，让模型重读文件后再改。
+3. **写类工具不可自动重试。** 编辑是有状态操作，重试会重复插入。本项目禁止后端
+   静默重试：失败必须把原因（哪一段上下文没匹配上）作为 tool result 回灌，让模型
+   重读文件后再改。
 
-失败路径语义与 Cline 一致：拒绝或校验失败时**不写盘**，失败原因进入历史，
+失败路径语义：拒绝或校验失败时**不写盘**，失败原因进入历史，
 模型必须基于"修改没有发生"重新选择方案。
 
 ### 5.4 命令执行路径
 
-当前实现（`_run_command` L2266）：`Popen(start_new_session=True)` 独立进程组 +
-`BLOCKED_COMMANDS` 正则黑名单（L261）+ 取消时 SIGTERM 杀进程组。
+当前实现（`_run_command`）：`Popen(start_new_session=True)` 独立进程组 +
+`BLOCKED_COMMANDS` 正则黑名单，取消时 SIGTERM 杀进程组。
 
 ```text
 模型发出 run_commands tool call
@@ -355,39 +344,36 @@ Popen(cwd=任务目录, start_new_session=True) → 登记 _processes[task_id]
 取消路径：cancel fence（第 7 节）→ os.killpg(SIGTERM) → 进程组退出
 ```
 
-借鉴 Cline 的四处设计（`extensions/tools/definitions.ts`、`command-guard.ts`）：
+命令执行工具围绕四个目标设计：
 
-1. **非交互约束写进工具描述。** Cline `run_commands` 描述要求："Commands must be
-   non-interactive；需要交互输入的命令必须用无交互 flag 跳过或改参数（如
-   `git --no-pager`、`--non-interactive`）"。这一条能显著减少模型误跑
-   pager/REPL 导致的挂死；
-2. **双层防护：提示词第一道，command-guard 硬背托。** Cline 在 Plan 模式保留
-   `run_commands` 做只读调查，但由 command-guard 在执行前拦截：先遮蔽引号内容、
-   heredoc 体、转义与注释（防误报），再按 shell 分隔符切分，检查每段**首个命令
+1. **非交互约束写进工具描述。** 描述应明确要求命令使用无交互 flag 或参数
+   （如 `git --no-pager`、`--non-interactive`），避免模型误跑 pager/REPL 导致挂死；
+2. **双层防护：提示词第一道，command-guard 硬背托。** Plan 模式可以保留
+   `run_commands` 做只读调查，但执行前必须硬拦截：先遮蔽引号内容、heredoc 体、
+   转义与注释（防误报），再按 shell 分隔符切分，检查每段**首个命令
    词**是否命中写操作集合（rm/mv/cp/touch/chmod/patch/…，含 PowerShell 别名
    remove-item/ri 等）或 git 变更子命令（add/am/apply/…），并拒绝重定向到
-   `/tmp` 之外的文件；命中返回 tool error 而不执行。注释坦承"这是常见编辑手段
-   的黑名单，不是 shell 解释器"。当前 `BLOCKED_COMMANDS` 对原始字符串跑正则，
-   `bash -c`、管道、引号内文本既易漏也易误杀——移植"遮蔽 → 切分 → 首词匹配"
+   `/tmp` 之外的文件；命中返回 tool error 而不执行。这是常见编辑手段的
+   黑名单，不是 shell 解释器。当前 `BLOCKED_COMMANDS` 对原始字符串跑正则，
+   `bash -c`、管道、引号内文本既易漏也易误杀——目标采用"遮蔽 → 切分 → 首词匹配"
    三步法，Plan 模式改用该策略；
-3. **输出中段截断，保头保尾。** Cline 对超长命令输出做 middle-truncation（保留
-   开头与结尾，因为测试失败信息通常在结尾），并在描述中写明"超出约 Nk 字符会
-   被截断，需要特定段落时先过滤输出"。当前输出截断应对齐为中段截断；
-4. **环境相关约束写进工具描述。** Cline 的 `buildRunCommandsDescription` 按实际
-   执行 shell 生成不同描述（引号规则、串联操作符 `';'` vs `'&&'`、WSL 挂载路径），
-   且 description 是 provider 函数、每次组装模型请求时重新求值。本项目固定
-   POSIX shell，场景简单，但"shell 方言、cwd、超时都写在该工具自己的 description
-   里，而不是只写 system prompt"这一点直接采用。
+3. **输出中段截断，保头保尾。** 超长命令输出保留开头与结尾，因为测试失败信息
+   通常在结尾；描述中写明截断行为，需要特定段落时先过滤输出。当前输出截断应对齐为
+   中段截断；
+4. **环境相关约束写进工具描述。** 描述应反映实际执行 shell 的引号规则、串联操作符
+   与挂载路径，并在每次组装模型请求时重新求值。本项目固定 POSIX shell，场景简单，
+   但"shell 方言、cwd、超时都写在该工具自己的 description 里，而不是只写
+   system prompt"这一点直接采用。
 
 ### 5.5 浏览器访问路径
 
-`BrowserManager`（omniscience_browser.py:19）已实现按 task 隔离的 Playwright
+`BrowserManager`（`omniscience_browser.py`）已实现按 task 隔离的 Playwright
 会话，五个 `browser_*` 工具走与其他工具相同的校验 → 执行 → 结果回灌路径：
 
 ```text
 模型发出 browser_navigate / content / screenshot / click / fill
   ↓
-_execute_tool (L2384) → BrowserManager
+_execute_tool → BrowserManager
   ├─ 未安装 Playwright → BrowserUnavailable 转错误 tool result（提示安装，不抛异常）
   ├─ navigate：仅允许 http/https
   ├─ content：body 或 selector inner_text，截断 10 万字符
@@ -395,21 +381,20 @@ _execute_tool (L2384) → BrowserManager
   └─ per-task page（_pages[task_id]）；任务取消/清理时 close(task_id)
 ```
 
-"截图落工作区、结果给路径"与 Cline 的视觉反馈思路一致：模型拿不到图片本身时，
-用路径 + `content` 文本验证代替。目标增强：
-
+"截图落工作区、结果给路径"使模型在拿不到图片本身时，可以用路径 + `content`
+文本继续验证。目标增强：
 1. 跨任务浏览器全局 `asyncio.Lock` 改 per-task 锁（第 8 节）；
 2. `content` 超限时在结果尾部附截断标记与截断位置，提示模型改用 selector 缩小
-   范围——对齐 Cline "filter output when you need specific sections" 的描述惯例；
+   范围，而不是重复拉取整页；
 3. 工具描述补充 ComfyUI 场景闭环："开发节点后可用浏览器打开 ComfyUI、导入任务
    目录的 `workflow.json`、执行并截图验证节点图"——把**如何验证**写进描述，
    而不是等模型自己发明验证方式。
 
 ### 5.6 工具结果的统一回灌格式
 
-Cline 每个工具返回统一结构 `{ query, result, error, success }`（ToolOperationResult），
-tool result 按顺序写入 runtime state，下一轮请求携带完整历史。本项目目标：把
-`_execute_tool` 所有分支的返回值收敛为统一 schema，再序列化为 `role:"tool"` 消息：
+工具结果需要统一结构，使任意成功或失败都能按相同顺序进入 runtime state，并在下一轮
+请求中携带完整历史。本项目目标：把 `_execute_tool` 所有分支的返回值收敛为统一 schema，
+再序列化为 `role:"tool"` 消息：
 
 ```json
 { "tool": "run_commands", "success": false,
@@ -421,8 +406,8 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
 - 失败必须是**内容化的 tool result**（模型读到原因后能自愈），不允许只写事件
   不写消息，也不允许抛异常中断整轮；
 - 每个 tool result 与触发它的 assistant tool_calls 消息保持相邻；上下文压缩时
-  不拆散 assistant/tool 对（`ContextManager._split_messages`，core L713 已保证）；
-- 回灌顺序沿用 Cline 18.7：`工具执行完成 → tool-result message → 写入消息 state
+  不拆散 assistant/tool 对（`ContextManager._split_messages` 已保证）；
+- 回灌顺序固定为：`工具执行完成 → tool-result message → 写入消息 state
   → 发事件 → 下一次模型请求携带完整历史`。测试失败时，失败输出进入历史，模型
   据此再读取失败位置、修改文件、重跑测试——这就是"编码闭环"的全部机制。
 
@@ -468,10 +453,10 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
 
 ## 6. 审批与工具策略
 
-### Cline 的做法
+### 审批回路
 
-工具审批是核心回路：runtime 请求 approval → UI 展示 → `askResponse` →
-`SdkFollowupCoordinator` 解决 pending approval → 工具继续/拒绝；拒绝结果回灌模型。
+工具审批需要形成完整回路：runtime 请求 approval → UI 展示 → `askResponse` →
+协调层解决 pending approval → 工具继续/拒绝；拒绝结果回灌模型。
 
 ### 当前实现
 
@@ -485,7 +470,7 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
 
 ### 目标设计：policy 层取代 if-else
 
-不移植逐工具弹窗，但把"什么工具能执行"收敛为与 Cline tool policy 同构的声明层，
+不恢复逐工具弹窗，但把“什么工具能执行”收敛为声明式策略层，
 供本地 host 构造：
 
 ```python
@@ -502,8 +487,7 @@ ToolPolicy = {
 旧 pending 被静默批准"是最危险的状态——它让一个从未被 UI 消费的概念保留了改变
 执行结果的权力。
 
-Plan/Act 切换（对应 Cline 的 `togglePlanActModeProto`）当前是
-`PATCH /tasks/{id}/mode`（L2586 附近路由）。保持约束：模式必须进入下一轮
+Plan/Act 切换当前使用 `PATCH /tasks/{id}/mode`（路由注册处）。保持约束：模式必须进入下一轮
 session 配置与工具集合，不能只当 UI 标签。
 
 ---
@@ -512,7 +496,7 @@ session 配置与工具集合，不能只当 UI 标签。
 
 ### 取消：先建 fence，再 abort
 
-Cline 的次序（18.8 节）：`cancel fence → host.abort() → 过滤 abort 期间迟到事件 →
+取消流程的固定次序：`cancel fence → host.abort() → 过滤 abort 期间迟到事件 →
 发布取消后状态`。
 
 当前实现（`cancel_task` L1756）已具备骨架：
@@ -531,49 +515,47 @@ runtime.cancel()`，循环内有多个 `_check_cancelled` fence 点（L1722）�
 3. `cancel_task` 要求 status ∈ {running, waiting_approval}，与 store 改 idle 之间存在
    no-op 窗口——以 Session 对象是否存在为准，而不是以 DB status 为准；
 4. abort 之后到 runtime 真正退出之间产生的事件，打 `session_id` 后由
-   SessionEventCoordinator 依 active session 丢弃（对应 Cline"取消 fence 抑制迟到
-   显示事件"）。
+   SessionEventCoordinator 依 active session 丢弃，确保取消 fence 抑制迟到显示事件。
 
 ### 清空历史
 
-`clear_history`（L1771，运行中拒绝）保留语义；对齐 Cline `clearTask` 补充：
-清 pending approval/question、重置 translator 与 turn 状态、把完整 state 重新推送
-（前端 refreshTask 已覆盖）。
+`clear_history`（运行中拒绝）保留语义，并补齐以下清理：清 pending approval/question、
+重置 translator 与 turn 状态、把完整 state 重新推送（前端 refreshTask 已覆盖）。
 
 ### 打开历史任务
 
-Cline 用 generation fence 防止较早发起的历史加载覆盖较新的选择。本项目前端切换
-任务时同样需要：`showTask(taskId)` 记录请求世代，响应回来时若世代已过期则丢弃；
-后端切换是纯读操作，无 active session 冲突，主要防护点在前端异步回调。
+前端切换任务时需要 generation fence，防止较早发起的历史加载覆盖较新的选择：
+`showTask(taskId)` 记录请求世代，响应回来时若世代已过期则丢弃；后端切换是纯读操作，
+无 active session 冲突，主要防护点在前端异步回调。
 
 ---
 
 ## 8. 工具层与外部 host
 
-对照 Cline 的 `VscodeSessionHost` 注入能力 + `vscode-runtime-builder` 组装工具：
+工具能力通过 host 抽象注入，Agent 循环只消费统一工具协议，不直接依赖 ComfyUI 宿主对象：
 
 | 能力 | 当前实现 | 目标调整 |
 | --- | --- | --- |
 | 文件 | `Workspace`（L454）：resolve/list/read/search/write/apply_patch，路径防穿越 + symlink 逃逸检查 | `search_files` 全文件逐行读入；移植 ripgrep 或维护索引 |
-| 命令 | `_run_command`（L2266）Popen + 进程组取消 | 输出事件化：`tool_started` + 分块 `tool_output`（对应 VS Code terminal 的 Proceed While Running 语义可简化为 background + 轮询输出） |
+| 命令 | `_run_command` Popen + 进程组取消 | 输出事件化：`tool_started` + 分块 `tool_output`；长任务采用 background + 轮询输出 |
 | 编辑器/diff | 无 diff preview（ComfyUI 无编辑器宿主） | 以检查点 diff 替代：写后自动快照，UI 提供"查看本次修改" |
 | 浏览器 | `BrowserManager`（browser.py:19）：每 task 独立 page，5 个 `browser_*` 工具 | 跨任务全局 `asyncio.Lock` 串行——改为 per-task lock |
 | MCP | `MCPManager`（mcp.py:50）：手写 JSON-RPC，stdio + Streamable HTTP | **stdio 每次调用重新 spawn 子进程并 initialize**（L128、L224），且 `_tool_definitions` 每步都 `list_tools`（L1990）→ 每步 spawn 全部 server。目标：每 server 一个长驻连接 + 工具目录缓存（变更时失效），HTTP 复用 `Mcp-Session-Id` |
-| Skill | SkillStore + 消息级选择注入 system prompt | 对应 Cline 的 skills/rules 注入路径，保持 |
+| Skill | SkillStore + 消息级选择注入 system prompt | 保持现有注入路径，并在请求边界统一组装 |
 
-模型侧边界与 Cline 18.6 的结论一致：**模型只提出工具调用意图**；文件写入、命令执行、
-审批和 UI 更新都由后端 host 完成，结果以 tool message 回灌。
+模型侧边界固定为：**模型只提出工具调用意图**；文件写入、命令执行、审批和 UI 更新
+都由后端 host 完成，结果以 tool message 回灌。
 
 ---
 
 ## 9. Prompt 与上下文组装
 
-Cline 的 session config 把 system prompt、规则、skills、模式、mention、历史和工具定义
-组合成 `AgentModelRequest`。本项目对应关系：
+每次模型请求由 session config 统一组装 system prompt、项目规则、Skills、模式、mention、
+历史和工具定义。本项目对应关系：
 
 | 部分 | 内容 | 当前来源 |
 | --- | --- | --- |
-| 基础 system prompt | 角色、工作方式、验证要求 | `PersistentClineAgent` 内联提示词 |
+| 基础 system prompt | 角色、工作方式、验证要求 | 主任务 Agent 内联提示词 |
 | Plan/Act 约束 | 模式允许范围 + 工具白名单 | `PLAN_TOOL_NAMES` L55 |
 | Skills | 选中且启用的 Skill 注入 | SkillStore（core L470）+ 任务元数据 |
 | 会话历史 | 前面的 assistant/tool 消息 | SQLite messages 表（每轮全量读） |
@@ -581,38 +563,33 @@ Cline 的 session config 把 system prompt、规则、skills、模式、mention�
 | mention 上下文 | `@file`、画布工作流 | `get_current_workflow` + 前端实时画布同步（js:92） |
 | 工具定义 | 名称/描述/JSON schema | `TOOL_DEFINITIONS` L267 + MCP |
 
-目标增强（按 Cline 18.3 补齐，非必需项按 ROI 排序）：
+目标增强（按依赖关系与收益排序）：
 
 1. **文件 mention 解析**：用户输入 `@src/foo.py` 在后端展开为真实文件内容再入库，
-   而不是把 `@` 当普通文本；展开格式借鉴 Cline `formatFileContentBlock`
-   （format.ts）：`<file_content path="...">…</file_content>`；引用过的文件记入
-   FileContextTracker 等价物；
-2. **请求边界组装**：把"system prompt + 模式 + skills + 压缩历史 + 工具定义"的组装
+   而不是把 `@` 当普通文本；展开格式使用 `<file_content path="...">…</file_content>`，
+   引用过的文件记入 FileContextTracker 等价物；
+2. **请求边界组装**：把“system prompt + 模式 + skills + 压缩历史 + 工具定义”的组装
    收敛为独立的 `SessionConfigBuilder.build(task, mode, skills) -> ModelRequestSpec`，
-   Agent 循环只消费该 spec——对应 Cline 的 `sdk-session-config-builder`，也为将来
-   `beforeModel` hook（运行时注入最新 follow-up）留出挂点；
-3. **模式标记随消息持久化（直接移植）**。Cline 把每条用户消息包成
+   Agent 循环只消费该 spec，也为将来 `beforeModel` hook（运行时注入最新 follow-up）
+   留出挂点；
+3. **模式标记随消息持久化**。每条用户消息保存为
    `<user_input mode="plan|act">`，模式切换后的第一条消息前置
-   `<mode_notice>The user switched from plan mode to act mode…</mode_notice>`
-   （`createModeSwitchNoticeTracker`，plan→act→plan 未发消息的空往返会互相抵消）。
-   system prompt 里配套 `MODE_TAG_INSTRUCTIONS` 解释该机制："以最新一条消息的
-   mode 为准，早期消息的约束不代表现在允许"。这解决了我们当前模式切换后的
-   历史歧义：模型看到早期 Plan 对话里"不能改文件"，切到 Act 后可能继续拒绝
-   执行。目标：`chat()` 入库时按当轮 mode 包装，`_messages_for_model` 送模型前
-   保留包装、前端展示时剥离（Cline 用 `stripModeNotices` 做同样的显示分离）；
-4. **工具描述按请求边界重建**。Cline 把与执行环境相关的描述做成 provider 函数，
-   runtime 每次组装 `AgentModelRequest` 时重新求值（shell 换了，在途请求不受影响，
+   `<mode_notice>The user switched from plan mode to act mode…</mode_notice>`；
+   plan→act→plan 未发消息的空往返会互相抵消。system prompt 里配套
+   `MODE_TAG_INSTRUCTIONS` 解释该机制：“以最新一条消息的 mode 为准，早期消息的
+   约束不代表现在允许”。这解决了当前模式切换后的历史歧义：模型看到早期 Plan 对话里
+   “不能改文件”，切到 Act 后可能继续拒绝执行。目标：`chat()` 入库时按当轮 mode 包装，
+   `_messages_for_model` 送模型前保留包装、前端展示时剥离；
+4. **工具描述按请求边界重建**。把与执行环境相关的描述做成 provider 函数，
+   runtime 每次组装 `ModelRequestSpec` 时重新求值（shell 换了，在途请求不受影响，
    下一请求自动带上）。本项目对应点：Plan/Act 切换、MCP 服务器增删、Skill 选择
    变化都应体现在**下一次请求**的工具集合与描述里，而不是 session 级缓存；
-5. `.omnisciencerules` 等价物：项目目录内 `OMNISCIENCE.md` 规则文件自动注入（ComfyUI 节点
-   开发约定常与项目绑定，价值高于全局规则）。
+5. **项目规则文件**：项目目录内 `OMNISCIENCE.md` 自动注入（ComfyUI 节点开发约定
+   常与项目绑定，价值高于全局规则）。
 
-**System prompt 本体**从 Cline 直接借鉴改写：Act 基础提示词
-（`shared/src/prompt/system/act.ts`）、Plan 契约
-（`prompt/omniscience.ts` 的 `PLAN_MODE_INSTRUCTIONS_MANUAL_SWITCH`——VS Code 变体与我们
-一样要求用户手动切换开关，不存在 `switch_to_act_mode` 工具）、组装顺序
-（base → `{{CLINE_RULES}}`（含模式说明）→ `{{CLINE_METADATA}}` workspace 元数据
-→ preferred language 追加）。完整可用版本见**附录 A**。
+**System prompt 本体**由本项目独立维护：Act 基础提示词、Plan 契约与组装顺序
+（base → `{{OMNISCIENCE_RULES}}`（含模式说明）→ `{{OMNISCIENCE_METADATA}}` workspace
+元数据 → preferred language 追加）。完整可用版本见**附录 A**。
 
 压缩策略保持现状：先无工具摘要请求、失败回退本地截断、不拆散 assistant/tool 对。
 
@@ -620,8 +597,7 @@ Cline 的 session config 把 system prompt、规则、skills、模式、mention�
 
 ## 10. 持久化
 
-当前 SQLite 结构（core L48-122，WAL）即本项目相对 Cline 的差异化优势——Cline 的
-canonical transcript 在 SDK session history，而这里事件与消息都是持久事实：
+当前 SQLite 结构（WAL）把事件与消息都保存为持久事实：
 
 | 表 | 用途 |
 | --- | --- |
@@ -633,7 +609,7 @@ canonical transcript 在 SDK session history，而这里事件与消息都是持
 | `current_workflows` | 实时画布缓存（≤2MB，不覆盖项目 workflow.json） |
 | `skills.sqlite3`（独立库） | Skill CRUD、导入导出 |
 
-设计约束沿用 Cline 的"TaskProxy 不是 canonical transcript"在本项目的对应物：
+本项目的持久化约束是：**内存态不是 canonical transcript**。
 **内存态（`_running_tasks`、`_context_cache`、前端本地 messages）都只是缓存与
 投影，随时可从 SQLite 重建**。这使页面刷新、ComfyUI 重启后任务可恢复成为架构保证
 而非补丁。
@@ -788,20 +764,20 @@ GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gi
 
 ## 12. 生命周期结束与资源清理
 
-对应 Cline 的 `deactivate()/tearDown()`。ComfyUI 不提供可靠的插件 unload 钩子，
+生命周期清理入口为 `SessionLifecycle.stop_all()`。ComfyUI 不提供可靠的插件 unload 钩子，
 因此清理点定义为：
 
 - `SessionLifecycle.stop_all()`：结束所有 active session、杀进程组、关闭 Playwright、
   关闭 MCP 长驻连接；
 - 触发点：ComfyUI 进程退出（`atexit`/信号处理）与控制器重建；
-- 每个 stop 带超时并记录 warning，不阻塞整体退出（同 Cline 约束）；
+- 每个 stop 带超时并记录 warning，不阻塞整体退出；
 - 前端 `setInterval` 轮询在面板隐藏时降频，页面卸载自然终止。
 
 ---
 
 ## 13. 关键设计约束
 
-移植并改写 Cline 第 17 节的九条约束：
+本项目最关键的设计约束如下：
 
 1. **前端不直接访问 Agent Runtime。** 所有任务操作经 `/omniscience/*` 路由进入后端。
 2. **`OmniscienceController` 是任务与 session 的真实协调边界**，路由 handler 只做
@@ -846,8 +822,8 @@ GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gi
 | 符号 | 行号 | 对应本文档章节 |
 | --- | --- | --- |
 | `register_routes` | 2486 | 2 |
-| `PersistentClineAgent` | 1585 | 4 |
-| `PersistentClineAgent._lock` | 1616 | 4（session 隔离） |
+| 主任务 Agent（内部类） | 1585 | 4 |
+| 主任务 Agent 的 `_lock` | 1616 | 4（session 隔离） |
 | `create_task` | 1847 | 5 |
 | `chat` / `_run_loop` | 1896 / 2155 | 5 |
 | `cancel_task` / `clear_history` | 1756 / 1771 | 7 |
@@ -910,11 +886,10 @@ python3 -m py_compile __init__.py omniscience_server.py
 
 ---
 
-## 附录 A：提示词设计（借鉴 Cline，可直接采用）
+## 附录 A：提示词设计（可直接采用）
 
-来源：`ref_code/omniscience/sdk/packages/shared/src/prompt/`（act.ts、omniscience.ts、
-format.ts），已按 ComfyUI Omniscience 场景改写。占位符由
-`SessionConfigBuilder`（第 9 节）在每次组装请求时填充。
+以下提示词由 ComfyUI Omniscience 独立维护，面向 ComfyUI 自定义节点开发场景。
+占位符由 `SessionConfigBuilder`（第 9 节）在每次组装请求时填充。
 
 ### A.1 Act 模式基础 system prompt
 
@@ -983,14 +958,13 @@ without using tools.
 {{PREFERRED_LANGUAGE}}
 ```
 
-最后一段 `# Preferred Language` 沿用 Cline 做法：非默认语言时在末尾追加
-`Speak in <language>.`；`{{SKILLS_AND_RULES}}` 依次注入项目 `OMNISCIENCE.md`、
-选中的启用 Skill；`{{WORKSPACE_METADATA}}` 为任务项目目录、模式、最近 git
-提交等结构化 JSON。
+最后一段 `# Preferred Language` 在非默认语言时追加 `Speak in <language>.`；
+`{{SKILLS_AND_RULES}}` 依次注入项目 `OMNISCIENCE.md`、选中的启用 Skill；
+`{{WORKSPACE_METADATA}}` 为任务项目目录、模式、最近 git 提交等结构化 JSON。
 
 ### A.2 Plan / Act 模式标记说明（`{{MODE_SECTIONS}}` 第一部分）
 
-移植自 `MODE_TAG_INSTRUCTIONS`，解释持久化的 `<user_input mode="...">` 包装
+`MODE_TAG_INSTRUCTIONS` 解释持久化的 `<user_input mode="...">` 包装
 （第 9 节目标增强 3）：
 
 ```text
@@ -1007,8 +981,7 @@ A <mode_notice> block inside a message marks exactly when such a switch happened
 
 ### A.3 Plan 模式契约（手动切换变体）
 
-移植自 `PLAN_MODE_INSTRUCTIONS_MANUAL_SWITCH`——与本项目一致：UI 有 Plan/Act
-开关、不给模型切换工具：
+以下契约与 UI 一致：提供 Plan/Act 开关，不向模型开放模式切换工具：
 
 ```text
 # Plan Mode
@@ -1038,17 +1011,16 @@ manually with the Plan/Act toggle. If the task requires act-mode tools, ask the
 user to "toggle to Act mode" (use those words).
 ```
 
-注意与现状的差异：当前 Plan 模式直接隐藏 `run_commands`（`PLAN_TOOL_NAMES`），
-Cline 的做法是**保留只读调查能力 + command-guard 硬拦截写操作**（5.4 节），
-配合上面这段契约。目标设计采用后者：模型在 Plan 模式能 grep、看 git diff，
-但不可能改任何东西。
+注意与现状的差异：当前 Plan 模式直接隐藏 `run_commands`（`PLAN_TOOL_NAMES`）。
+目标设计是**保留只读调查能力 + command-guard 硬拦截写操作**（5.4 节），配合上面这段
+契约，使模型在 Plan 模式能 grep、看 git diff，但不可能改任何东西。
 
 ### A.4 工具描述模板
 
 各写进该工具自己的 `description`（对齐 5.3–5.5 的"环境约束放在工具描述"原则），
 schema 保持 JSON Schema：
 
-**editor（新增，精确编辑）** —— 借鉴 Cline `editor`：
+**editor（新增，精确编辑）**：
 
 ```text
 An editor for controlled text edits on the file at `path`. Provide `insert_line`
@@ -1060,7 +1032,7 @@ multiple editor calls in the same response instead of serializing them across
 turns.
 ```
 
-**apply_patch（升级描述）** —— 借鉴 Cline 的 freeform 文法（内容行规则、`@@`
+**apply_patch（升级描述）** —— 使用受控 freeform 文法（内容行规则、`@@`
 消歧、禁用行号）：
 
 ```text
@@ -1107,7 +1079,7 @@ file path. Use after wiring a workflow (import the project workflow.json) to
 verify node graph and outputs visually.
 ```
 
-**工具层共同规则**（写进每个描述或公共说明，借鉴 Cline 一致性做法）：
+**工具层共同规则**（写进每个描述或公共说明，确保执行边界一致）：
 
 - 写类工具（editor/apply_patch/write_file/run_commands 的变更命令）不可自动
   重试；失败原文必须作为 tool result 回灌；
@@ -1116,8 +1088,7 @@ verify node graph and outputs visually.
 
 ### A.5 组装顺序
 
-`SessionConfigBuilder` 输出顺序（对齐 Cline `buildClineSystemPrompt` 的模板替换
-次序）：
+`SessionConfigBuilder` 按以下顺序输出并填充模板：
 
 ```text
 ACT_BASE
@@ -1130,5 +1101,5 @@ ACT_BASE
   + "\n\n" + "# Preferred Language\nSpeak in <lang>."（非英文时）
 ```
 
-override 规则同 Cline：若未来支持用户自定义完整 system prompt（override），
-则跳过 base 与模式段，仅按需在尾部补 workspace metadata。
+override 规则：若未来支持用户自定义完整 system prompt（override），则跳过 base 与模式段，
+仅按需在尾部补 workspace metadata。

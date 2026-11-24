@@ -66,7 +66,7 @@
 .omniscience-task-node-description { overflow: hidden; color: #bdb7cd; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .omniscience-task-node-status { flex: 0 0 auto; border: 1px solid #5b536f; border-radius: 10px; padding: 1px 6px; color: #bbb6ce; font-size: 10px; line-height: 1.4; }
 .omniscience-task-node-status.running { border-color: #8f713f; color: #e5c47e; }
-.omniscience-task-node-status.cancelled { border-color: #874b58; color: #e39a9a; }
+.omniscience-task-node-status.cancelled, .omniscience-task-node-status.failed { border-color: #874b58; color: #e39a9a; }
 .omniscience-task-node-footer { color: #8f899f; font-size: 10px; }
 .omniscience-task-node-mode { color: #aaa0e9; }
 .omniscience-task-prompt-length { overflow: hidden; color: #aaa5b8; text-overflow: ellipsis; white-space: nowrap; }
@@ -91,6 +91,11 @@
 .omniscience-node-install-status { margin: 8px 0 0; font-size: 11px; line-height: 1.5; }
 .omniscience-node-install .omniscience-hint { margin: 6px 0 0; font-size: 10px; line-height: 1.5; }
 .omniscience-settings-readonly { margin: 4px 0; color: #8f89a5; font-size: 11px; word-break: break-all; }
+.omniscience-donation { margin-top: 24px; border-top: 1px solid #373445; padding-top: 8px; }
+.omniscience-donation-options { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 14px; }
+.omniscience-donation-item { display: flex; min-width: 220px; flex: 1 1 260px; flex-direction: column; gap: 7px; border: 1px solid #45405a; border-radius: 8px; padding: 12px; background: #24222d; }
+.omniscience-donation-qr { width: min(220px, 100%); height: auto; align-self: center; border-radius: 6px; background: #fff; }
+.omniscience-donation-address { display: block; padding: 10px; border: 1px solid #4a4560; border-radius: 6px; color: #e8ddff; background: #1d1c25; font: 11px/1.6 ui-monospace, SFMono-Regular, monospace; user-select: all; word-break: break-all; }
 .omniscience-tool-result-details { margin: 4px 0; border: 1px solid #45405a; border-radius: 6px; padding: 6px 8px; color: #aaa5b8; background: #211f2b; }
 .omniscience-tool-result-details summary { color: #c8c2da; cursor: pointer; font-size: 11px; }
 .omniscience-tool-result-body { max-height: 360px; overflow: auto; margin-top: 6px; }

@@ -8452,9 +8452,9 @@ class WebRegressionTests(unittest.TestCase):
         source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
         style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
 
-        self.assertIn("function nodeActions(control, onClick)", source)
-        self.assertIn("nodeActions(skillSecurityControl(project.security), () => scanProject(project.folder))", source)
-        self.assertIn("nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id))", source)
+        self.assertIn("function nodeActions(control, onClick, scanKey)", source)
+        self.assertIn('nodeActions(skillSecurityControl(project.security), () => scanProject(project.folder), nodeScanStateKey("project", project.folder))', source)
+        self.assertIn('nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id), scanKey)', source)
         self.assertIn('request("/omniscience/custom-nodes/scan", { method: "POST"', source)
         self.assertIn('request("/omniscience/custom-nodes/scan-all", { method: "POST", body: "{}" })', source)
         self.assertIn("`/omniscience/tasks/${encodeURIComponent(taskId)}/scan`", source)
@@ -8464,11 +8464,52 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn("function setNodeScanStatus(message)", source)
         self.assertIn("omniscience-node-scan-status", source)
         # The project rows are buttons, so the scan control must stay a span.
-        self.assertIn('el("span", "omniscience-node-scan", "安全检测")', source)
+        self.assertIn('el("span", "omniscience-node-scan", scanning ? "检测中…" : "安全检测")', source)
         self.assertNotIn('button("安全检测", "omniscience-node-scan")', source)
         self.assertIn("event.stopPropagation();", source)
         for selector in ("omniscience-node-actions", "omniscience-node-scan", "omniscience-scan-nodes", "omniscience-node-scan-status"):
             self.assertIn(f".{selector}", style)
+
+    def test_task_node_security_scan_status_is_visible(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+
+        self.assertIn("nodeScans: {}", source)
+        self.assertIn("function nodeScanStateKey(kind, value)", source)
+        self.assertIn('state.nodeScans[scanKey] = { status: "scanning", error: "" };', source)
+        self.assertIn('state.nodeScans[scanKey] = { status: "failed", error: error.message };', source)
+        self.assertIn('scanState?.status === "scanning" ? "检测中"', source)
+        self.assertIn('scanState?.status === "failed" ? "检测失败"', source)
+        self.assertIn('if (scanState?.status === "failed") status.title = scanState.error', source)
+        self.assertIn('delete state.nodeScans[scanKey];', source)
+        self.assertIn(".omniscience-task-node-status.failed", style)
+
+    def test_settings_donation_section_follows_network_region(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+        donation_start = source.index("function appendDonationSection(area)")
+        donation_end = source.index("function skillEditorField", donation_start)
+        donation = source[donation_start:donation_end]
+
+        self.assertIn("area.append(contextLabel, hint, save);\n  appendDonationSection(area);", source)
+        self.assertIn('el("h4", "omniscience-workflow-section-title", "支持项目")', donation)
+        self.assertIn('const region = regionSelect?.value || "domestic";', donation)
+        self.assertIn('if (region !== "international")', donation)
+        self.assertIn('if (region !== "domestic")', donation)
+        self.assertIn('regionSelect?.addEventListener("change", render);', donation)
+        self.assertIn('new URL("./assets/donation/alipay-qr.jpg", import.meta.url).href', donation)
+        self.assertIn("BNB Smart Chain (BEP-20)", donation)
+        self.assertIn("0x31babbb634bb46df0298d0edb93c1f4eaac73f85", donation)
+        self.assertIn('image.alt = "支付宝打赏收款码"', donation)
+        for selector in ("omniscience-donation", "omniscience-donation-options", "omniscience-donation-item", "omniscience-donation-qr", "omniscience-donation-address"):
+            self.assertIn(f".{selector}", style)
+
+        asset = root / "web" / "assets" / "donation" / "alipay-qr.jpg"
+        self.assertTrue(asset.is_file())
+        self.assertEqual(asset.read_bytes()[:2], b"\xff\xd8")
+        self.assertIn('src="web/assets/donation/alipay-qr.jpg"', (root / "README_zh-CN.md").read_text(encoding="utf-8"))
 
     def test_node_install_ui_is_wired(self):
         root = Path(__file__).resolve().parents[1]
