@@ -18,8 +18,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from html.parser import HTMLParser
 
 from .agent.github_skill import GitHubSkillInstaller
 from .agent.node_install import NodeInstallerMixin
@@ -28,8 +29,8 @@ from .region_router import RegionRouter
 MAX_RESULTS = 8
 MAX_RESPONSE_BYTES = 1_000_000
 GITHUB_API_BASE = "https://api.github.com"
-GITHUB_PROXY_PREFIX = "https://gh-proxy.com/"
-GITHUB_PROXY_HOST = "gh-proxy.com"
+GITHUB_PROXY_PREFIX = "https://github.tbap.top/"
+GITHUB_PROXY_HOST = "github.tbap.top"
 MANAGER_GITHUB_ENDPOINT = f"{GITHUB_PROXY_PREFIX.rstrip('/')}/https://github.com"
 DOMESTIC_PIP_INDEX_URL = "https://mirrors.aliyun.com/pypi/simple/"
 MANAGER_MAPPING_PATH = "/v2/customnode/getmappings?mode=local"
@@ -46,6 +47,8 @@ CONFIRMED_NODE_PACKAGE_IDS = {
     "Text": {"kaytool"},
 }
 _PIP_ENVIRONMENT_LOCK = threading.RLock()
+SEARCH_ENGINE_USER_AGENT = "Comfyui-omniscience-Node-Search/1.0"
+SEARCH_ENGINE_HOSTS = {"cn.bing.com", "www.bing.com", "www.google.com", "google.com"}
 
 
 @contextlib.contextmanager
@@ -81,7 +84,7 @@ def _manager_pip_environment(decision: Any) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _manager_git_environment(decision: Any) -> Iterator[None]:
+def _manager_git_environment(decision: Any, proxy_base: str = "https://github.tbap.top") -> Iterator[None]:
     """Configure Manager's native GitHub endpoint for the queued install.
 
     Manager does not clone the URL from the queue payload verbatim. Its Git
@@ -99,9 +102,14 @@ def _manager_git_environment(decision: Any) -> Iterator[None]:
         git_utils = sys.modules.get("comfyui_manager.common.git_utils")
         previous_module_endpoint = getattr(git_utils, "GITHUB_ENDPOINT", None) if git_utils is not None else None
         try:
-            os.environ["GITHUB_ENDPOINT"] = MANAGER_GITHUB_ENDPOINT
+            proxy_base = str(proxy_base or "https://github.tbap.top").strip().rstrip("/")
+            proxy = urlparse(proxy_base)
+            if proxy.scheme != "https" or not proxy.hostname or proxy.username or proxy.password or proxy.port not in {None, 443}:
+                raise ValueError("GitHub 国内代理地址必须是无认证的 HTTPS 地址。")
+            manager_endpoint = f"{proxy_base}/https://github.com"
+            os.environ["GITHUB_ENDPOINT"] = manager_endpoint
             if git_utils is not None:
-                git_utils.GITHUB_ENDPOINT = MANAGER_GITHUB_ENDPOINT
+                git_utils.GITHUB_ENDPOINT = manager_endpoint
             yield
         finally:
             if previous_environment is None:
@@ -153,6 +161,169 @@ def _result(item: Any, *, platform: str) -> dict[str, Any] | None:
         "updated_at": str(item.get("updated_at") or ""),
         "language": str(item.get("language") or ""),
     }
+
+
+class _NodeSearchResultParser(HTMLParser):
+    """Collect generic search-result anchors without depending on CSS classes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._href = ""
+        self._text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a" or self._href:
+            return
+        href = str(dict(attrs).get("href") or "").strip()
+        if href:
+            self._href = href
+            self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self._href:
+            return
+        self.results.append({
+            "href": self._href,
+            "title": re.sub(r"\s+", " ", " ".join(self._text)).strip()[:500],
+        })
+        self._href = ""
+        self._text = []
+
+
+class _SearchEngineRedirectHandler(HTTPRedirectHandler):
+    """Keep regional node searches on their selected search engine."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        parsed = urlparse(new_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in SEARCH_ENGINE_HOSTS or parsed.port not in {None, 443}:
+            raise ValueError("节点搜索尝试跳转到不受支持的搜索站点，已阻止。")
+        return super().redirect_request(request, response, code, message, headers, new_url)
+
+
+def _search_result_target(href: Any, base_url: str) -> str:
+    """Unwrap Bing/Google result links and return an absolute HTTPS URL."""
+    value = urljoin(base_url, str(href or "").strip())
+    parsed = urlsplit(value)
+    if (parsed.hostname or "").lower() in SEARCH_ENGINE_HOSTS:
+        query = parse_qs(parsed.query)
+        value = unquote(str((query.get("q") or query.get("url") or [""])[0]))
+    return value
+
+
+def _github_repository_root_from_search_target(target: Any) -> str | None:
+    """Turn a GitHub repository content result into its strict repository URL.
+
+    Search engines commonly link to a README under ``blob`` rather than to the
+    repository root.  That is useful evidence for discovering a repository, but
+    it must never be retained as an install source.  Only ``blob`` and ``tree``
+    links are eligible for this normalization; issue, pull-request, release,
+    user, and arbitrary GitHub pages remain rejected.
+    """
+    value = str(target or "").strip()
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != "github.com"
+        or parsed.username
+        or parsed.password
+        or parsed.port not in {None, 443}
+    ):
+        return None
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) == 2:
+        root = value.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    elif len(parts) >= 4 and parts[2].lower() in {"blob", "tree"}:
+        root = f"https://github.com/{parts[0]}/{parts[1]}"
+    else:
+        return None
+    try:
+        host, owner, repository, prefix, ref = NodeInstallerMixin._node_repository_source(root)
+    except (TypeError, ValueError):
+        return None
+    if host != "github.com" or prefix or ref:
+        return None
+    return f"https://github.com/{owner}/{repository}"
+
+
+class WebNodeSearcher:
+    """Search the regional web engine for strict GitHub repository-root candidates."""
+
+    @staticmethod
+    def _search_url(region: str, class_type: str, limit: int) -> tuple[str, str]:
+        query = f'"{class_type}"'
+        count = max(1, min(MAX_RESULTS, int(limit)))
+        if region == "domestic":
+            engine = "bing"
+            url = "https://cn.bing.com/search?" + urlencode({"q": query, "count": count, "first": 1})
+        else:
+            engine = "google"
+            url = "https://www.google.com/search?" + urlencode({"q": query, "num": count, "start": 0})
+        return engine, url
+
+    @classmethod
+    def search_url(cls, class_type: Any, *, region: str, limit: int = MAX_RESULTS) -> tuple[str, str]:
+        name = _class_name(class_type, "区域 Web 搜索")
+        selected_region = str(region or "").strip().lower()
+        if selected_region not in {"domestic", "international"}:
+            raise ValueError("区域 Web 搜索必须选择 domestic 或 international。")
+        return cls._search_url(selected_region, name, limit)
+
+    @staticmethod
+    def _request_html(url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in SEARCH_ENGINE_HOSTS:
+            raise ValueError("节点搜索地址无效。")
+        request = Request(url, headers={"Accept": "text/html", "User-Agent": SEARCH_ENGINE_USER_AGENT})
+        try:
+            with build_opener(_SearchEngineRedirectHandler()).open(request, timeout=20) as response:
+                body = response.read(4_000_000)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            raise ValueError("区域 Web 节点搜索请求失败。") from exc
+        return body.decode("utf-8", errors="replace")
+
+    @classmethod
+    def search(cls, class_type: Any, *, region: str, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
+        name = _class_name(class_type, "区域 Web 搜索")
+        selected_region = str(region or "").strip().lower()
+        if selected_region not in {"domestic", "international"}:
+            raise ValueError("区域 Web 搜索必须选择 domestic 或 international。")
+        engine, url = cls._search_url(selected_region, name, limit)
+        parser = _NodeSearchResultParser()
+        parser.feed(cls._request_html(url))
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in parser.results:
+            target = _search_result_target(item.get("href"), url)
+            canonical = _github_repository_root_from_search_target(target)
+            if not canonical:
+                continue
+            key = canonical.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            owner, repository = canonical.removeprefix("https://github.com/").split("/", 1)
+            results.append({
+                "full_name": f"{owner}/{repository}",
+                "source": canonical,
+                "url": canonical,
+                "repository": canonical,
+                "provider": "web_search",
+                "region": selected_region,
+                "search_engine": engine,
+                "search_query": url,
+                "title": item.get("title") or f"{owner}/{repository}",
+                "description": "",
+                "verified": False,
+                "match": "web_search_repository_root",
+            })
+            if len(results) >= 1:
+                break
+        return results
 
 
 class GitHubNodeSearcher:
@@ -251,6 +422,7 @@ class ComfyUIManagerClient:
         self.settings = settings
         self.request_timeout = request_timeout
         self._last_candidates: list[dict[str, Any]] = []
+        self._last_resolution_error = ""
         self._mapping_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
     def _data(self) -> dict[str, Any]:
@@ -615,10 +787,12 @@ class ComfyUIManagerClient:
 
     def resolve_candidates(self, class_type: Any, *, aux_id: Any = "") -> list[dict[str, Any]]:
         name = _class_name(class_type, "ComfyUI-Manager")
+        self._last_resolution_error = ""
         cached_candidates = self.cached_candidates(name, aux_id=aux_id)
         try:
             mappings = self.mappings()
-        except ValueError:
+        except ValueError as exc:
+            self._last_resolution_error = str(exc)
             mappings = {}
         normalised = self._normalised_name(name)
         candidates: list[dict[str, Any]] = []
@@ -701,7 +875,8 @@ class ComfyUIManagerClient:
             # Preserve the existing Git fallback behavior when auto detection is
             # unavailable.  International pip behavior is also left untouched.
             decision = None
-        with _manager_pip_environment(decision), _manager_git_environment(decision):
+        proxy_base = str(self._data().get("github_proxy_base_url") or "https://github.tbap.top")
+        with _manager_pip_environment(decision), _manager_git_environment(decision, proxy_base):
             return self._install(
                 manager_id,
                 version=version,
@@ -799,10 +974,8 @@ class ComfyUIManagerClient:
             repository_name = repository_path.rsplit("/", 1)[-1].removesuffix(".git").strip()
             if repository_name:
                 package_id = repository_name
-        # Keep the canonical URL in the payload. Manager normalizes this URL
-        # and applies its native GITHUB_ENDPOINT immediately before cloning;
-        # passing ``https://gh-proxy.com/https://github.com/...`` here causes
-        # Manager to normalize it back to github.com.
+        # Keep the canonical GitHub URL here. Manager normalizes the repository
+        # and applies the configured GITHUB_ENDPOINT immediately before cloning.
         manager_repository = repository
         ui_id = f"omniscience-node-{uuid.uuid4().hex}"
         client_id = f"omniscience-{uuid.uuid4().hex}"

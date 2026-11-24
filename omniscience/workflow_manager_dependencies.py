@@ -108,7 +108,7 @@ class WorkflowDependencyMixin:
         # ``missing_nodes`` is the historical executable-only report.  The
         # install card must instead use the canvas dependency set so a bypassed
         # node is not silently omitted from the list ComfyUI needs to render.
-        missing_nodes = [
+        missing_nodes = list(dict.fromkeys(
             str(name)
             for name in (
                 inspection.get("installable_missing_nodes")
@@ -116,7 +116,7 @@ class WorkflowDependencyMixin:
                 or []
             )
             if str(name).strip()
-        ]
+        ))
         missing_node_instances = [
             item for item in (
                 inspection.get("installable_missing_node_instances")
@@ -125,6 +125,34 @@ class WorkflowDependencyMixin:
             )
             if isinstance(item, dict) and str(item.get("class_type") or "").strip()
         ]
+        failed_progress = job_metadata.get("node_install_progress") or {}
+        failed_class_type = str(failed_progress.get("current_node") or "").strip()
+        terminal_failure = failed_progress.get("status") == "failed" or failed_progress.get("interrupted") is True
+        loaded_nodes = {str(name) for name in inspection.get("loaded_node_types") or []}
+        if (
+            terminal_failure
+            and failed_class_type
+            and failed_class_type not in loaded_nodes
+            and failed_class_type not in missing_nodes
+        ):
+            workflow_nodes = [
+                item for item in (
+                    inspection.get("node_instances")
+                    or inspection.get("canvas_missing_node_instances")
+                    or []
+                )
+                if isinstance(item, dict) and str(item.get("class_type") or "") == failed_class_type
+            ]
+            if workflow_nodes:
+                missing_nodes.append(failed_class_type)
+                missing_node_instances.extend(
+                    item for item in workflow_nodes
+                    if not any(
+                        str(existing.get("id") or "") == str(item.get("id") or "")
+                        and str(existing.get("class_type") or "") == failed_class_type
+                        for existing in missing_node_instances
+                    )
+                )
         # Reports created before instance-level attribution only contain the
         # de-duplicated type list.  Reconstruct a minimal instance record for
         # those jobs so dependency planning remains resumable.

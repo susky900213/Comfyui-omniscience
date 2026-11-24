@@ -1386,7 +1386,7 @@ def _fake_github_repo(package: bytes):
     with patch.object(
         node_install.NodeInstallerMixin,
         "_github_default_branch",
-        staticmethod(lambda owner, repository: "main"),
+        staticmethod(lambda owner, repository, **_kwargs: "main"),
     ):
         with patch.object(
             node_install.NodeInstallerMixin,
@@ -1508,6 +1508,128 @@ class NodeInstallerTests(unittest.IsolatedAsyncioTestCase):
     def _github(self, package: bytes):
         with _fake_github_repo(package):
             yield
+
+    def test_github_tbap_proxy_archive_url_is_validated_and_downloaded(self):
+        package = b"zip package bytes"
+        settings = SettingsStore(Path(tempfile.mkdtemp()) / "settings.json")
+        settings.update({"github_proxy_base_url": "https://github.tbap.top"})
+        url = "https://github.tbap.top/https://github.com/KookYn9404/KOOK_ImageCompression/archive/" + "a" * 40 + ".zip"
+
+        class Response:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return None
+            def geturl(self):
+                return url
+            def read(self, _size):
+                return package
+
+        with patch.object(node_install, "build_opener") as build_opener:
+            build_opener.return_value.open.return_value = Response()
+            result = node_install.NodeInstallerMixin._download_github_archive_url(url, settings=settings)
+
+        self.assertEqual(result, package)
+        self.assertEqual(build_opener.return_value.open.call_args.args[0].full_url, url)
+        self.assertEqual(build_opener.return_value.open.call_args.kwargs["timeout"], node_install.DOWNLOAD_TIMEOUT_SECONDS)
+
+    def test_github_tbap_proxy_archive_rejects_non_github_targets(self):
+        settings = SettingsStore(Path(tempfile.mkdtemp()) / "settings.json")
+        settings.update({"github_proxy_base_url": "https://github.tbap.top"})
+        with self.assertRaisesRegex(ValueError, "代理 ZIP 地址无效"):
+            node_install.NodeInstallerMixin._download_github_archive_url(
+                "https://github.tbap.top/https://attacker.example/repo.zip", settings=settings
+            )
+
+    def test_github_rate_limit_falls_back_to_tbap_git_refs(self):
+        settings = SettingsStore(Path(tempfile.mkdtemp()) / "settings.json")
+        settings.update({"github_proxy_base_url": "https://github.tbap.top"})
+        refs = [("a" * 40, "refs/heads/main")]
+        with patch.object(node_install.NodeInstallerMixin, "_github_json", side_effect=ValueError("GitHub API 返回 403")), patch.object(
+            node_install.NodeInstallerMixin, "_github_proxy_git_refs", return_value=(refs, "main")
+        ) as git_refs:
+            branch = node_install.NodeInstallerMixin._github_default_branch(
+                "KookYn9404", "KOOK_ImageCompression", region="domestic", settings=settings
+            )
+            commit = node_install.NodeInstallerMixin._github_commit(
+                "KookYn9404", "KOOK_ImageCompression", "main", region="domestic", settings=settings
+            )
+        self.assertEqual(branch, "main")
+        self.assertEqual(commit, "a" * 40)
+        self.assertEqual(git_refs.call_count, 2)
+
+    def test_github_zip_fallback_tries_main_then_master_and_uses_safe_package_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _nodes = self._agent(Path(directory))
+            archive_urls = []
+            callback_events = []
+            installed = {"status": "installed", "path": str(Path(directory) / "custom_nodes" / "KOOK_ImageCompression")}
+
+            def proxy_url(url, *, region):
+                archive_urls.append(url)
+                return f"https://github.tbap.top/{url}", type("Decision", (), {"selected_region": region})()
+
+            def download(url, *, settings):
+                if "main.zip" in url:
+                    raise ValueError("main archive not found")
+                return b"master zip"
+
+            with patch.object(node_install.RegionRouter, "github_url", side_effect=proxy_url), patch.object(
+                node_install.NodeInstallerMixin, "_download_github_archive_url", side_effect=download
+            ), patch.object(
+                node_install.NodeInstallerMixin, "_install_package", AsyncMock(return_value=installed)
+            ) as safe_install:
+                result = asyncio.run(agent._install_github_branch_zip_fallback(
+                    "KookYn9404",
+                    "KOOK_ImageCompression",
+                    source="https://github.com/KookYn9404/KOOK_ImageCompression",
+                    expected_class_type="KOOK_SaveJPGImage",
+                    acknowledged=False,
+                    on_progress=callback_events.append,
+                    previous_error="Git executable missing",
+                ))
+
+            self.assertEqual(result["status"], "installed")
+            self.assertIn("/archive/refs/heads/main.zip", archive_urls[0])
+            self.assertIn("/archive/refs/heads/master.zip", archive_urls[1])
+            self.assertEqual(safe_install.await_args.kwargs["expected_class_type"], "KOOK_SaveJPGImage")
+            self.assertEqual(safe_install.await_args.kwargs["archive_name"], "KOOK_ImageCompression-master.zip")
+            self.assertEqual(len(callback_events), 3)
+            self.assertIn("main.zip 后备失败", callback_events[1]["manager_messages"][0])
+            self.assertIn("master.zip", callback_events[2]["manager_messages"][0])
+
+    def test_github_zip_fallback_does_not_try_another_branch_after_security_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _nodes = self._agent(Path(directory))
+            report = {"verdict": "review", "findings": [{"title": "network download"}]}
+            blocked = node_install.NodeSecurityBlockedError("KOOK_ImageCompression", report)
+            download_urls = []
+
+            def proxy_url(url, *, region):
+                return f"https://github.tbap.top/{url}", type("Decision", (), {"selected_region": region})()
+
+            def download(url, *, settings):
+                download_urls.append(url)
+                return b"main zip"
+
+            with patch.object(node_install.RegionRouter, "github_url", side_effect=proxy_url), patch.object(
+                node_install.NodeInstallerMixin, "_download_github_archive_url", side_effect=download
+            ), patch.object(
+                node_install.NodeInstallerMixin, "_install_package", AsyncMock(side_effect=blocked)
+            ):
+                with self.assertRaises(node_install.NodeSecurityBlockedError):
+                    asyncio.run(agent._install_github_branch_zip_fallback(
+                        "KookYn9404",
+                        "KOOK_ImageCompression",
+                        source="https://github.com/KookYn9404/KOOK_ImageCompression",
+                        expected_class_type="KOOK_SaveJPGImage",
+                        acknowledged=False,
+                        on_progress=None,
+                        previous_error="Git executable missing",
+                    ))
+
+            self.assertEqual(len(download_urls), 1)
+            self.assertIn("main.zip", download_urls[0])
 
     def test_github_install_lands_scanned_and_caches_the_report(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2683,7 +2805,7 @@ class GitHubNodeSearchTests(unittest.TestCase):
         self.assertEqual(results[0]["provider"], "github_proxy")
         self.assertEqual(results[0]["stars"], 12)
         proxy_url = request.call_args.args[0]
-        self.assertTrue(proxy_url.startswith("https://gh-proxy.com/https://api.github.com/search/repositories?"))
+        self.assertTrue(proxy_url.startswith("https://github.tbap.top/https://api.github.com/search/repositories?"))
         self.assertIn("per_page=8", request.call_args.args[0])
 
 
@@ -2955,12 +3077,13 @@ class ComfyUIManagerClientTests(unittest.TestCase):
 
         git_utils.get_url_for_clone = get_url_for_clone
         with patch.dict(node_search.sys.modules, {"comfyui_manager.common.git_utils": git_utils}, clear=False):
-            with node_search._manager_git_environment(decision):
-                self.assertEqual(os.environ["GITHUB_ENDPOINT"], node_search.MANAGER_GITHUB_ENDPOINT)
-                self.assertEqual(git_utils.GITHUB_ENDPOINT, node_search.MANAGER_GITHUB_ENDPOINT)
+            with node_search._manager_git_environment(decision, "https://github.tbap.top"):
+                expected_endpoint = "https://github.tbap.top/https://github.com"
+                self.assertEqual(os.environ["GITHUB_ENDPOINT"], expected_endpoint)
+                self.assertEqual(git_utils.GITHUB_ENDPOINT, expected_endpoint)
                 self.assertEqual(
                     git_utils.get_url_for_clone(repository),
-                    "https://gh-proxy.com/https://github.com/sonnybox/ComfyUI-SuperNodes",
+                    "https://github.tbap.top/https://github.com/sonnybox/ComfyUI-SuperNodes",
                 )
         self.assertEqual(os.environ.get("GITHUB_ENDPOINT"), previous)
         self.assertIsNone(git_utils.GITHUB_ENDPOINT)
@@ -3051,6 +3174,64 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
     def _restore_paths(self):
         self.paths.TASK_DATABASE, self.paths.SKILL_DATABASE, self.paths.STATE_DIRECTORY = self.previous
 
+    def test_regional_node_search_url_uses_google_for_international(self):
+        engine, url = node_search.WebNodeSearcher.search_url("KOOK_SaveJPGImage", region="international")
+        self.assertEqual(engine, "google")
+        self.assertTrue(url.startswith("https://www.google.com/search?"))
+        self.assertIn("KOOK_SaveJPGImage", url)
+
+    async def test_manager_timeout_falls_back_to_regional_web_search(self):
+        from importlib import import_module
+
+        node_sources_module = import_module("omniscience.workflow_manager_node_sources")
+        web_candidate = {
+            "source": "https://github.com/KOOK-Team/ComfyUI-KOOK",
+            "repository": "https://github.com/KOOK-Team/ComfyUI-KOOK",
+            "full_name": "KOOK-Team/ComfyUI-KOOK",
+            "provider": "web_search",
+            "region": "domestic",
+            "search_engine": "bing",
+            "title": "ComfyUI-KOOK",
+        }
+        with patch.object(
+            workflow_manager.ComfyUIManagerClient,
+            "resolve",
+            side_effect=TimeoutError("Manager mapping timeout"),
+        ), patch.object(
+            node_sources_module.RegionRouter,
+            "decide",
+            return_value=type("Decision", (), {"selected_region": "domestic"})(),
+        ), patch.object(
+            node_sources_module.WebNodeSearcher,
+            "search",
+            return_value=[web_candidate],
+        ) as web_search:
+            result = await self.agent.search_workflow_node_sources(self.job["id"])
+            web_search.assert_not_called()
+            self.assertIn("LoadMoss", result["manager_errors"])
+            web_result = await self.agent.search_workflow_node_web_sources(self.job["id"], ["LoadMoss"])
+        web_search.assert_called_once_with("LoadMoss", region="domestic")
+        self.assertEqual(web_result["results"]["LoadMoss"][0]["source"], web_candidate["source"])
+
+    async def test_web_search_failure_returns_manual_search_link(self):
+        from importlib import import_module
+
+        node_sources_module = import_module("omniscience.workflow_manager_node_sources")
+        with patch.object(
+            node_sources_module.RegionRouter,
+            "decide",
+            return_value=type("Decision", (), {"selected_region": "domestic"})(),
+        ), patch.object(
+            node_sources_module.WebNodeSearcher,
+            "search",
+            side_effect=ValueError("Bing fetch timeout"),
+        ):
+            result = await self.agent.search_workflow_node_web_sources(self.job["id"], ["LoadMoss"])
+
+        self.assertEqual(result["search_errors"]["LoadMoss"], "Bing fetch timeout")
+        self.assertTrue(result["search_urls"]["LoadMoss"].startswith("https://cn.bing.com/search?"))
+        self.assertEqual(result["search_engines"]["LoadMoss"], "bing")
+
     async def test_search_and_explicit_source_selection_are_persisted(self):
         manager_candidate = {
             "manager_id": "comfy-org/load-moss",
@@ -3104,6 +3285,73 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             deps._GLOBAL_CHAT_AGENT = previous_agent
 
+    async def test_start_node_installation_can_target_one_selected_node_type(self):
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata.update({
+            "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+            "inspection": {
+                "missing_nodes": ["KOOK_SaveJPGImage", "RH_RhartImageG2ImageToImage"],
+                "missing_node_instances": [
+                    {"id": "22", "class_type": "KOOK_SaveJPGImage", "properties": {}},
+                    {"id": "14", "class_type": "RH_RhartImageG2ImageToImage", "properties": {}},
+                ],
+                "unverified_nodes": [],
+                "models": [],
+            },
+            "node_source_selections": {
+                "KOOK_SaveJPGImage": {
+                    "source": "https://github.com/KookYn9404/KOOK_ImageCompression",
+                    "provider": "web_search",
+                    "region": "domestic",
+                },
+            },
+        })
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+
+        async def capture_confirm(job_id, *, class_types=None, **kwargs):
+            self.assertEqual(class_types, ["KOOK_SaveJPGImage"])
+            return {"status": "nodes_prepared", "nodes": [{"class_type": class_types[0]}]}
+
+        with patch.object(self.agent, "confirm_node_installation", side_effect=capture_confirm):
+            started = await self.agent.start_node_installation(
+                self.job["id"], confirmed=True, class_types=["KOOK_SaveJPGImage"]
+            )
+            await self.agent._node_install_tasks[self.job["id"]]
+
+        self.assertEqual(started["status"], "installing")
+        status = self.agent.node_install_status(self.job["id"])
+        self.assertEqual(status["status"], "completed")
+        self.assertTrue(status["progress"]["partial_install"])
+        self.assertEqual(status["progress"]["total"], 1)
+
+    async def test_background_node_package_security_block_is_persisted_for_card_review(self):
+        plan = {
+            "nodes": [{"class_type": "KOOK_SaveJPGImage", "source": "https://github.com/KookYn9404/KOOK_ImageCompression/tree/" + "a" * 40}],
+            "models": [],
+        }
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["dependency_plan"] = plan
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+        report = {
+            "verdict": "review",
+            "class_type": "KOOK_SaveJPGImage",
+            "findings": [{"severity": "medium", "title": "存在用途未明的外部下载"}],
+        }
+        blocked = node_install.NodeSecurityBlockedError("KOOK_ImageCompression", report)
+
+        async def fake_confirm(_job_id, *, progress_callback=None, **_kwargs):
+            progress_callback({"phase": "security_review", "current_node": "KOOK_SaveJPGImage"})
+            raise blocked
+
+        with patch.object(self.agent, "confirm_node_installation", side_effect=fake_confirm):
+            started = await self.agent.start_node_installation(self.job["id"], confirmed=True)
+            with self.assertRaises(node_install.NodeSecurityBlockedError):
+                await self.agent._node_install_tasks[self.job["id"]]
+
+        status = self.agent.node_install_status(self.job["id"])
+        self.assertEqual(status["status"], "security_review_required")
+        self.assertEqual(status["progress"]["security"]["findings"][0]["title"], "存在用途未明的外部下载")
+
     async def test_node_installation_runs_in_background_and_persists_progress(self):
         plan = {
             "nodes": [
@@ -3118,6 +3366,25 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_confirm(_job_id, *, progress_callback=None, **_kwargs):
             progress_callback({
+                "phase": "queued",
+                "current": 1,
+                "completed": 0,
+                "current_node": "SigmasGraph",
+                "current_plugin": "ComfyUI-SuperNodes",
+                "manager_task_id": "manager-task-1",
+                "manager_status": "queued",
+            })
+            progress_callback({
+                "phase": "running",
+                "current": 1,
+                "completed": 0,
+                "current_node": "SigmasGraph",
+                "current_plugin": "ComfyUI-SuperNodes",
+                "manager_task_id": "manager-task-1",
+                "manager_status": "running",
+                "manager_messages": ["正在下载插件", "正在安装依赖"],
+            })
+            progress_callback({
                 "phase": "installing",
                 "current": 1,
                 "completed": 0,
@@ -3131,6 +3398,7 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
                 "phase": "completed",
                 "completed": 1,
                 "completed_plugin": "ComfyUI-SuperNodes",
+                "installed_path": str(Path(self.directory.name) / "custom_nodes" / "ComfyUI-SuperNodes"),
             })
             progress_callback({
                 "phase": "installing",
@@ -3153,7 +3421,12 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["progress"]["total"], 2)
         self.assertEqual(status["progress"]["completed_plugin"], "ComfyUI-SuperNodes")
         self.assertEqual(status["progress"]["completed_plugins"], ["ComfyUI-SuperNodes"])
+        self.assertEqual(
+            status["progress"]["completed_installations"],
+            [{"plugin": "ComfyUI-SuperNodes", "path": str(Path(self.directory.name) / "custom_nodes" / "ComfyUI-SuperNodes")}],
+        )
         self.assertEqual(status["progress"]["manager_task_id"], "manager-task-1")
+        self.assertEqual(status["progress"]["current_plugin"], "KayTool")
         self.assertIn("正在下载插件依赖", status["progress"]["events"])
         self.assertIn("已完成：ComfyUI-SuperNodes", status["progress"]["events"])
         self.assertEqual(self.agent.workflow_job(self.job["id"])["state"], "selected")
@@ -3263,7 +3536,7 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(current.status, 200)
             self.assertEqual(json.loads(current.text)["progress"]["completed"], 1)
             start_install.assert_awaited_once_with(
-                self.job["id"], confirmed=True, acknowledge_security_for="Text"
+                self.job["id"], confirmed=True, acknowledge_security_for="Text", class_types=None
             )
             read_status.assert_called_once_with(self.job["id"])
         finally:
@@ -3367,6 +3640,220 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(install.call_args.args[0], candidate["manager_id"])
         self.assertEqual(install.call_args.kwargs["version"], candidate["version"])
         self.assertEqual(install.call_args.kwargs["candidate"]["install_id"], candidate["install_id"])
+
+    async def test_manager_install_failure_falls_back_to_selected_github_repository(self):
+        candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "repository": "https://github.com/acme/load-moss",
+            "class_type": "LoadMoss",
+            "provider": "comfyui_manager",
+            "verified": True,
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["LoadMoss"],
+                    "missing_node_instances": [{"id": "1", "class_type": "LoadMoss", "properties": {}}],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_manager_results": {"LoadMoss": {**candidate, "candidates": [candidate]}},
+            },
+        )
+        self.agent.dependency_plan(self.job["id"])
+        installed = {
+            "status": "installed",
+            "path": "/comfy/custom_nodes/load-moss",
+            "security": {"verdict": "clean"},
+        }
+        with patch.object(
+            workflow_manager.ComfyUIManagerClient,
+            "install",
+            side_effect=ValueError("Manager catalog fetch timeout"),
+        ), patch.object(
+            node_install.NodeInstallerMixin,
+            "scan_installed_manager_node",
+            AsyncMock(return_value={"status": "not_verified"}),
+        ), patch.object(
+            node_install.NodeInstallerMixin,
+            "_repository_default_branch",
+            return_value="main",
+        ), patch.object(
+            node_install.NodeInstallerMixin,
+            "_repository_commit",
+            return_value="a" * 40,
+        ), patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "object_info",
+            return_value={"LoadMoss": {}},
+        ), patch.object(self.agent, "install_comfyui_node", AsyncMock(return_value=installed)) as fallback:
+            result = await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+
+        self.assertEqual(result["nodes"][0]["manager_fallback"], True)
+        fallback.assert_awaited_once()
+        self.assertTrue(callable(fallback.await_args.kwargs["on_progress"]))
+        self.assertEqual(
+            fallback.await_args.args[0],
+            "https://github.com/acme/load-moss/tree/" + "a" * 40,
+        )
+        self.assertEqual(fallback.await_args.kwargs["region"], "domestic")
+
+    async def test_manager_failure_does_not_redownload_if_node_is_already_installed(self):
+        candidate = {
+            "manager_id": "comfy-org/load-moss",
+            "repository": "https://github.com/acme/load-moss",
+            "class_type": "LoadMoss",
+            "provider": "comfyui_manager",
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["LoadMoss"],
+                    "missing_node_instances": [{"id": "1", "class_type": "LoadMoss", "properties": {}}],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_manager_results": {"LoadMoss": {**candidate, "candidates": [candidate]}},
+            },
+        )
+        self.agent.dependency_plan(self.job["id"])
+        with patch.object(
+            workflow_manager.ComfyUIManagerClient,
+            "install",
+            side_effect=ValueError("Manager queue timed out"),
+        ), patch.object(
+            node_install.NodeInstallerMixin,
+            "scan_installed_manager_node",
+            AsyncMock(return_value={"status": "manager_installed", "path": "/comfy/custom_nodes/load-moss"}),
+        ), patch.object(self.agent, "install_comfyui_node", AsyncMock()) as fallback:
+            with self.assertRaisesRegex(ValueError, "为避免重复覆盖"):
+                await self.agent.confirm_node_installation(self.job["id"], confirmed=True)
+
+        fallback.assert_not_awaited()
+
+    async def test_failed_unregistered_node_is_restored_to_dependency_plan(self):
+        workflow = {
+            "prompt": {
+                "22": {"class_type": "KOOK_SaveJPGImage", "inputs": {}},
+                "18": {"class_type": "KOOK_SaveJPGImage", "inputs": {}},
+            }
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "workflow": workflow,
+                "inspection": {
+                    "loaded_nodes_checked": True,
+                    "loaded_node_types": ["SaveImage"],
+                    "installable_missing_nodes": [],
+                    "installable_missing_node_instances": [],
+                    "missing_nodes": [],
+                    "missing_node_instances": [],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+                "node_install_progress": {
+                    "status": "failed",
+                    "phase": "failed",
+                    "current_node": "KOOK_SaveJPGImage",
+                    "error": "ComfyUI-Manager queue timeout",
+                },
+                "node_source_selections": {
+                    "KOOK_SaveJPGImage": {
+                        "source": "https://github.com/KookYn9404/KOOK_ImageCompression",
+                        "provider": "web_search",
+                        "region": "domestic",
+                    },
+                },
+            },
+        )
+
+        plan = self.agent.dependency_plan(self.job["id"])
+
+        self.assertEqual([node["class_type"] for node in plan["nodes"]], ["KOOK_SaveJPGImage"])
+        self.assertEqual([item["id"] for item in plan["nodes"][0]["instances"]], ["22", "18"])
+        self.assertTrue(plan["nodes"][0]["source_selected"])
+
+    async def test_duplicate_missing_types_make_one_plan_entry_with_all_instance_ids(self):
+        self.agent.store.update_workflow_job(
+            self.job["id"],
+            metadata={
+                "candidate": {"id": "candidate", "node_sources": [], "model_sources": []},
+                "inspection": {
+                    "missing_nodes": ["RH_RhartImageG2ImageToImage", "KOOK_SaveJPGImage", "RH_RhartImageG2ImageToImage", "KOOK_SaveJPGImage"],
+                    "missing_node_instances": [
+                        {"id": "12", "class_type": "RH_RhartImageG2ImageToImage", "properties": {}},
+                        {"id": "18", "class_type": "KOOK_SaveJPGImage", "properties": {}},
+                        {"id": "31", "class_type": "RH_RhartImageG2ImageToImage", "properties": {}},
+                        {"id": "42", "class_type": "KOOK_SaveJPGImage", "properties": {}},
+                    ],
+                    "unverified_nodes": [],
+                    "models": [],
+                },
+            },
+        )
+
+        plan = self.agent.dependency_plan(self.job["id"])
+
+        self.assertEqual(
+            [node["class_type"] for node in plan["nodes"]],
+            ["RH_RhartImageG2ImageToImage", "KOOK_SaveJPGImage"],
+        )
+        self.assertEqual(
+            [[instance["id"] for instance in node["instances"]] for node in plan["nodes"]],
+            [["12", "31"], ["18", "42"]],
+        )
+
+    async def test_single_node_install_ignores_other_unselected_node_sources(self):
+        plan = {
+            "nodes": [
+                {
+                    "class_type": "KOOK_SaveJPGImage",
+                    "source": "https://github.com/KookYn9404/KOOK_ImageCompression/tree/" + "a" * 40,
+                    "source_type": "web_search",
+                    "instances": [{"id": "22", "source_selected": True}],
+                },
+                {
+                    "class_type": "RH_RhartImageG2ImageToImage",
+                    "source": "",
+                    "manager_id": "",
+                    "instances": [{"id": "14", "source_selected": False}],
+                },
+            ],
+            "models": [],
+        }
+        metadata = dict(self.agent.workflow_job(self.job["id"])["metadata"])
+        metadata["dependency_plan"] = plan
+        metadata["node_source_selections"] = {
+            "KOOK_SaveJPGImage": {
+                "source": "https://github.com/KookYn9404/KOOK_ImageCompression",
+                "provider": "web_search",
+                "region": "domestic",
+                "commit": "a" * 40,
+            }
+        }
+        self.agent.store.update_workflow_job(self.job["id"], metadata=metadata)
+        installed = {"status": "installed", "path": "/custom_nodes/KOOK_ImageCompression"}
+        with patch.object(
+            self.agent,
+            "install_comfyui_node",
+            AsyncMock(return_value=installed),
+        ) as install, patch.object(
+            workflow_manager.ComfyUIWorkflowExecutor,
+            "object_info",
+            return_value={"KOOK_SaveJPGImage": {}},
+        ):
+            result = await self.agent.confirm_node_installation(
+                self.job["id"], confirmed=True, class_types=["KOOK_SaveJPGImage"]
+            )
+
+        self.assertEqual(install.await_args.kwargs["expected_class_type"], "KOOK_SaveJPGImage")
+        self.assertEqual(install.await_args.args[0], "https://github.com/KookYn9404/KOOK_ImageCompression/tree/" + "a" * 40)
 
     async def test_dependency_plan_resolves_instances_and_groups_only_confirmed_plugins(self):
         self.agent.store.update_workflow_job(
@@ -3567,6 +4054,54 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "checked")
         self.assertEqual(result["workflow"], workflow)
         self.assertEqual(result["inspection"]["format"], "api")
+
+    async def test_failed_node_install_survives_restart_inspection_for_retry(self):
+        workflow = {
+            "prompt": {
+                "22": {"class_type": "KOOK_SaveJPGImage", "inputs": {}},
+                "18": {"class_type": "KOOK_SaveJPGImage", "inputs": {}},
+            }
+        }
+        candidate = {
+            "id": "uploaded-candidate",
+            "title": "uploaded",
+            "source_type": "uploaded",
+            "execution_mode": "local",
+            "node_sources": [],
+            "model_sources": [],
+        }
+        self.agent.store.save_workflow_candidates(self.job["id"], [candidate])
+        metadata = {
+            "candidate": candidate,
+            "workflow": workflow,
+            "node_install_progress": {
+                "status": "failed",
+                "phase": "failed",
+                "current_node": "KOOK_SaveJPGImage",
+                "error": "ComfyUI-Manager queue timeout",
+            },
+            "prepared_node_results": {
+                "KOOK_SaveJPGImage": {"status": "not_verified", "verification_status": "restart_required"},
+            },
+        }
+        self.agent.store.update_workflow_job(
+            self.job["id"], selected_candidate_id=candidate["id"], metadata=metadata
+        )
+        with patch.object(workflow_manager.ComfyUIWorkflowExecutor, "object_info", return_value={}):
+            result = await self.agent.inspect_selected_workflow(self.job["id"])
+
+        self.assertEqual(result["inspection"]["installable_missing_nodes"], ["KOOK_SaveJPGImage"])
+        self.assertEqual(
+            [item["id"] for item in result["inspection"]["installable_missing_node_instances"]],
+            ["22", "18"],
+        )
+        self.assertNotIn(
+            "KOOK_SaveJPGImage",
+            result["job"]["metadata"]["prepared_node_results"],
+        )
+        retry_plan = self.agent.dependency_plan(self.job["id"])
+        self.assertEqual([node["class_type"] for node in retry_plan["nodes"]], ["KOOK_SaveJPGImage"])
+        self.assertEqual([item["id"] for item in retry_plan["nodes"][0]["instances"]], ["22", "18"])
 
     async def test_workflow_inspection_reads_model_folders_off_the_event_loop(self):
         workflow = {"prompt": {"1": {"class_type": "UploadedNode", "inputs": {}}}}
@@ -3823,8 +4358,8 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
             first = await self.agent.search_workflow_node_sources(self.job["id"])
             self.assertEqual(resolve.call_count, 7)
             search.assert_not_called()
-            self.assertEqual(first["deferred"], 0)
-            second = await self.agent.search_workflow_node_sources(self.job["id"])
+            self.assertEqual(set(first["results"]), set(classes))
+            second = await self.agent.search_workflow_node_web_sources(self.job["id"], classes)
             self.assertEqual(resolve.call_count, 7)
             self.assertEqual(set(second["results"]), set(classes))
 
@@ -7758,6 +8293,10 @@ class WebRegressionTests(unittest.TestCase):
         style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
         self.assertIn("function parseToolResult(content)", source)
         self.assertIn("function workflowInstallCard(content)", source)
+        self.assertIn("function workflowApiPrompt(workflow)", source)
+        self.assertIn("async function loadWorkflowToCanvas(workflow)", source)
+        self.assertIn("app.loadGraphData(workflow)", source)
+        self.assertIn("app.loadApiJson(prompt)", source)
         self.assertIn('toolName === "install_uploaded_workflow"', source)
         self.assertIn('message.tool_call_id === "workflow-install-fallback"', source)
         self.assertIn('"安装成功"', source)
@@ -7767,7 +8306,7 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn('"未下载模型"', source)
         self.assertIn('"未覆盖同名文件"', source)
         self.assertIn("workflowCandidateCard(", source)
-        self.assertIn("{ uploaded: true, autoRestore: false, autoPrepare: true, forceInspection: true }", source)
+        self.assertIn("{ uploaded: true, autoRestore: false, autoPrepare: true, autoLoadCanvas: true, forceInspection: true }", source)
         self.assertIn("result.workflow_job_id", source)
         self.assertIn("result.candidate_id", source)
         self.assertLess(
@@ -7833,6 +8372,8 @@ class WebRegressionTests(unittest.TestCase):
         for field in ("cnr_id", "install_id", "install_type", "reference", "pip"):
             self.assertIn(f'"{field}"', source)
         self.assertIn("const version = repo.version || repo.selected_version", source)
+        self.assertIn("在 ${searchEngine === \"bing\" ? \"Bing\" : \"Google\"} 中手动搜索", source)
+        self.assertIn('searchLink.rel = "noopener noreferrer"', source)
 
     def test_workflow_node_install_details_are_displayed(self):
         root = Path(__file__).resolve().parents[1]
@@ -7874,6 +8415,10 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn("请在 Manager 中停用或移除该节点后再处理", source)
         self.assertIn("/dependencies/nodes/status", source)
         self.assertIn("current_plugin", source)
+        self.assertIn('class_types: [classType]', source)
+        self.assertIn('showNodeSecurityReview(error, {', source)
+        self.assertIn('retry: () => runSingleNodeInstall(true)', source)
+        self.assertIn('if (!options.inline) showError(securityError)', source)
         self.assertIn("cline-workflow-node-install-progress", style)
 
     def test_global_chat_has_independent_header_button_and_send_route(self):

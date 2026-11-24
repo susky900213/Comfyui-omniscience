@@ -21,6 +21,7 @@ import ast
 import io
 import re
 import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -30,6 +31,7 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .. import access_tokens, archives, node_review, node_security, paths, skill_review, skill_security
+from ..region_router import RegionRouter
 from ..constants import (
     MAX_NODE_PACKAGE_BYTES,
     MAX_NODE_PACKAGE_FILE_BYTES,
@@ -86,6 +88,17 @@ class _TarballRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(request, response, code, message, headers, new_url)
 
 
+class _ProxyTarballRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, proxy_host: str):
+        self.proxy_host = proxy_host.lower()
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        parsed = urlparse(new_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in {self.proxy_host, "api.github.com", *TARBALL_HOSTS} or parsed.port not in {None, 443}:
+            raise ValueError("GitHub 前置代理尝试跳转到不受支持的地址，已阻止安装。")
+        return super().redirect_request(request, response, code, message, headers, new_url)
+
+
 class _GitCodeRedirectHandler(HTTPRedirectHandler):
     """Follow GitCode archive redirects only to GitCode HTTPS hosts."""
 
@@ -116,6 +129,9 @@ class NodeInstallerMixin:
         acknowledged: bool = False,
         pin_commit: bool = False,
         expected_class_type: str = "",
+        region: str | None = None,
+        on_progress: Any = None,
+        allow_unpinned_zip_fallback: bool = False,
     ) -> dict[str, Any]:
         """Install a node project from a public GitHub/GitCode link or uploaded archive."""
         value = str(source or "").strip()
@@ -126,21 +142,76 @@ class NodeInstallerMixin:
                 raise ValueError("工作流节点必须使用可固定版本的 GitHub/GitCode 仓库来源，不能使用可变压缩包链接。")
             return await self.install_workspace_archive(value, acknowledged=acknowledged)
         host, owner, repository, prefix, ref = self._node_repository_source(value)
-        resolved_ref = ref or await asyncio.to_thread(self._repository_default_branch, host, owner, repository)
+        report_progress = lambda phase, message: on_progress({
+            "phase": phase,
+            "current_plugin": repository,
+            "current_node": expected_class_type,
+            "manager_messages": [message],
+        }) if callable(on_progress) else None
+        if re.fullmatch(r"[0-9a-fA-F]{40}", str(ref or "")):
+            resolved_ref = str(ref)
+        else:
+            report_progress("resolving", "正在通过 GitHub API 解析默认分支…")
+            try:
+                resolved_ref = ref or await asyncio.to_thread(
+                    self._repository_default_branch,
+                    host,
+                    owner,
+                    repository,
+                    region=region,
+                    settings=self.settings,
+                )
+            except ValueError as exc:
+                if host != "github.com" or region != "domestic" or not allow_unpinned_zip_fallback:
+                    raise
+                return await self._install_github_branch_zip_fallback(
+                    owner,
+                    repository,
+                    source=value,
+                    expected_class_type=expected_class_type,
+                    acknowledged=acknowledged,
+                    on_progress=on_progress,
+                    previous_error=str(exc),
+                )
         if pin_commit and not re.fullmatch(r"[0-9a-fA-F]{40}", resolved_ref):
             raise ValueError("节点安装必须提供已固定的 40 位 Git commit 哈希。")
-        package = await asyncio.to_thread(self._repository_archive, host, owner, repository, resolved_ref)
+        if host == "github.com" and region == "domestic":
+            report_progress("downloading", "正在通过 github.tbap.top 下载 GitHub 仓库 ZIP…")
+            archive_url, _ = RegionRouter(self.settings).github_url(
+                f"https://github.com/{owner}/{repository}/archive/{quote(resolved_ref, safe='')}.zip",
+                region="domestic",
+            )
+            try:
+                package = await asyncio.to_thread(self._download_github_archive_url, archive_url, settings=self.settings)
+            except ValueError as archive_error:
+                if isinstance(archive_error, NodeSecurityBlockedError):
+                    raise
+                if not allow_unpinned_zip_fallback or not re.fullmatch(r"[0-9a-fA-F]{40}", resolved_ref):
+                    raise
+                return await self._install_github_branch_zip_fallback(
+                    owner,
+                    repository,
+                    source=value,
+                    expected_class_type=expected_class_type,
+                    acknowledged=acknowledged,
+                    on_progress=on_progress,
+                    previous_error=str(archive_error),
+                )
+        else:
+            report_progress("downloading", f"正在从 {host} 下载节点包…")
+            package = await asyncio.to_thread(self._repository_archive, host, owner, repository, resolved_ref)
         source_url = f"https://{host}/{owner}/{repository}/tree/{resolved_ref}"
         if prefix:
             source_url = f"{source_url}/{prefix}"
-        return await self._install_package(
+        return await self._install_node_package(
             package,
-            archive_name=f"{repository}.zip" if host in GITCODE_HOSTS else f"{repository}.tar.gz",
+            archive_name=f"{repository}.zip" if host in GITCODE_HOSTS or host == "github.com" and region == "domestic" else f"{repository}.tar.gz",
             folder=prefix.split("/")[-1] if prefix else repository,
             source=source_url,
             subdirectory=prefix,
             acknowledged=acknowledged,
             expected_class_type=expected_class_type,
+            progress_callback=on_progress,
         )
 
     async def install_workspace_archive(self, relative_path: Any, *, acknowledged: bool = False) -> dict[str, Any]:
@@ -154,7 +225,7 @@ class NodeInstallerMixin:
         if path.stat().st_size > MAX_NODE_PACKAGE_BYTES:
             raise ValueError(f"节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
         package = await asyncio.to_thread(path.read_bytes)
-        return await self._install_package(
+        return await self._install_node_package(
             package,
             archive_name=path.name,
             folder=archive_stem(path.name),
@@ -176,13 +247,16 @@ class NodeInstallerMixin:
         data = bytes(package or b"")
         if len(data) > MAX_NODE_PACKAGE_BYTES:
             raise ValueError(f"节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
-        return await self._install_package(
+        return await self._install_node_package(
             data,
             archive_name=name,
             folder=archive_stem(name),
             source=f"archive:{name}",
             acknowledged=acknowledged,
         )
+
+    async def _install_node_package(self, package: bytes, **kwargs: Any) -> dict[str, Any]:
+        return await NodeInstallerMixin._install_package(self, package, **kwargs)
 
     async def _install_package(
         self,
@@ -194,6 +268,7 @@ class NodeInstallerMixin:
         subdirectory: str = "",
         acknowledged: bool = False,
         expected_class_type: str = "",
+        progress_callback: Any = None,
     ) -> dict[str, Any]:
         if not package:
             raise ValueError("节点压缩包内容为空。")
@@ -203,14 +278,22 @@ class NodeInstallerMixin:
         if nodes is None:
             raise ValueError("请先在设置里填写 ComfyUI 目录，才能安装节点。")
         staging = Path(tempfile.mkdtemp(prefix="omniscience-node-"))
+        report_progress = lambda phase, message: progress_callback({
+            "phase": phase,
+            "current_plugin": folder,
+            "manager_messages": [message],
+        }) if callable(progress_callback) else None
         try:
             archive_path = staging / Path(archive_name).name
             unpacked = staging / "package"
             await asyncio.to_thread(archive_path.write_bytes, package)
+            report_progress("extracting", "节点包已下载，正在解包…")
             stats = await asyncio.to_thread(archives.extract, archive_path, unpacked)
             root = await asyncio.to_thread(
                 self._locate_node_package, unpacked, subdirectory=subdirectory, folder=folder
             )
+            if expected_class_type:
+                report_progress("validating", f"正在检查插件是否包含节点 {expected_class_type}…")
             if expected_class_type and not await asyncio.to_thread(
                 self._exports_node_class, root, expected_class_type
             ):
@@ -218,9 +301,9 @@ class NodeInstallerMixin:
                     f"仓库 {source} 中未能静态确认导出工作流所需节点“{expected_class_type}”，已拒绝安装。"
                 )
             target = nodes / root.name
-            # Scan before anything lands in custom_nodes, and re-check the name
-            # right before the move: the review step can take a model round-trip.
+            report_progress("security_review", "节点文件已解包，正在进行安全检查…")
             report = await self._review_package(root, source=source, acknowledged=acknowledged)
+            report_progress("placing", "安全检查通过，正在写入 custom_nodes…")
             placed = await asyncio.to_thread(self._place_package, root, target, report)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -541,9 +624,44 @@ class NodeInstallerMixin:
         return host, owner, repository, prefix, ref
 
     @classmethod
-    def _repository_default_branch(cls, host: str, owner: str, repository: str) -> str:
+    def _github_proxy_git_refs(cls, owner: str, repository: str, *, settings: Any) -> tuple[list[tuple[str, str]], str]:
+        settings_data = settings.load() if hasattr(settings, "load") else dict(settings or {})
+        proxy = str(settings_data.get("github_proxy_base_url") or "https://github.tbap.top").strip().rstrip("/")
+        parsed = urlparse(proxy)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.port not in {None, 443}:
+            raise ValueError("GitHub 前置代理地址无效。")
+        repository_url = f"{proxy}/https://github.com/{quote(owner, safe='')}/{quote(repository, safe='')}"
+        try:
+            completed = subprocess.run(
+                ["git", "ls-remote", "--symref", repository_url, "HEAD", "refs/heads/*", "refs/tags/*"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"无法通过 GitHub 前置代理读取仓库引用：{exc}") from exc
+        if completed.returncode:
+            raise ValueError(f"GitHub 前置代理 git ls-remote 失败：{completed.stderr.strip()[:500]}")
+        refs: list[tuple[str, str]] = []
+        head_branch = ""
+        for line in completed.stdout.splitlines():
+            if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                head_branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+                continue
+            fields = line.split("\t", 1)
+            if len(fields) == 2 and re.fullmatch(r"[0-9a-fA-F]{40}", fields[0]):
+                refs.append((fields[0].lower(), fields[1]))
+        if not refs:
+            raise ValueError("GitHub 前置代理没有返回有效提交引用。")
+        return refs, head_branch
+
+    @classmethod
+    def _repository_default_branch(
+        cls, host: str, owner: str, repository: str, *, region: str | None = None, settings: Any = None
+    ) -> str:
         if host == "github.com":
-            return cls._github_default_branch(owner, repository)
+            return cls._github_default_branch(owner, repository, region=region, settings=settings)
         try:
             info = cls._gitcode_json(f"https://api.gitcode.com/api/v5/repos/{owner}/{repository}")
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
@@ -554,9 +672,11 @@ class NodeInstallerMixin:
         return ref
 
     @classmethod
-    def _repository_commit(cls, host: str, owner: str, repository: str, ref: str) -> str:
+    def _repository_commit(
+        cls, host: str, owner: str, repository: str, ref: str, *, region: str | None = None, settings: Any = None
+    ) -> str:
         if host == "github.com":
-            return cls._github_commit(owner, repository, ref)
+            return cls._github_commit(owner, repository, ref, region=region, settings=settings)
         try:
             info = cls._gitcode_json(
                 f"https://api.gitcode.com/api/v5/repos/{owner}/{repository}/commits/{quote(ref, safe='')}"
@@ -676,20 +796,58 @@ class NodeInstallerMixin:
             return cls._github_tarball(owner, repository, ref)
         return cls._gitcode_source_archive(owner, repository, ref)
 
-    @staticmethod
-    def _github_json(url: str) -> Any:
+    @classmethod
+    def _github_json(cls, url: str, *, region: str | None = None, settings: Any = None) -> Any:
         from .github_skill import GitHubSkillInstaller
+        from ..node_search import GITHUB_PROXY_HOST
 
-        return GitHubSkillInstaller._github_request(
-            url,
-            max_bytes=MAX_REPO_INFO_BYTES,
-        )
+        request_url = url
+        proxy_host = GITHUB_PROXY_HOST
+        if region == "domestic":
+            if settings is None:
+                raise ValueError("国内 GitHub 请求缺少代理配置。")
+            request_url, _ = RegionRouter(settings).github_url(url, region="domestic")
+            proxy_host = urlparse(request_url).hostname or GITHUB_PROXY_HOST
+        if request_url == url:
+            return GitHubSkillInstaller._github_request(request_url, max_bytes=MAX_REPO_INFO_BYTES)
+        parsed = urlparse(request_url)
+        proxy = RegionRouter(settings)._data().get("github_proxy_base_url")
+        proxy_host = urlparse(str(proxy or "")).hostname or proxy_host
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != proxy_host.lower():
+            raise ValueError("GitHub 前置代理 API 地址无效。")
+        opener = build_opener(_ProxyTarballRedirectHandler(proxy_host))
+        request = Request(request_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "Comfyui-omniscience-Node-Installer"})
+        try:
+            with opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                if (urlparse(response.geturl()).hostname or "").lower() not in {proxy_host.lower(), "api.github.com"}:
+                    raise ValueError("GitHub API 代理响应主机无效。")
+                payload = response.read(MAX_REPO_INFO_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            raise ValueError("无法通过 GitHub 前置代理读取仓库信息。") from exc
+        if len(payload) > MAX_REPO_INFO_BYTES:
+            raise ValueError("GitHub 仓库信息超过安全大小限制。")
+        import json
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("GitHub 代理返回了无法识别的仓库信息。") from exc
 
     @classmethod
-    def _github_default_branch(cls, owner: str, repository: str) -> str:
+    def _github_default_branch(
+        cls, owner: str, repository: str, *, region: str | None = None, settings: Any = None
+    ) -> str:
         try:
-            info = cls._github_json(f"https://api.github.com/repos/{owner}/{repository}")
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            info = cls._github_json(
+                f"https://api.github.com/repos/{owner}/{repository}", region=region, settings=settings
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            if region == "domestic" and settings is not None:
+                try:
+                    refs, head_branch = cls._github_proxy_git_refs(owner, repository, settings=settings)
+                except ValueError:
+                    raise ValueError(f"无法读取公开 GitHub 仓库：{exc}") from exc
+                if head_branch:
+                    return head_branch
             raise ValueError(f"无法读取公开 GitHub 仓库：{exc}") from exc
         ref = str((info or {}).get("default_branch") or "").strip() if isinstance(info, dict) else ""
         if not ref:
@@ -697,13 +855,26 @@ class NodeInstallerMixin:
         return ref
 
     @classmethod
-    def _github_commit(cls, owner: str, repository: str, ref: str) -> str:
+    def _github_commit(
+        cls, owner: str, repository: str, ref: str, *, region: str | None = None, settings: Any = None
+    ) -> str:
         """Resolve a branch/tag to an immutable commit before a gated install."""
         try:
             info = cls._github_json(
-                f"https://api.github.com/repos/{owner}/{repository}/commits/{quote(ref, safe='')}"
+                f"https://api.github.com/repos/{owner}/{repository}/commits/{quote(ref, safe='')}",
+                region=region,
+                settings=settings,
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            if region == "domestic" and settings is not None:
+                try:
+                    refs, _head_branch = cls._github_proxy_git_refs(owner, repository, settings=settings)
+                except ValueError:
+                    raise ValueError(f"无法固定 GitHub 节点版本：{exc}") from exc
+                expected = {ref, f"refs/heads/{ref}", f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}"}
+                for sha, name in refs:
+                    if name in expected:
+                        return sha
             raise ValueError(f"无法固定 GitHub 节点版本：{exc}") from exc
         sha = str((info or {}).get("sha") or "").strip() if isinstance(info, dict) else ""
         if not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
@@ -721,18 +892,121 @@ class NodeInstallerMixin:
     @classmethod
     def _github_tarball(cls, owner: str, repository: str, ref: str) -> bytes:
         url = f"https://codeload.github.com/{owner}/{repository}/tar.gz/{quote(ref, safe='')}"
-        request = Request(
-            url,
-            headers={
-                "Accept": "application/gzip",
-                "User-Agent": "Comfyui-omniscience-Node-Installer",
-            },
-        )
-        opener = build_opener(_TarballRedirectHandler())
+        return cls._download_github_tarball_url(url)
+
+    async def _install_github_branch_zip_fallback(
+        self,
+        owner: str,
+        repository: str,
+        *,
+        source: str,
+        expected_class_type: str,
+        acknowledged: bool,
+        on_progress: Any,
+        previous_error: str,
+    ) -> dict[str, Any]:
+        from ..node_search import GITHUB_PROXY_PREFIX
+
+        proxy_base = str(
+            (self.settings.load() if hasattr(self.settings, "load") else {}).get("github_proxy_base_url")
+            or GITHUB_PROXY_PREFIX.rstrip("/")
+        ).rstrip("/")
+        last_error = previous_error
+        for branch in ("main", "master"):
+            if callable(on_progress):
+                on_progress({
+                    "phase": "downloading",
+                    "current_plugin": repository,
+                    "current_node": expected_class_type,
+                    "manager_messages": [f"GitHub API 和 git ls-remote 不可用，尝试代理下载 {branch}.zip…"],
+                })
+            target = f"https://github.com/{quote(owner, safe='')}/{quote(repository, safe='')}/archive/refs/heads/{branch}.zip"
+            proxy_url, _ = RegionRouter(self.settings).github_url(target, region="domestic")
+            try:
+                package = await asyncio.to_thread(
+                    self._download_github_archive_url, proxy_url, settings=self.settings
+                )
+                return await self._install_node_package(
+                    package,
+                    archive_name=f"{repository}-{branch}.zip",
+                    folder=repository,
+                    source=f"https://github.com/{owner}/{repository}/tree/{branch}",
+                    acknowledged=acknowledged,
+                    expected_class_type=expected_class_type,
+                    progress_callback=on_progress,
+                )
+            except NodeSecurityBlockedError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                if callable(on_progress):
+                    on_progress({
+                        "phase": "downloading",
+                        "current_plugin": repository,
+                        "current_node": expected_class_type,
+                        "manager_messages": [f"{branch}.zip 后备失败：{last_error}"],
+                    })
+        raise ValueError(f"GitHub API / git ls-remote 失败，main/master ZIP 后备下载也失败：{last_error}")
+
+    @classmethod
+    def _download_github_archive_url(cls, url: str, *, settings: Any) -> bytes:
+        from ..node_search import GITHUB_PROXY_HOST, GITHUB_PROXY_PREFIX
+
+        parsed = urlparse(url)
+        settings_data = settings.load() if hasattr(settings, "load") else dict(settings or {})
+        proxy_base = str(settings_data.get("github_proxy_base_url") or GITHUB_PROXY_PREFIX.rstrip("/")).rstrip("/")
+        proxy_host = (urlparse(proxy_base).hostname or GITHUB_PROXY_HOST).lower()
+        prefix = proxy_base + "/"
+        target = urlparse(url[len(prefix):]) if url.startswith(prefix) else None
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != proxy_host
+            or target is None
+            or target.scheme != "https"
+            or (target.hostname or "").lower() != "github.com"
+            or not target.path.endswith(".zip")
+            or target.port not in {None, 443}
+        ):
+            raise ValueError("GitHub 前置代理 ZIP 地址无效。")
+        request = Request(url, headers={"Accept": "application/zip", "User-Agent": "Comfyui-omniscience-Node-Installer"})
         try:
-            with opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:  # noqa: S310 - host-validated GitHub URL
+            with build_opener(_ProxyTarballRedirectHandler(proxy_host)).open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
                 final_host = (urlparse(response.geturl()).hostname or "").lower()
-                if final_host not in TARBALL_HOSTS:
+                if final_host not in {proxy_host, *TARBALL_HOSTS}:
+                    raise ValueError("GitHub 代理 ZIP 响应主机无效。")
+                package = response.read(MAX_NODE_PACKAGE_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            raise ValueError("无法通过 GitHub 前置代理下载仓库 ZIP。") from exc
+        if len(package) > MAX_NODE_PACKAGE_BYTES:
+            raise ValueError(f"节点压缩包超过 {MAX_NODE_PACKAGE_BYTES} 字节上限。")
+        return package
+
+    @classmethod
+    def _download_github_tarball_url(cls, url: str, *, settings: Any = None) -> bytes:
+        from ..node_search import GITHUB_PROXY_HOST, GITHUB_PROXY_PREFIX
+
+        parsed = urlparse(url)
+        settings_data = settings.load() if settings is not None else {}
+        proxy_base = str(settings_data.get("github_proxy_base_url") or GITHUB_PROXY_PREFIX.rstrip("/"))
+        proxy_host = (urlparse(proxy_base).hostname or GITHUB_PROXY_HOST).lower()
+        configured_prefix = proxy_base.rstrip("/") + "/"
+        if url.startswith(configured_prefix):
+            proxy_target = url[len(configured_prefix):]
+            target = urlparse(proxy_target)
+            if (parsed.hostname or "").lower() != proxy_host or target.scheme != "https" or (target.hostname or "").lower() != "codeload.github.com":
+                raise ValueError("GitHub 前置代理下载地址无效。")
+            opener = build_opener(_ProxyTarballRedirectHandler(proxy_host))
+            allowed_hosts = {proxy_host, *TARBALL_HOSTS}
+        else:
+            if parsed.scheme != "https" or (parsed.hostname or "").lower() != "codeload.github.com":
+                raise ValueError("GitHub 下载地址无效。")
+            opener = build_opener(_TarballRedirectHandler())
+            allowed_hosts = TARBALL_HOSTS
+        request = Request(url, headers={"Accept": "application/gzip", "User-Agent": "Comfyui-omniscience-Node-Installer"})
+        try:
+            with opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                final_host = (urlparse(response.geturl()).hostname or "").lower()
+                if final_host not in allowed_hosts:
                     raise ValueError("GitHub 下载被重定向到不受支持的主机，已拒绝安装。")
                 package = response.read(MAX_NODE_PACKAGE_BYTES + 1)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:

@@ -2,7 +2,7 @@
   position: fixed;
   bottom: max(88px, calc(env(safe-area-inset-bottom) + 72px));
   right: 18px;
-  z-index: 10000;
+  z-index: 10002 !important;
   border: 1px solid #6d5ce7;
   border-radius: 6px;
   padding: 7px 13px;
@@ -100,6 +100,7 @@
 .cline-workflow-candidate-title { display: block; color: #eee9fa; }
 .cline-workflow-candidate-description, .cline-workflow-candidate-meta { margin: 5px 0; color: #aaa5b8; font-size: 11px; line-height: 1.45; }
 .cline-workflow-select { margin-top: 4px; padding: 4px 8px; font-size: 11px; }
+.cline-workflow-node-source-picker { display: block; width: 100%; margin: 5px 0 8px; border: 1px solid #504a68; border-radius: 5px; padding: 7px 8px; color: #eee; background: #24222d; font-size: 11px; }
 .cline-workflow-no-results { margin-top: 8px; padding: 9px; border: 1px solid #5c5068; border-radius: 7px; background: #29242f; }
 .cline-workflow-develop { padding: 5px 9px; font-size: 11px; }
 .cline-workflow-execute { margin-top: 6px; padding: 5px 9px; font-size: 11px; }
@@ -163,6 +164,7 @@
 .cline-workflow-node-install-progress-events li { margin: 2px 0; overflow-wrap: anywhere; }
 .cline-workflow-node-install-progress.error { color: #f0a8a8; }
 .cline-workflow-node-install-progress.completed { color: #8ee0b0; }
+.cline-workflow-node-install-area { display: flex; flex-direction: column; gap: 6px; }
 .cline-workflow-node-install-details { margin: 8px 0; padding: 8px; border: 1px solid #49435e; border-radius: 6px; background: #24222d; }
 .cline-workflow-node-install-detail { margin-top: 7px; border-top: 1px solid #3b374b; padding-top: 7px; }
 .cline-workflow-node-install-detail:first-of-type { margin-top: 5px; border-top: 0; padding-top: 0; }

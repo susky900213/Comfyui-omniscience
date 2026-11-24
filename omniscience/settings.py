@@ -26,6 +26,7 @@ DEFAULT_HUGGINGFACE_DOMESTIC = "https://hf-mirror.com"
 DEFAULT_HUGGINGFACE_INTERNATIONAL = "https://huggingface.co"
 DEFAULT_PUBLIC_IP_URL = "https://ipapi.co/json/"
 DEFAULT_IP_GEOLOCATION_URL = "https://ipapi.co/{ip}/json/"
+DEFAULT_GITHUB_PROXY_BASE_URL = "https://github.tbap.top"
 
 
 class SettingsStore:
@@ -81,6 +82,7 @@ class SettingsStore:
             "ip_geolocation_url": str(data.get("ip_geolocation_url") or DEFAULT_IP_GEOLOCATION_URL),
             "public_ip_url": str(data.get("public_ip_url") or DEFAULT_PUBLIC_IP_URL),
             "skill_security_mode": skill_security.resolve_review_mode(data),
+            "github_proxy_base_url": str(data.get("github_proxy_base_url") or DEFAULT_GITHUB_PROXY_BASE_URL),
             "skill_security_model": str(data.get("skill_security_model") or "").strip(),
             "model": data.get("model") or paths.DEFAULT_MODEL,
             "max_context_tokens": max_context_tokens(data.get("max_context_tokens", DEFAULT_MAX_CONTEXT_TOKENS)),
@@ -112,6 +114,7 @@ class SettingsStore:
             "huggingface_international_base_url",
             "ip_geolocation_url",
             "public_ip_url",
+            "github_proxy_base_url",
         ):
             if key in values and values[key] is not None:
                 current[key] = str(values[key]).strip()

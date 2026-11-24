@@ -20,6 +20,7 @@ DEFAULT_ENDPOINTS = {
     "huggingface_international_base_url": "https://huggingface.co",
     "public_ip_url": "https://ipapi.co/json/",
     "ip_geolocation_url": "https://ipapi.co/{ip}/json/",
+    "github_proxy_base_url": "https://github.tbap.top",
 }
 
 
@@ -126,6 +127,33 @@ class RegionRouter:
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError(f"{key} 不是有效的 HTTP(S) 地址。")
         return value, decision
+
+    def github_url(self, url: str, *, force: bool = False, region: str | None = None) -> tuple[str, RegionDecision]:
+        """Route a validated GitHub URL through the domestic proxy when needed.
+
+        The proxy accepts the original HTTPS GitHub URL as a path component.  Do
+        not route arbitrary URLs here: callers must provide a GitHub API or
+        archive URL, and the resulting proxy URL is constrained to the configured
+        proxy host.
+        """
+        value = str(url or "").strip()
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or host not in {
+            "api.github.com",
+            "codeload.github.com",
+            "github.com",
+            "raw.githubusercontent.com",
+        } or parsed.port not in {None, 443}:
+            raise ValueError("GitHub 请求地址无效。")
+        decision = self.decide(force=force, region=region)
+        if decision.selected_region == "international":
+            return value, decision
+        proxy = str(self._data().get("github_proxy_base_url") or DEFAULT_ENDPOINTS["github_proxy_base_url"]).strip().rstrip("/")
+        proxy_parsed = urlparse(proxy)
+        if proxy_parsed.scheme != "https" or not proxy_parsed.hostname or proxy_parsed.username or proxy_parsed.password or proxy_parsed.port not in {None, 443}:
+            raise ValueError("GitHub 国内代理地址必须是无认证的 HTTPS 地址。")
+        return f"{proxy}/{value}", decision
 
     @staticmethod
     def _fetch_public_ip() -> str:

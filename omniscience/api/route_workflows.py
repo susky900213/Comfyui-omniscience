@@ -80,6 +80,21 @@ def register_workflows_routes(routes: Any) -> None:
             return _response(await agent.search_workflow_node_sources(request.match_info["job_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
+    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/web-search")
+    async def cline_search_workflow_node_web_sources(request):
+        try:
+            agent = deps.global_chat_agent()
+            job = agent.workflow_job(request.match_info["job_id"])
+            if not job.get("selected_candidate_id"):
+                raise ValueError("请先在界面中选择一个工作流，再搜索它的缺失节点。")
+            values = await _body(request)
+            return _response(
+                await agent.search_workflow_node_web_sources(
+                    request.match_info["job_id"], values.get("class_types")
+                )
+            )
+        except (ValueError, OSError) as exc:
+            return _response({"error": str(exc)}, status=400)
     @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/source")
     async def cline_select_workflow_node_source(request):
         try:
@@ -98,6 +113,11 @@ def register_workflows_routes(routes: Any) -> None:
                     reference=values.get("reference"),
                     pip=values.get("pip"),
                     instance_id=values.get("instance_id"),
+                    candidate_id=values.get("candidate_id"),
+                    provider=values.get("provider"),
+                    region=values.get("region"),
+                    branch=values.get("branch"),
+                    commit=values.get("commit"),
                     manual=bool(values.get("manual")),
                 )
             )
@@ -163,6 +183,7 @@ def register_workflows_routes(routes: Any) -> None:
                     request.match_info["job_id"],
                     confirmed=bool(values.get("confirmed")),
                     acknowledge_security_for=str(values.get("acknowledge_security_for") or ""),
+                    class_types=values.get("class_types"),
                 )
             )
         except NodeSecurityBlockedError as exc:

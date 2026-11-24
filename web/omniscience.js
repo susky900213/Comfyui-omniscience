@@ -118,19 +118,43 @@ function workflowNodeInstallCandidate(node) {
   return { instance: selected, candidate };
 }
 
+function dedupeWorkflowNodeTypes(plan) {
+  const byType = new Map();
+  for (const node of plan?.nodes || []) {
+    const classType = String(node.class_type || "");
+    const existing = byType.get(classType);
+    if (!existing) {
+      byType.set(classType, { ...node, instances: [...(node.instances || [])] });
+      continue;
+    }
+    if ((!existing.source && node.source) || (!existing.manager_id && node.manager_id)) {
+      Object.assign(existing, { ...node, instances: existing.instances });
+    }
+    const ids = new Set((existing.instances || []).map((instance) => String(instance.id || "")));
+    for (const instance of node.instances || []) {
+      if (!ids.has(String(instance.id || ""))) {
+        existing.instances.push(instance);
+        ids.add(String(instance.id || ""));
+      }
+    }
+  }
+  return [...byType.values()];
+}
+
 function renderWorkflowNodeInstallDetails(container, plan) {
   container.replaceChildren();
-  const nodes = plan?.nodes || [];
+  const nodes = dedupeWorkflowNodeTypes(plan);
   const heading = el("strong", "", "安装节点详情");
   container.appendChild(heading);
   if (!nodes.length) {
     container.appendChild(el("p", "cline-workflow-candidate-meta", "没有需要安装的缺失节点。"));
     return;
   }
+  const instanceCount = nodes.reduce((total, node) => total + (node.instances || []).length, 0);
   container.appendChild(el(
     "p",
     "cline-workflow-candidate-meta",
-    `共 ${nodes.length} 种节点类型，${plan.installable_missing_node_count ?? plan.node_instance_count ?? nodes.length} 个工作流实例。`,
+    `共 ${nodes.length} 种节点类型，${plan.installable_missing_node_count ?? plan.node_instance_count ?? instanceCount} 个工作流实例。`,
   ));
   nodes.forEach((node) => {
     const item = el("div", "cline-workflow-node-install-detail");
@@ -235,11 +259,21 @@ function updateNodeInstallProgress(progress, result) {
   const currentNode = result?.current_node && result?.current_plugin
     ? `节点：${result.current_node}`
     : "";
+  const managerMessage = Array.isArray(result?.manager_messages)
+    ? result.manager_messages.filter(Boolean).slice(-1)[0]
+    : "";
   const phaseName = {
     starting: "准备安装",
     queued: "已加入 ComfyUI-Manager 队列",
     running: "ComfyUI-Manager 安装中",
-    installing: "安装中",
+    downloading: "正在下载插件",
+    installing: "安装插件依赖",
+    processing: "正在处理插件",
+    resolving: "正在解析 GitHub 仓库",
+    extracting: "正在解包节点文件",
+    validating: "正在验证目标节点",
+    security_review: "正在安全扫描节点",
+    placing: "正在写入 custom_nodes",
     completed: "已完成",
     security_blocked: "安全复核阻止",
     interrupted: "服务重启中断",
@@ -259,11 +293,18 @@ function updateNodeInstallProgress(progress, result) {
     : phase;
   progress.current.textContent = result?.status === "completed"
     ? "所有缺失节点插件均已处理。"
-    : `${phaseName} · 当前插件：${currentPlugin}${currentNode ? ` · ${currentNode}` : ""}`;
+    : `${phaseName} · 当前插件：${currentPlugin}${currentNode ? ` · ${currentNode}` : ""}${managerMessage ? ` · ${managerMessage}` : ""}`;
 
   const completedPlugins = Array.isArray(result?.completed_plugins) ? result.completed_plugins : [];
+  const completedInstallations = Array.isArray(result?.completed_installations) ? result.completed_installations : [];
   progress.completed.replaceChildren();
-  if (completedPlugins.length) {
+  if (completedInstallations.length) {
+    progress.completed.appendChild(el("strong", "", `已完成插件（${completedPlugins.length}）：`));
+    completedInstallations.forEach((item) => {
+      const label = [item.plugin, item.path].filter(Boolean).join(" · ");
+      progress.completed.appendChild(el("p", "cline-workflow-candidate-meta", label));
+    });
+  } else if (completedPlugins.length) {
     progress.completed.appendChild(el("strong", "", `已完成插件（${completedPlugins.length}）：`));
     progress.completed.appendChild(el("span", "", completedPlugins.join("、")));
   } else {
@@ -501,12 +542,16 @@ function createModelDownloadRunner({ jobId, name, progress, prepareSource, onSou
 }
 
 function ensureStyle() {
-  if (document.getElementById(STYLE_ID)) return;
-  const link = document.createElement("link");
-  link.id = STYLE_ID;
-  link.rel = "stylesheet";
-  link.href = new URL("./omniscience.css", import.meta.url).href;
-  document.head.appendChild(link);
+  let link = document.getElementById(STYLE_ID);
+  if (!link) {
+    link = document.createElement("link");
+    link.id = STYLE_ID;
+    link.rel = "stylesheet";
+  }
+  const stylesheetUrl = new URL("./omniscience.css", import.meta.url);
+  stylesheetUrl.searchParams.set("v", "launcher-layer-2");
+  if (link.href !== stylesheetUrl.href) link.href = stylesheetUrl.href;
+  if (!link.isConnected) document.head.appendChild(link);
 }
 
 function lines(value) {
@@ -520,6 +565,40 @@ function currentTaskId() { return state.task?.id || ""; }
 function displayedMessages() { return state.globalChatActive ? state.globalMessages : state.messages; }
 
 function displayedBusy() { return state.globalChatActive ? state.globalBusy : state.busy; }
+
+function workflowApiPrompt(workflow) {
+  if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) return null;
+  if (workflow.prompt && typeof workflow.prompt === "object" && !Array.isArray(workflow.prompt)) {
+    return workflow.prompt;
+  }
+  const looksLikePrompt = Object.values(workflow).some((node) => (
+    node && typeof node === "object" && !Array.isArray(node)
+      && typeof node.class_type === "string"
+      && node.inputs && typeof node.inputs === "object"
+      && !Array.isArray(node.inputs)
+  ));
+  return looksLikePrompt ? workflow : null;
+}
+
+async function loadWorkflowToCanvas(workflow) {
+  if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
+    throw new Error("工作流内容无效，无法加载到当前画布。");
+  }
+  if (Array.isArray(workflow.nodes)) {
+    if (typeof app.loadGraphData !== "function") throw new Error("当前 ComfyUI 不支持导入工作流画布。");
+    await app.loadGraphData(workflow);
+    return;
+  }
+  const prompt = workflowApiPrompt(workflow);
+  if (prompt && typeof app.loadApiJson === "function") {
+    await app.loadApiJson(prompt);
+    return;
+  }
+  if (prompt) {
+    throw new Error("当前 ComfyUI 不支持将 API 工作流转换为画布，请更新 ComfyUI 前端后重试。");
+  }
+  throw new Error("该工作流不是可识别的 ComfyUI 画布或 API 格式。");
+}
 
 function serializeCurrentCanvasWorkflow() {
   if (!app?.graph || typeof app.graph.serialize !== "function") {
@@ -1046,29 +1125,33 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
       }
       card.appendChild(summary);
       const loadCanvas = button("加载到当前画布", "cline-secondary cline-workflow-load-canvas");
-      loadCanvas.onclick = () => {
+      loadCanvas.onclick = async () => {
+        const originalLabel = loadCanvas.textContent;
+        loadCanvas.disabled = true;
         try {
           const workflow = inspection.workflow;
-          if (!workflow || typeof app.loadGraphData !== "function") throw new Error("当前 ComfyUI 不支持导入工作流画布。");
-          const graph = workflow.nodes ? workflow : workflow.prompt ? null : workflow;
-          if (!graph) throw new Error("该工作流是 API prompt 格式，请先转换为 ComfyUI 画布工作流。");
-          app.loadGraphData(graph);
+          await loadWorkflowToCanvas(workflow);
           loadCanvas.textContent = "已加载到当前画布";
         } catch (error) {
+          loadCanvas.disabled = false;
+          loadCanvas.textContent = originalLabel;
           showError(error);
         }
       };
       card.appendChild(loadCanvas);
-      if (!restoring && report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
+      if (options.autoLoadCanvas) {
+        loadCanvas.textContent = "正在加载到当前画布…";
+        void loadCanvas.onclick();
+      } else if (!restoring && report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
         if (window.confirm("工作流检查完成。是否先加载到当前 ComfyUI 画布？\n\n当前画布中的未保存内容可能会被替换。")) {
-          loadCanvas.click();
+          void loadCanvas.onclick();
         }
       }
       let plan = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies`);
       const planSummary = el(
         "p",
         "cline-workflow-candidate-meta",
-        `工作流节点：${plan.workflow_node_count ?? report.node_count ?? 0} · 需要安装插件：${plan.installable_plugin_count ?? (plan.plugin_groups || []).length} 个 · 节点：${plan.installable_missing_type_count ?? plan.installable_missing_nodes?.length ?? (plan.nodes || []).length} 种类型/${plan.installable_missing_node_count ?? plan.node_instance_count ?? 0} 个实例 · 模型依赖：${(plan.models || []).length}`,
+        `工作流节点：${plan.workflow_node_count ?? report.node_count ?? 0} · 需要安装插件：${plan.installable_plugin_count ?? (plan.plugin_groups || []).length} 个 · 节点：${plan.installable_missing_type_count ?? plan.installable_missing_nodes?.length ?? dedupeWorkflowNodeTypes(plan).length} 种类型/${plan.installable_missing_node_count ?? plan.node_instance_count ?? dedupeWorkflowNodeTypes(plan).reduce((total, node) => total + (node.instances || []).length, 0)} 个实例 · 模型依赖：${(plan.models || []).length}`,
       );
       card.appendChild(planSummary);
       const runStatus = el("p", "cline-workflow-candidate-meta cline-workflow-run-status");
@@ -1094,19 +1177,21 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
       };
       card.appendChild(runStatus);
       renderRunStatus(plan);
+      const nodeInstallArea = el("div", "cline-workflow-node-install-area");
+      card.appendChild(nodeInstallArea);
       const nodeInstallDetails = el("div", "cline-workflow-node-install-details");
       renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
-      card.appendChild(nodeInstallDetails);
+      nodeInstallArea.appendChild(nodeInstallDetails);
       const installablePlugins = plan.installable_plugins || plan.plugin_groups || [];
       if (installablePlugins.length) {
-        card.appendChild(el(
+        nodeInstallArea.appendChild(el(
           "p",
           "cline-workflow-candidate-meta",
           `需要安装：${installablePlugins.map((plugin) => plugin.package_name || plugin.title || plugin.manager_id || plugin.source).join("、")}`,
         ));
       }
       if ((plan.frontend_only_nodes || []).length) {
-        card.appendChild(el(
+        nodeInstallArea.appendChild(el(
           "p",
           "cline-workflow-candidate-meta",
           `前端节点（无需安装）：${plan.frontend_only_nodes.join("、")}`,
@@ -1156,7 +1241,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
           `仍有 ${(plan.unresolved_instances || []).length} 个节点实例未解决，请按实例选择来源或手动确认仓库。`,
         ));
       }
-      if (nodeAttributionArea.children.length) card.appendChild(nodeAttributionArea);
+      if (nodeAttributionArea.children.length) nodeInstallArea.appendChild(nodeAttributionArea);
       const modelSourceArea = el("div", "cline-workflow-node-sources cline-workflow-model-sources");
       let modelSearchUrls = {};
       const localInventoryArea = el("div", "cline-workflow-local-inventory");
@@ -1409,7 +1494,8 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         if (instances.length) return instances.every((instance) => instance.source_selected);
         return !!(node.source || node.manager_id || node.source_selected);
       };
-      const missingSources = (plan.nodes || []).filter((node) => !nodeSourceReady(node));
+      const nodeTypes = dedupeWorkflowNodeTypes(plan);
+      const missingSources = nodeTypes.filter((node) => !nodeSourceReady(node));
       const sourceSearchArea = el("div", "cline-workflow-node-sources");
       const searchButton = button("解析缺失节点（ComfyUI-Manager）", "cline-secondary cline-workflow-node-search");
       const modelSearchButton = button("搜索缺失模型文件（Hugging Face）", "cline-secondary cline-workflow-model-search");
@@ -1456,14 +1542,135 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
           searchButton.disabled = true;
           searchButton.textContent = "正在读取 ComfyUI-Manager 映射…";
           try {
-            const searched = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/search`, {
-              method: "POST", body: "{}",
-            });
+            let searched;
+            try {
+              searched = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/search`, {
+                method: "POST", body: "{}",
+              });
+            } catch (error) {
+              const classTypes = [...new Set(nodeTypes.filter((node) => !nodeSourceReady(node)).map((node) => node.class_type))];
+              searched = {
+                results: Object.fromEntries(classTypes.map((classType) => [classType, []])),
+                manager_errors: Object.fromEntries(classTypes.map((classType) => [classType, error.message || "Fetch timeout"])),
+              };
+            }
+            const managerErrors = { ...(searched.manager_errors || {}) };
+            const needsWebSearch = Object.entries(searched.results || {})
+              .filter(([, candidates]) => !candidates?.length)
+              .map(([classType]) => classType);
+            if (needsWebSearch.length) {
+              searchButton.textContent = "Manager 无映射，正在搜索 GitHub…";
+              try {
+                const web = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/web-search`, {
+                  method: "POST", body: JSON.stringify({ class_types: needsWebSearch }),
+                });
+                searched = {
+                  ...searched,
+                  results: { ...(searched.results || {}), ...(web.results || {}) },
+                  search_errors: web.search_errors || {},
+                  manager_errors: managerErrors,
+                };
+              } catch (error) {
+                searched.search_errors = Object.fromEntries(needsWebSearch.map((classType) => [classType, error.message]));
+                searched.manager_errors = managerErrors;
+              }
+            }
             sourceSearchArea.replaceChildren();
-            for (const [classType, candidates] of Object.entries(searched.results || {})) {
+            const searchErrors = searched.search_errors || {};
+            const renderManagerErrors = searched.manager_errors || {};
+            const searchResults = searched.results || {};
+            const searchUrls = searched.search_urls || {};
+            const searchEngines = searched.search_engines || {};
+            const unresolvedByType = new Map();
+            for (const node of plan.nodes || []) {
+              const classType = String(node.class_type || "");
+              const existing = unresolvedByType.get(classType);
+              if (!existing) {
+                unresolvedByType.set(classType, { ...node, instances: [...(node.instances || [])] });
+                continue;
+              }
+              const seenInstanceIds = new Set((existing.instances || []).map((instance) => String(instance.id || "")));
+              for (const instance of node.instances || []) {
+                const id = String(instance.id || "");
+                if (!seenInstanceIds.has(id)) {
+                  existing.instances.push(instance);
+                  seenInstanceIds.add(id);
+                }
+              }
+            }
+            const unresolvedTypes = [...unresolvedByType.values()];
+            for (const plannedNode of unresolvedTypes) {
+              const classType = plannedNode.class_type;
+              const candidates = searchResults[classType] || [];
               const group = el("div", "cline-workflow-node-source-group");
+              const instanceIds = [...new Set((plannedNode.instances || []).map((instance) => String(instance.id || "").trim()).filter(Boolean))];
               group.appendChild(el("strong", "", `节点 ${classType}：`));
-              const plannedNode = (plan.nodes || []).find((node) => node.class_type === classType);
+              group.appendChild(el("p", "cline-workflow-candidate-meta", instanceIds.length
+                ? `使用实例 ID：${instanceIds.join("、")}`
+                : "未提供实例 ID"));
+              if (nodeSourceReady(plannedNode)) {
+                const source = plannedNode.source || (plannedNode.instances || []).find((instance) => instance.source)?.source || "来源已确认";
+                group.appendChild(el("p", "cline-workflow-candidate-meta", `已确认安装来源 · 尚未安装：${source}`));
+                const installNow = button("现在安装此节点", "cline-secondary cline-workflow-node-source");
+                const runSingleNodeInstall = async (acknowledgeSecurity = false) => {
+                  installNow.disabled = true;
+                  installNow.textContent = "正在启动安装…";
+                  try {
+                    const started = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/confirm`, {
+                      method: "POST",
+                      body: JSON.stringify({
+                        confirmed: true,
+                        class_types: [classType],
+                        acknowledge_security_for: acknowledgeSecurity ? classType : "",
+                      }),
+                    });
+                    updateNodeInstallProgress(nodeProgressUi, started.progress || {});
+                    if (started.status === "installing") {
+                      installNow.textContent = "正在安装此节点…";
+                      await waitForNodeInstall(
+                        jobId,
+                        (progress) => updateNodeInstallProgress(nodeProgressUi, progress),
+                        () => nodeProgressUi.container.isConnected,
+                      );
+                    }
+                    installNow.textContent = "此节点已完成安装检查";
+                    installNow.disabled = true;
+                    void refreshRunStatus().then(() => maybeAppendExecute());
+                  } catch (error) {
+                    installNow.disabled = false;
+                    installNow.textContent = "重试安装此节点";
+                    if (error?.payload?.security) showNodeSecurityReview(error, {
+                      inline: true,
+                      retry: () => runSingleNodeInstall(true),
+                    });
+                    else group.appendChild(el("p", "cline-workflow-candidate-meta warning", `安装失败：${error.message}`));
+                  }
+                };
+                installNow.onclick = () => runSingleNodeInstall(false);
+                group.appendChild(installNow);
+                sourceSearchArea.appendChild(group);
+                continue;
+              }
+              if (renderManagerErrors[classType]) {
+                group.appendChild(el("p", "cline-workflow-candidate-meta warning", `ComfyUI-Manager 查询失败，已继续网页搜索：${renderManagerErrors[classType]}`));
+              }
+              if (searchErrors[classType]) {
+                group.appendChild(el("p", "cline-workflow-candidate-meta warning", `网页搜索失败：${searchErrors[classType]}`));
+              }
+              const searchUrl = searchUrls[classType] || candidates.find((repo) => repo.search_url)?.search_url || "";
+              const searchEngine = searchEngines[classType] || candidates.find((repo) => repo.search_engine)?.search_engine || "";
+              let parsedSearchUrl = null;
+              try { parsedSearchUrl = searchUrl ? new URL(searchUrl) : null; } catch {}
+              const validSearchUrl = parsedSearchUrl?.protocol === "https:"
+                && ((searchEngine === "bing" && parsedSearchUrl.hostname === "cn.bing.com")
+                  || (searchEngine === "google" && parsedSearchUrl.hostname === "www.google.com"));
+              if (!candidates.length && validSearchUrl) {
+                const searchLink = el("a", "cline-workflow-candidate-meta", `在 ${searchEngine === "bing" ? "Bing" : "Google"} 中手动搜索 ${classType}`);
+                searchLink.href = parsedSearchUrl.href;
+                searchLink.target = "_blank";
+                searchLink.rel = "noopener noreferrer";
+                group.appendChild(searchLink);
+              }
               const unresolvedInstances = (plannedNode?.instances || []).filter((instance) => !instance.source_selected);
               const auxInstances = unresolvedInstances.filter((instance) => instance.aux_id);
               if (auxInstances.length) {
@@ -1496,7 +1703,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                         instance.status = "selected";
                         manualSubmit.textContent = "已选择手动来源";
                         renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
-                        prepare.disabled = !(plan.nodes || []).every(nodeSourceReady);
+                        prepare.disabled = !nodeTypes.every(nodeSourceReady);
                       } catch (error) {
                         manualSubmit.disabled = false;
                         showError(error);
@@ -1519,7 +1726,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                         instance.source_selected = true;
                         instance.status = "selected";
                         option.textContent = `已选择：${label}`;
-                        prepare.disabled = !(plan.nodes || []).every(nodeSourceReady);
+                        prepare.disabled = !nodeTypes.every(nodeSourceReady);
                       } catch (error) {
                         option.disabled = false;
                         showError(error);
@@ -1531,11 +1738,14 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                 });
               }
               const regularInstances = unresolvedInstances.filter((instance) => !instance.aux_id);
-              const targets = regularInstances.length
-                ? regularInstances
-                : unresolvedInstances.length
-                  ? []
-                  : [{ id: "", aux_id: "" }];
+              const webCandidates = (candidates || []).filter((repo) => ["web_search", "github_proxy"].includes(repo.provider));
+              const targets = webCandidates.length
+                ? [{ id: "", aux_id: "", web_search: true }]
+                : regularInstances.length
+                  ? regularInstances
+                  : unresolvedInstances.length
+                    ? []
+                    : [{ id: "", aux_id: "" }];
               const candidateMatches = (repo, target) => {
                 const expected = String(target?.aux_id || "").trim().toLowerCase().replace(/\/$/, "");
                 if (!expected) return true;
@@ -1586,7 +1796,11 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                   : "节点类型级来源";
                 const targetGroup = el("div", "cline-workflow-node-source-instance");
                 targetGroup.appendChild(el("p", "cline-workflow-candidate-meta", targetLabel));
-                const targetCandidates = (candidates || []).filter((repo) => candidateMatches(repo, target));
+                const targetCandidates = (candidates || []).filter((repo) => (
+                  target.web_search
+                    ? ["web_search", "github_proxy"].includes(repo.provider)
+                    : candidateMatches(repo, target)
+                ));
                 if (!targetCandidates.length) {
                   targetGroup.appendChild(el("p", "cline-workflow-candidate-meta warning", target.aux_id
                     ? "没有带有相同 aux_id 证据的 Manager 候选；请手动确认真正的 GitHub 节点仓库。"
@@ -1610,7 +1824,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                       manualSubmit.textContent = "已选择手动来源";
                       applySelection(target, { source: value.replace(/\/$/, ""), source_type: "manual" });
                       renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
-                      const allSourcesSelected = (plan.nodes || []).every(nodeSourceReady);
+                      const allSourcesSelected = nodeTypes.every(nodeSourceReady);
                       prepare.disabled = !allSourcesSelected;
                     } catch (error) {
                       manualSubmit.disabled = false;
@@ -1620,8 +1834,48 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                   targetGroup.append(manualInput, manualSubmit);
                 }
                 targetCandidates.forEach((repo) => {
-                  const label = repo.title || repo.manager_id || repo.cnr_id || "未命名节点包";
-                  const option = button(`安装包：${label}`, "cline-secondary cline-workflow-node-source");
+                  const label = repo.title || repo.manager_id || repo.cnr_id || repo.full_name || "未命名节点包";
+                  const isWebCandidate = ["web_search", "github_proxy"].includes(repo.provider);
+                  if (isWebCandidate) {
+                    const picker = el("select", "cline-workflow-node-source-picker");
+                    picker.setAttribute("aria-label", `选择 ${classType} 的 GitHub 节点仓库`);
+                    const placeholderOption = el("option", "", "请选择 GitHub 节点仓库…");
+                    placeholderOption.value = "";
+                    placeholderOption.selected = true;
+                    picker.appendChild(placeholderOption);
+                    const candidateOption = el("option", "", `${label} · ${repo.source || repo.repository || ""}`);
+                    candidateOption.value = repo.candidate_id || "candidate";
+                    picker.appendChild(candidateOption);
+                    targetGroup.appendChild(el("p", "cline-workflow-candidate-meta", `网页搜索 · ${repo.search_engine === "bing" ? "Bing" : "Google"} · 请从下拉列表选择候选仓库`));
+                    targetGroup.appendChild(picker);
+                    const installOption = button("选择并安装此节点", "cline-secondary cline-workflow-node-source");
+                    installOption.disabled = true;
+                    picker.onchange = () => { installOption.disabled = !picker.value; };
+                    installOption.onclick = async () => {
+                      if (!picker.value) return;
+                      installOption.disabled = true;
+                      try {
+                        const body = {
+                          class_type: classType,
+                          source: repo.source || repo.repository,
+                          candidate_id: repo.candidate_id,
+                          provider: repo.provider,
+                          region: repo.region,
+                        };
+                        await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/source`, {
+                          method: "POST", body: JSON.stringify(body),
+                        });
+                        installOption.textContent = `已选择：${label}`;
+                        installOption.classList.add("selected");
+                        applySelection({ id: "", aux_id: "" }, { source: repo.source || repo.repository || "", source_type: repo.provider });
+                        renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
+                        prepare.disabled = !nodeTypes.every(nodeSourceReady);
+                      } catch (error) { installOption.disabled = false; showError(error); }
+                    };
+                    targetGroup.appendChild(installOption);
+                    return;
+                  }
+                  const option = button(`选择并安装：${label}`, "cline-secondary cline-workflow-node-source");
                   const details = ["ComfyUI-Manager 精确映射", `包 ID：${repo.manager_id || "未知"}`, repo.repository].filter(Boolean).join(" · ");
                   targetGroup.appendChild(el("p", "cline-workflow-candidate-meta", details));
                   option.onclick = async () => {
@@ -1631,15 +1885,11 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
                       await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/source`, {
                         method: "POST", body: JSON.stringify(body),
                       });
-                      option.textContent = `已选择 Manager 安装包：${label}`;
+                      option.textContent = `已选择：${label}`;
                       option.classList.add("selected");
-                      applySelection(target, { source: repo.repository || "", manager_id: repo.manager_id, source_type: "comfyui_manager" });
+                      applySelection(target, { source: repo.repository || "", manager_id: repo.manager_id, source_type: repo.provider });
                       renderWorkflowNodeInstallDetails(nodeInstallDetails, plan);
-                      const allSourcesSelected = (plan.nodes || []).every(nodeSourceReady);
-                      prepare.disabled = !allSourcesSelected;
-                      prepare.textContent = allSourcesSelected
-                        ? `使用 Manager 安装并扫描缺少节点（工作流 ID: ${candidate.id || "未知"}）`
-                        : "先选择缺少节点的安装来源";
+                      prepare.disabled = !nodeTypes.every(nodeSourceReady);
                     } catch (error) { option.disabled = false; showError(error); }
                   };
                   targetGroup.appendChild(option);
@@ -1655,10 +1905,10 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
             showError(error);
           } finally { searchButton.disabled = false; }
         };
-        card.append(searchButton, sourceSearchArea);
+        nodeInstallArea.append(searchButton, sourceSearchArea);
       }
-      const hasNodes = (plan.nodes || []).length > 0;
-      const nodesReady = hasNodes && (plan.nodes || []).every(nodeSourceReady);
+      const hasNodes = nodeTypes.length > 0;
+      const nodesReady = hasNodes && nodeTypes.every(nodeSourceReady);
       const hasModels = (plan.models || []).length > 0;
       let nodesPrepared = plan.node_dependencies_ready === true || !hasNodes;
       const maybeAppendExecute = () => {
@@ -1670,10 +1920,14 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
       });
       const prepare = button(hasNodes ? (nodesReady ? `安装并安全检查缺少节点（工作流 ID: ${candidate.id || "未知"}）` : "先选择缺少节点的安装来源") : "检查工作流准备状态", "cline-secondary cline-workflow-prepare");
       const nodeProgressUi = nodeInstallProgress();
-      const runNodeInstallation = async (acknowledgeSecurityFor = "") => {
+      const runNodeInstallation = async (acknowledgeSecurityFor = "", classTypes = null) => {
         const started = await request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/confirm`, {
           method: "POST",
-          body: JSON.stringify({ confirmed: true, acknowledge_security_for: acknowledgeSecurityFor }),
+          body: JSON.stringify({
+            confirmed: true,
+            acknowledge_security_for: acknowledgeSecurityFor,
+            ...(Array.isArray(classTypes) ? { class_types: classTypes } : {}),
+          }),
         });
         updateNodeInstallProgress(nodeProgressUi, started.progress || {});
         if (started.status === "security_blocked") {
@@ -1692,9 +1946,13 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         return completed;
       };
       prepare.disabled = hasNodes && !nodesReady;
-      const showNodeSecurityReview = (securityError) => {
+      const showNodeSecurityReview = (securityError, options = {}) => {
         const security = securityError?.payload?.security;
-        if (!security) return showError(securityError);
+        if (!security) {
+          if (options.inline) card.appendChild(el("p", "cline-workflow-candidate-meta warning", `安全检查失败：${securityError.message}`));
+          else showError(securityError);
+          return;
+        }
         const report = securityReport(security);
         if (security.post_install || security.manager_managed) {
           card.append(
@@ -1702,19 +1960,31 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
             el(
               "p",
               "cline-workflow-candidate-meta warning",
-              "ComfyUI-Manager 已经把该节点放入 custom_nodes，但安全复核未通过。请在 Manager 中停用或移除该节点后再处理；Omniscience 不会通过手动 GitHub 兜底安装。",
+              securityError.message || "ComfyUI-Manager 已经把该节点放入 custom_nodes，但安全复核未通过。请在 Manager 中停用或移除该节点后再处理；Omniscience 不会通过手动 GitHub 兜底安装。",
             ),
           );
           return;
         }
         const retry = button("查看报告后，单独确认仍要安装此风险节点", "cline-secondary cline-workflow-node-risk-confirm");
-        retry.onclick = () => {
+        retry.onclick = async () => {
           const findings = (security.findings || []).map((finding) => `${finding.severity}: ${finding.title}`).join("\n");
           if (!window.confirm(`安全检测报告为“${securityVerdict(security)}”。\n\n${findings}\n\n继续会把风险代码放入 ComfyUI，并可能在重启时执行。仍要继续吗？`)) return;
+          if (options.retry) {
+            retry.disabled = true;
+            try {
+              await options.retry();
+            } catch (error) {
+              retry.disabled = false;
+              if (error?.payload?.security) showNodeSecurityReview(error, options);
+              else if (options.inline) card.appendChild(el("p", "cline-workflow-candidate-meta warning", `安装失败：${error.message}`));
+              else showError(error);
+            }
+            return;
+          }
           retry.disabled = true;
           prepare.disabled = true;
           const acknowledgeFor = security.class_type;
-          runNodeInstallation(acknowledgeFor).then(() => {
+          runNodeInstallation(acknowledgeFor, options.classTypes || null).then(() => {
             nodesPrepared = true;
             prepare.disabled = false;
             prepare.textContent = "已完成逐节点安全复核";
@@ -1728,13 +1998,12 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
           });
         };
         card.append(report, retry);
-        showError(securityError);
       };
       prepare.onclick = async () => {
         prepare.disabled = true;
         try {
           if (hasNodes) {
-            if (!window.confirm(`将通过 ComfyUI-Manager 安装已映射节点，并对手动 GitHub 来源执行安全扫描与 NODE_CLASS_MAPPINGS 校验：\n\n${(plan.nodes || []).map((node) => `${node.class_type} ← ${node.manager_id ? `Manager:${node.manager_id}` : node.source}`).join("\n")}\n\n继续？`)) {
+            if (!window.confirm(`将通过 ComfyUI-Manager 安装已映射节点，并对手动 GitHub 来源执行安全扫描与 NODE_CLASS_MAPPINGS 校验：\n\n${nodeTypes.map((node) => `${node.class_type} ← ${node.manager_id ? `Manager:${node.manager_id}` : node.source}`).join("\n")}\n\n继续？`)) {
               prepare.disabled = false;
               return;
             }
@@ -1756,8 +2025,8 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         }
       };
       if (hasNodes) {
-        card.appendChild(prepare);
-        card.appendChild(nodeProgressUi.container);
+        nodeInstallArea.appendChild(prepare);
+        nodeInstallArea.appendChild(nodeProgressUi.container);
         void request(`/cline/global-chat/workflows/${encodeURIComponent(jobId)}/dependencies/nodes/status`)
           .then((status) => {
             updateNodeInstallProgress(nodeProgressUi, status.progress || {});
@@ -1789,14 +2058,19 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
               if (status.progress?.security) {
                 const error = new Error(status.progress.error || "节点插件安装失败");
                 error.payload = { security: status.progress.security };
-                showNodeSecurityReview(error);
+                error.classType = status.progress.blocked_node || status.progress.security.class_type || "";
+                showNodeSecurityReview(error, { classTypes: error.classType ? [error.classType] : null });
               }
-            } else if (status.status === "security_blocked") {
-              prepare.disabled = true;
-              prepare.textContent = "Manager 已安装，但安全复核未通过";
-              const error = new Error(status.progress?.error || "Manager 已安装节点，但安全复核未通过");
+            } else if (status.status === "security_review_required" || status.status === "security_blocked") {
+              prepare.disabled = Boolean(status.progress?.manager_installed);
+              prepare.textContent = status.progress?.manager_installed
+                ? "Manager 已安装，但安全复核未通过"
+                : "安全检测发现风险：查看报告并决定是否继续";
+              const error = new Error(status.progress?.error || "节点安全检查发现风险，请查看报告并决定是否继续安装");
+              error.status = 409;
               if (status.progress?.security) error.payload = { security: status.progress.security };
-              showNodeSecurityReview(error);
+              const classType = status.progress?.blocked_node || status.progress?.security?.class_type || "";
+              showNodeSecurityReview(error, { classTypes: classType ? [classType] : null });
             }
           })
           .catch(() => {});
@@ -1969,7 +2243,7 @@ function workflowInstallCard(content) {
     preparation.appendChild(workflowCandidateCard(
       result.workflow_job_id,
       result.candidate,
-      { uploaded: true, autoRestore: false, autoPrepare: true, forceInspection: true },
+      { uploaded: true, autoRestore: false, autoPrepare: true, autoLoadCanvas: true, forceInspection: true },
     ));
     card.appendChild(preparation);
   }
@@ -3791,7 +4065,11 @@ function buildPanel() {
   const globalChat = button("全局对话", "cline-secondary cline-global-chat-toggle");
   globalChat.onclick = toggleGlobalChat;
   const close = button("×", "cline-close");
-  close.onclick = () => panel.classList.remove("open");
+  close.onclick = () => {
+    panel.classList.remove("open");
+    const launcher = document.getElementById("comfyui-omniscience-launcher");
+    if (launcher) launcher.hidden = false;
+  };
   const headerActions = el("div", "cline-header-actions");
   headerActions.append(globalChat, close);
   header.append(heading, headerActions);
@@ -3999,7 +4277,11 @@ function installLauncher() {
   if (document.getElementById("comfyui-omniscience-launcher")) return;
   const launcher = button("Omniscience", "cline-launcher");
   launcher.id = "comfyui-omniscience-launcher";
-  launcher.onclick = () => { buildPanel(); document.getElementById(PANEL_ID).classList.add("open"); };
+  launcher.onclick = () => {
+    buildPanel();
+    document.getElementById(PANEL_ID).classList.add("open");
+    launcher.hidden = true;
+  };
   document.body.appendChild(launcher);
 }
 

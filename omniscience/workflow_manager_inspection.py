@@ -207,6 +207,7 @@ class WorkflowInspectionMixin:
             loaded_nodes_checked=loaded_nodes_checked,
             loader_choices=node_info,
         )
+        report["loaded_node_types"] = sorted(str(name) for name in (loaded_nodes or [])) if loaded_nodes_checked else []
         # Keep the provider's workflow untouched during selection/preparation.
         # UI canvas exports may contain widget values for nodes that are not
         # present in the current ComfyUI /object_info response yet (for
@@ -258,12 +259,52 @@ class WorkflowInspectionMixin:
         if folder_warning:
             report["folder_paths_warning"] = folder_warning
         metadata = dict(job.get("metadata") or {})
-        # A node installed before a ComfyUI restart is not registered in the
-        # old /object_info response. Refresh the durable result when the user
-        # inspects the workflow again after restarting ComfyUI.
         prepared = dict(metadata.get("prepared_node_results") or {})
+        progress = metadata.get("node_install_progress") or {}
+        failed_node = str(progress.get("current_node") or "").strip()
+        terminal_install_failure = progress.get("status") == "failed" or progress.get("interrupted") is True
         loaded_set = {str(name) for name in (loaded_nodes or [])} if loaded_nodes_checked else set()
         prepared_changed = False
+        if loaded_nodes_checked and terminal_install_failure and failed_node and failed_node not in loaded_set:
+            failed_instances = [
+                dict(instance)
+                for instance in report.get("node_instances") or []
+                if str(instance.get("class_type") or "") == failed_node
+            ]
+            if failed_instances:
+                for name_field, instance_field, details_field in (
+                    ("missing_nodes", "missing_node_instances", "missing_node_details"),
+                    ("canvas_missing_nodes", "canvas_missing_node_instances", "canvas_missing_node_details"),
+                    ("installable_missing_nodes", "installable_missing_node_instances", "installable_missing_node_details"),
+                ):
+                    names = list(dict.fromkeys([*(report.get(name_field) or []), failed_node]))
+                    instances = [
+                        dict(instance)
+                        for instance in report.get(instance_field) or []
+                        if str(instance.get("class_type") or "") != failed_node
+                    ]
+                    instances.extend(failed_instances)
+                    report[name_field] = sorted(str(name) for name in names)
+                    report[instance_field] = instances
+                    details = [
+                        dict(detail)
+                        for detail in report.get(details_field) or []
+                        if str(detail.get("class_type") or "") != failed_node
+                    ]
+                    details.append({
+                        "class_type": failed_node,
+                        "count": len(failed_instances),
+                        "node_ids": [str(instance.get("id") or "") for instance in failed_instances],
+                    })
+                    report[details_field] = sorted(details, key=lambda detail: str(detail.get("class_type") or ""))
+                report["missing_node_count"] = len(report.get("missing_node_instances") or [])
+                report["canvas_missing_node_count"] = len(report.get("canvas_missing_node_instances") or [])
+                report["installable_missing_node_count"] = len(report.get("installable_missing_node_instances") or [])
+                report["missing_type_count"] = len(report.get("missing_node_details") or [])
+                report["canvas_missing_type_count"] = len(report.get("canvas_missing_node_details") or [])
+                report["installable_missing_type_count"] = len(report.get("installable_missing_node_details") or [])
+                prepared.pop(failed_node, None)
+                prepared_changed = True
         if loaded_nodes_checked:
             for class_type, result in prepared.items():
                 if not isinstance(result, dict) or result.get("verification_status") != "restart_required":

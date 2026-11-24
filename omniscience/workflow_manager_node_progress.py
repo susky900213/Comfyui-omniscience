@@ -144,6 +144,7 @@ class WorkflowNodeProgressMixin:
         *,
         confirmed: bool = False,
         acknowledge_security_for: str = "",
+        class_types: Any = None,
     ) -> dict[str, Any]:
         """Queue node installation and return immediately with a durable progress snapshot."""
         if not confirmed:
@@ -153,6 +154,12 @@ class WorkflowNodeProgressMixin:
         if not plan:
             plan = await asyncio.to_thread(self.dependency_plan, job_id)
         nodes = [item for item in plan.get("nodes") or [] if isinstance(item, dict)]
+        requested_types = {str(name).strip() for name in class_types} if isinstance(class_types, list) else None
+        if requested_types is not None:
+            available_types = {str(item.get("class_type") or "") for item in nodes}
+            if not requested_types or not requested_types.issubset(available_types):
+                raise ValueError("单节点安装请求包含无效或不属于当前工作流的节点类型。")
+            nodes = [item for item in nodes if str(item.get("class_type") or "") in requested_types]
         if not nodes:
             return {
                 "status": "completed",
@@ -176,7 +183,7 @@ class WorkflowNodeProgressMixin:
             return {"status": "installing", "job_id": key, "progress": self.node_install_status(key)["progress"]}
         previous = dict((job.get("metadata") or {}).get("node_install_progress") or {})
         previous = self._migrate_legacy_manager_security_progress(key, previous)
-        if previous.get("status") == "completed":
+        if previous.get("status") == "completed" and not previous.get("partial_install"):
             return {"status": "completed", "job_id": key, "progress": previous}
         if previous.get("status") == "security_blocked":
             # Manager has already put this project in custom_nodes.  A security
@@ -203,9 +210,13 @@ class WorkflowNodeProgressMixin:
             "current": 0,
             "completed": 0,
             "total": len(nodes),
+            "requested_class_types": [str(item.get("class_type") or "") for item in nodes]
+                if requested_types is not None
+                else None,
             "current_node": "",
             "current_plugin": "",
             "completed_plugins": [],
+            "completed_installations": [],
             "events": [],
             "error": "",
         }
@@ -215,6 +226,7 @@ class WorkflowNodeProgressMixin:
                 key,
                 acknowledge_security_for=acknowledge_security_for,
                 total=len(nodes),
+                class_types=[str(item.get("class_type") or "") for item in nodes],
             )
         )
         tasks[key] = task
@@ -223,7 +235,7 @@ class WorkflowNodeProgressMixin:
 
 
     async def _run_background_node_installation(
-        self, job_id: str, *, acknowledge_security_for: str, total: int
+        self, job_id: str, *, acknowledge_security_for: str, total: int, class_types: list[str]
     ) -> dict[str, Any]:
         try:
             result = await self.confirm_node_installation(
@@ -231,9 +243,19 @@ class WorkflowNodeProgressMixin:
                 confirmed=True,
                 acknowledge_security_for=acknowledge_security_for,
                 progress_callback=lambda update: self._merge_node_install_progress(job_id, update, total),
+                class_types=class_types,
             )
             progress = dict((self.store.get_workflow_job(job_id) or {}).get("metadata", {}).get("node_install_progress") or {})
-            progress.update({"status": "completed", "phase": "completed", "current": total, "completed": total, "total": total, "error": ""})
+            partial = bool(progress.get("requested_class_types"))
+            progress.update({
+                "status": "completed",
+                "phase": "completed",
+                "current": total,
+                "completed": total,
+                "total": total,
+                "error": "",
+                "partial_install": partial,
+            })
             self._save_node_install_progress(job_id, progress)
             return result
         except Exception as exc:
@@ -241,25 +263,29 @@ class WorkflowNodeProgressMixin:
             report = getattr(exc, "report", None)
             if isinstance(report, dict):
                 progress["security"] = report
+            from .agent.node_install import NodeSecurityBlockedError
+
             manager_managed = isinstance(report, dict) and bool(
                 report.get("post_install") or report.get("manager_managed")
             )
+            node_security_blocked = isinstance(exc, NodeSecurityBlockedError)
+            security_requires_review = node_security_blocked and not manager_managed
             progress.update(
                 {
-                    "status": "security_blocked" if manager_managed else "failed",
-                    "phase": "security_blocked" if manager_managed else "failed",
+                    "status": "security_review_required" if security_requires_review else "security_blocked" if node_security_blocked else "failed",
+                    "phase": "security_review_required" if security_requires_review else "security_blocked" if node_security_blocked else "failed",
                     "terminal": manager_managed,
                     "manager_installed": manager_managed,
                     "error": str(exc),
                     "total": total,
                 }
             )
-            if manager_managed:
-                blocked_node = str(report.get("class_type") or "").strip()
+            if node_security_blocked:
+                blocked_node = str(report.get("class_type") or progress.get("current_node") or "").strip()
                 if blocked_node:
                     progress["blocked_node"] = blocked_node
                 events = list(progress.get("events") or [])
-                event = f"安全复核阻止：{blocked_node or 'Manager 节点'}（Manager 已安装）"
+                event = f"等待用户确认风险：{blocked_node or '节点包'}" if security_requires_review else f"安全复核阻止：{blocked_node or '节点包'}"
                 if event not in events:
                     events.append(event)
                 progress["events"] = events[-20:]
@@ -277,6 +303,18 @@ class WorkflowNodeProgressMixin:
         if completed_plugin and completed_plugin not in completed_plugins:
             completed_plugins.append(completed_plugin)
         merged["completed_plugins"] = completed_plugins
+        completed_installations = list(previous.get("completed_installations") or [])
+        if completed_plugin:
+            installation = {
+                "plugin": completed_plugin,
+                "path": str(update.get("installed_path") or ""),
+            }
+            completed_installations = [
+                item for item in completed_installations
+                if str(item.get("plugin") or "") != completed_plugin
+            ]
+            completed_installations.append(installation)
+        merged["completed_installations"] = completed_installations
 
         events = list(previous.get("events") or [])
         manager_messages = [
