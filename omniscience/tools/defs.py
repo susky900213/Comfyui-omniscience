@@ -136,6 +136,15 @@ LIVE_WORKFLOW_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     ),
 ]
 
+OPEN_WORKFLOW_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    _function(
+        "open_workflow_on_canvas",
+        "Open this task's workflow.json on the user's active ComfyUI canvas. Call only when the user explicitly asks to open, load, or import the task workflow on the canvas. The frontend performs the canvas import after receiving this result; report it as requested, not guaranteed successful.",
+        {},
+        [],
+    ),
+]
+
 GLOBAL_CHAT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _function(
         "install_github_skill",
@@ -276,6 +285,8 @@ def definitions_for_mode(mode: str, mcp_groups: list[dict[str, Any]] | None = No
     else:
         tools += [*WRITE_TOOL_DEFINITIONS, *BROWSER_TOOL_DEFINITIONS]
     tools += LIVE_WORKFLOW_TOOL_DEFINITIONS
+    if mode != "plan":
+        tools += OPEN_WORKFLOW_TOOL_DEFINITIONS
     # MCP tools may have arbitrary side effects: ACT mode only (DESIGN 6).
     for group in (mcp_groups or [] if mode != "plan" else []):
         for tool in group.get("tools") or []:

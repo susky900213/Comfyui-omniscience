@@ -63,6 +63,9 @@ Remember:
 - When the user asks about the current ComfyUI graph, call get_current_workflow
   first; the live workflow can contain unsaved canvas changes and is not the same
   as workflow.json.
+- When the user explicitly asks to open/load/import this task's workflow on the
+  ComfyUI canvas, call open_workflow_on_canvas in ACT mode. The frontend performs
+  the import; say it was requested and let the interface report the actual result.
 
 Begin by analyzing the user's input and gathering necessary context. Present your
 plan at the start of your response, along with the tool calls.

@@ -11,8 +11,59 @@ import asyncio
 from typing import Any
 
 from . import paths
-from .constants import MODEL_TEMPERATURE, MODEL_TIMEOUT_SECONDS
+from .constants import (
+    MODEL_OVERLOAD_MAX_ATTEMPTS,
+    MODEL_OVERLOAD_RETRY_DELAY_SECONDS,
+    MODEL_TEMPERATURE,
+    MODEL_TIMEOUT_SECONDS,
+)
 from .util import json_text
+
+
+def repair_tool_message_sequence(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    repaired: list[dict[str, Any]] = []
+    pending: dict[str, str] = {}
+
+    def append_missing_results() -> None:
+        for call_id, name in pending.items():
+            repaired.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json_text({"error": f"Tool output for {name} is missing because its execution was interrupted."}),
+            })
+        pending.clear()
+
+    for message in messages:
+        role = str(message.get("role") or "")
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in pending:
+                continue
+            repaired.append(dict(message))
+            pending.pop(call_id, None)
+            continue
+        append_missing_results()
+        value = dict(message)
+        if role == "assistant" and value.get("tool_calls"):
+            calls = []
+            for index, call in enumerate(value["tool_calls"]):
+                call_value = dict(call)
+                call_id = str(call_value.get("id") or f"omniscience-missing-tool-{len(repaired)}-{index}")
+                call_value["id"] = call_id
+                name = str((call_value.get("function") or {}).get("name") or "unknown_tool")
+                pending[call_id] = name
+                calls.append(call_value)
+            value["tool_calls"] = calls
+        repaired.append(value)
+    append_missing_results()
+    return repaired
+
+
+def _is_model_overload(status: int, detail: str) -> bool:
+    return 500 <= status < 600 and any(
+        marker in detail.lower()
+        for marker in ("server_is_overloaded", "service_unavailable", "currently overloaded")
+    )
 
 
 async def complete(
@@ -36,7 +87,7 @@ async def complete(
         headers["Authorization"] = f"Bearer {api_key}"
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": repair_tool_message_sequence(messages),
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
@@ -48,11 +99,16 @@ async def complete(
 
         timeout = ClientTimeout(total=MODEL_TIMEOUT_SECONDS)
         async with ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    detail = (await response.text())[:2_000]
-                    raise RuntimeError(f"模型 API 返回 HTTP {response.status}: {detail}")
-                body = await response.json(content_type=None)
+            for attempt in range(MODEL_OVERLOAD_MAX_ATTEMPTS):
+                async with session.post(endpoint, json=payload, headers=headers) as response:
+                    if response.status >= 400:
+                        detail = (await response.text())[:2_000]
+                        if attempt + 1 < MODEL_OVERLOAD_MAX_ATTEMPTS and _is_model_overload(response.status, detail):
+                            await asyncio.sleep(MODEL_OVERLOAD_RETRY_DELAY_SECONDS * (attempt + 1))
+                            continue
+                        raise RuntimeError(f"模型 API 返回 HTTP {response.status}: {detail}")
+                    body = await response.json(content_type=None)
+                    break
     except asyncio.TimeoutError as exc:
         raise RuntimeError("模型 API 请求超时。") from exc
     except ClientError as exc:

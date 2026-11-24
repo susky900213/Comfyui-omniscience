@@ -7687,9 +7687,97 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertIn("get_current_workflow", {item["function"]["name"] for item in act_tools})
                 self.assertIn("get_current_workflow", {item["function"]["name"] for item in plan_tools})
+                self.assertIn("open_workflow_on_canvas", {item["function"]["name"] for item in act_tools})
+                self.assertNotIn("open_workflow_on_canvas", {item["function"]["name"] for item in plan_tools})
             finally:
                 paths.TASK_DATABASE = old_database
                 paths.STATE_DIRECTORY = old_state
+
+    async def test_open_workflow_tool_requests_frontend_canvas_import(self):
+        from omniscience import paths
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            settings = SettingsStore(root / "settings.json")
+            settings.update({"workspace": str(workspace)})
+            old_database = paths.TASK_DATABASE
+            old_state = paths.STATE_DIRECTORY
+            try:
+                paths.TASK_DATABASE = root / "tasks.sqlite3"
+                paths.STATE_DIRECTORY = root / "state"
+                agent = PersistentClineAgent(settings)
+                task = agent.create_task("Open canvas", "act", "open-canvas")
+
+                result = await agent._execute_tool(task["id"], "open_workflow_on_canvas", {})
+
+                self.assertEqual(result["status"], "requested")
+                self.assertEqual(result["action"], "open_workflow_on_canvas")
+                self.assertEqual(result["task_id"], task["id"])
+                self.assertTrue(result["path"].endswith("workflow.json"))
+
+                call = {"id": "open-call", "function": {"name": "open_workflow_on_canvas", "arguments": "{}"}}
+                agent.store.append_message(task["id"], {"role": "assistant", "content": "", "tool_calls": [call]})
+                await agent._process_tool_calls(task["id"], [call], 0, "act")
+                event = agent.store.events(task["id"])[-1]
+                self.assertEqual(event["kind"], "tool_result")
+                self.assertEqual(event["payload"]["result"]["output"]["action"], "open_workflow_on_canvas")
+            finally:
+                paths.TASK_DATABASE = old_database
+                paths.STATE_DIRECTORY = old_state
+
+    async def test_invalid_tool_arguments_still_produce_a_paired_tool_result(self):
+        from omniscience import paths
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            settings = SettingsStore(root / "settings.json")
+            settings.update({"workspace": str(workspace)})
+            old_database = paths.TASK_DATABASE
+            old_state = paths.STATE_DIRECTORY
+            try:
+                paths.TASK_DATABASE = root / "tasks.sqlite3"
+                paths.STATE_DIRECTORY = root / "state"
+                agent = PersistentClineAgent(settings)
+                task = agent.create_task("Invalid tool args", "act", "invalid-tool-args")
+                agent.store.append_message(task["id"], {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call-bad", "function": {"name": "read_file", "arguments": "{bad"}}],
+                })
+
+                await agent._process_tool_calls(task["id"], [{"id": "call-bad", "function": {"name": "read_file", "arguments": "{bad"}}], 0, "act")
+
+                tool_message = agent.store.messages(task["id"])[-1]
+                self.assertEqual(tool_message["role"], "tool")
+                self.assertEqual(tool_message["tool_call_id"], "call-bad")
+                self.assertIn("无效的工具参数", tool_message["content"])
+            finally:
+                paths.TASK_DATABASE = old_database
+                paths.STATE_DIRECTORY = old_state
+
+    def test_model_request_repairs_missing_and_orphan_tool_outputs(self):
+        from omniscience.model_client import repair_tool_message_sequence
+
+        messages = [
+            {"role": "tool", "tool_call_id": "orphan", "content": "discard"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "done", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "missing", "function": {"name": "open_workflow_on_canvas", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "done", "content": "ok"},
+            {"role": "assistant", "content": "continue"},
+        ]
+
+        repaired = repair_tool_message_sequence(messages)
+
+        self.assertEqual([message["role"] for message in repaired], ["assistant", "tool", "tool", "assistant"])
+        self.assertEqual(repaired[1]["tool_call_id"], "done")
+        self.assertEqual(repaired[2]["tool_call_id"], "missing")
+        self.assertIn("execution was interrupted", repaired[2]["content"])
 
     async def test_current_canvas_tool_reports_when_no_workflow_is_synced(self):
         from omniscience import paths, prompts, constants
@@ -8222,6 +8310,44 @@ class WebRegressionTests(unittest.TestCase):
         )
         self.assertIn("cline-workflow-repair-progress", style)
         self.assertIn("cline-workflow-repair-events", style)
+
+    def test_task_node_opens_its_workflow_on_the_canvas(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+
+        row_start = source.index("function taskNodeRow(task)")
+        row_end = source.index("function externalProjectRow", row_start)
+        row = source[row_start:row_end]
+        self.assertIn('el("span", "cline-node-open", "打开工作流")', row)
+        self.assertIn("open.onclick = runOpen", row)
+        self.assertIn("row.oncontextmenu", row)
+        self.assertIn("openTaskWorkflow(task.id)", row)
+        self.assertIn("event.stopPropagation()", row)
+
+        self.assertIn("function taskCanvasWorkflow(result)", source)
+        self.assertLess(source.index("JSON.parse(result.content)"), source.index("return result.current.workflow"))
+        self.assertIn("async function openTaskWorkflow(taskId)", source)
+        self.assertIn("await loadTask(taskId, { openWorkflow: true })", source)
+        load_start = source.index("async function loadTask(")
+        load_end = source.index("async function refreshTask", load_start)
+        load = source[load_start:load_end]
+        self.assertIn("await loadWorkflowToCanvas(taskCanvasWorkflow(workflowResult))", load)
+        self.assertLess(load.index("await loadWorkflowToCanvas"), load.index("await syncCurrentWorkflow"))
+        self.assertIn("if (loaded) await syncCurrentWorkflow", load)
+        self.assertIn("state.taskLoading", load)
+        self.assertIn("state.taskLoading || state.globalChatActive", source)
+        self.assertIn(".cline-node-open", style)
+
+    def test_task_agent_can_request_opening_workflow_on_canvas(self):
+        source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")
+
+        self.assertIn('payload.tool === "open_workflow_on_canvas"', source)
+        self.assertIn('payload.result?.output?.action === "open_workflow_on_canvas"', source)
+        self.assertIn("void openTaskCanvasWorkflow(currentTaskId()).catch(showError)", source)
+        self.assertIn("async function openTaskCanvasWorkflow(taskId)", source)
+        self.assertIn("await loadWorkflowToCanvas(taskCanvasWorkflow(workflowResult))", source)
+        self.assertIn("applyEvents(events.events || [], { allowCanvasOpen: false })", source)
 
     def test_current_task_displays_prompt_length(self):
         source = (Path(__file__).resolve().parents[1] / "web" / "omniscience.js").read_text(encoding="utf-8")

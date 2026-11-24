@@ -648,23 +648,25 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         for index in range(start_index, len(calls)):
             self._check_cancelled(task_id)
             call = calls[index]
-            name, arguments = ClineAgent._parse_tool_call(call)
-            denial = policy.policy_error(mode, name, arguments)
-            if denial is not None:
-                tool_result = results.fail(name, denial)
-            else:
-                try:
+            call_id = str(call.get("id") or f"omniscience-tool-{index}")
+            name = str((call.get("function") or {}).get("name") or "unknown_tool")
+            try:
+                name, arguments = ClineAgent._parse_tool_call(call)
+                denial = policy.policy_error(mode, name, arguments)
+                if denial is not None:
+                    tool_result = results.fail(name, denial)
+                else:
                     tool_result = results.normalize(name, await self._execute_tool(task_id, name, arguments))
-                except Exception as exc:
-                    tool_result = results.fail(name, str(exc))
+            except Exception as exc:
+                tool_result = results.fail(name, str(exc))
             self._check_cancelled(task_id)
             tool_message = {
                 "role": "tool",
-                "tool_call_id": call.get("id", f"omniscience-tool-{index}"),
+                "tool_call_id": call_id,
                 "content": json_text(tool_result),
             }
             self.store.append_message(task_id, tool_message)
-            self._event(task_id, "tool_result", {"tool": name, "result": tool_result})
+            self._event(task_id, "tool_result", {"task_id": task_id, "tool": name, "result": tool_result})
             await self._checkpoint_after_tool(task_id, name)
         return None
 

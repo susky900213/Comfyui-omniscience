@@ -18,7 +18,7 @@ from ..tools.defs import definitions_for_mode
 from ..workspace import Workspace
 
 # Read-only tools never modify the project, so they skip checkpoint creation.
-CHECKPOINT_EXEMPT_TOOLS = {"list_files", "read_file", "search_files", "browser_content"}
+CHECKPOINT_EXEMPT_TOOLS = {"list_files", "read_file", "search_files", "browser_content", "get_current_workflow", "open_workflow_on_canvas"}
 
 NETWORK_DENIED = "该任务未开启网络访问。请让用户点击输入区下方的“网络访问”按钮开启后再调用此工具。"
 
@@ -42,6 +42,17 @@ class TaskToolExecutionMixin:
                     "message": "当前 ComfyUI 画布尚未同步到 Omniscience。请用户在 ComfyUI 中打开 Omniscience 后重试，或点击“读取当前画布”。",
                 }
             return {"available": True, **current}
+        if name == "open_workflow_on_canvas":
+            workflow_path, _ = self._ensure_task_workflow(task_id)
+            if not workflow_path:
+                return {"error": "该任务没有可打开的 workflow.json。"}
+            return {
+                "status": "requested",
+                "action": "open_workflow_on_canvas",
+                "task_id": task_id,
+                "path": workflow_path,
+                "message": "已请求前端在当前 ComfyUI 画布打开任务工作流；实际结果以界面为准。",
+            }
         if name.startswith("browser_") and not self._network_allowed(task_id):
             return {"error": NETWORK_DENIED}
         workspace = self.workspace(task_id)

@@ -42,6 +42,7 @@ const state = {
   cancelling: false,
   error: "",
   polling: false,
+  taskLoading: false,
   workflowRepairCards: [],
   workflowRepairPolling: false,
   workflowRepairGeneration: 0,
@@ -549,7 +550,7 @@ function ensureStyle() {
     link.rel = "stylesheet";
   }
   const stylesheetUrl = new URL("./omniscience.css", import.meta.url);
-  stylesheetUrl.searchParams.set("v", "launcher-layer-2");
+  stylesheetUrl.searchParams.set("v", "launcher-layer-3");
   if (link.href !== stylesheetUrl.href) link.href = stylesheetUrl.href;
   if (!link.isConnected) document.head.appendChild(link);
 }
@@ -578,6 +579,22 @@ function workflowApiPrompt(workflow) {
       && !Array.isArray(node.inputs)
   ));
   return looksLikePrompt ? workflow : null;
+}
+
+function taskCanvasWorkflow(result) {
+  if (result.content) {
+    try {
+      const workflow = JSON.parse(result.content);
+      if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) throw new Error();
+      return workflow;
+    } catch {
+      throw new Error("该任务节点的 workflow.json 不是有效的工作流 JSON。");
+    }
+  }
+  if (result.current?.workflow && typeof result.current.workflow === "object" && !Array.isArray(result.current.workflow)) {
+    return result.current.workflow;
+  }
+  throw new Error("该任务节点还没有可打开的工作流。");
 }
 
 async function loadWorkflowToCanvas(workflow) {
@@ -2508,6 +2525,21 @@ function taskNodeRow(task) {
   );
   row.append(port, header, description, footer);
   row.appendChild(nodeActions(skillSecurityControl(task.metadata?.security), () => scanTaskProject(task.id)));
+  const open = el("span", "cline-node-open", "打开工作流");
+  open.setAttribute("role", "button");
+  open.tabIndex = 0;
+  open.title = "在 ComfyUI 画布打开此任务的 workflow.json；没有文件时打开实时画布，也可以右键任务节点";
+  const runOpen = (event) => {
+    event.stopPropagation();
+    if (!state.taskLoading) void openTaskWorkflow(task.id);
+  };
+  open.onclick = runOpen;
+  open.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    runOpen(event);
+  };
+  row.appendChild(open);
   const remove = el("span", "cline-node-delete", "删除");
   remove.setAttribute("role", "button");
   remove.tabIndex = 0;
@@ -2526,6 +2558,10 @@ function taskNodeRow(task) {
   row.title = task.id;
   row.setAttribute("aria-current", active ? "true" : "false");
   row.onclick = () => loadTask(task.id);
+  row.oncontextmenu = (event) => {
+    event.preventDefault();
+    if (!state.taskLoading) void openTaskWorkflow(task.id);
+  };
   return row;
 }
 
@@ -3045,7 +3081,7 @@ async function toggleGlobalChat() {
   }
 }
 
-function applyEvents(events) {
+function applyEvents(events, { allowCanvasOpen = true } = {}) {
   for (const event of events) {
     state.cursor = Math.max(state.cursor, Number(event.seq ?? -1));
     const payload = event.payload || {};
@@ -3055,10 +3091,22 @@ function applyEvents(events) {
     if (event.kind === "task_cancelled") {
       state.error = "本次运行已被强制取消，可以继续提问。";
     }
+    if (
+      allowCanvasOpen
+      && !state.taskLoading
+      && event.kind === "tool_result"
+      && payload.task_id === currentTaskId()
+      && payload.tool === "open_workflow_on_canvas"
+      && payload.result?.output?.action === "open_workflow_on_canvas"
+    ) {
+      void openTaskCanvasWorkflow(currentTaskId()).catch(showError);
+    }
   }
 }
 
-async function loadTask(taskId, { resetSkills = true } = {}) {
+async function loadTask(taskId, { resetSkills = true, openWorkflow = false } = {}) {
+  if (state.taskLoading) return;
+  state.taskLoading = true;
   state.globalChatActive = false;
   state.globalBusy = false;
   state.error = "";
@@ -3075,18 +3123,26 @@ async function loadTask(taskId, { resetSkills = true } = {}) {
   state.currentWorkflow = null;
   state.currentWorkflowSignature = "";
   state.currentWorkflowTaskId = "";
+  let loaded = false;
   try {
     const result = await request(`/cline/tasks/${encodeURIComponent(taskId)}`);
     state.task = result.task;
     state.messages = result.messages || [];
     await loadSkills();
+    if (openWorkflow) {
+      const workflowResult = await request(`/cline/tasks/${encodeURIComponent(taskId)}/workflow`);
+      await loadWorkflowToCanvas(taskCanvasWorkflow(workflowResult));
+    }
     const liveWorkflow = await request(`/cline/tasks/${encodeURIComponent(taskId)}/current-workflow`);
     state.currentWorkflow = liveWorkflow.current || null;
     const events = await request(`/cline/tasks/${encodeURIComponent(taskId)}/events?after=-1`);
-    applyEvents(events.events || []);
+    applyEvents(events.events || [], { allowCanvasOpen: false });
     state.busy = result.task.status === "running";
+    loaded = true;
   } catch (error) {
     state.error = error.message;
+  } finally {
+    state.taskLoading = false;
   }
   try {
     await loadContextStats();
@@ -3095,10 +3151,22 @@ async function loadTask(taskId, { resetSkills = true } = {}) {
     console.warn("[Comfyui-omniscience] prompt length refresh failed", error);
   }
   renderPanel();
-  await syncCurrentWorkflow({ silent: true });
+  if (loaded) await syncCurrentWorkflow({ silent: true });
   if (state.view === "settings") loadSettings().then(renderSettings).catch(showError);
   if (state.view === "checkpoints") renderCheckpoints().catch(showError);
   if (state.view === "skills") loadSkills().then(renderSkills).catch(showError);
+}
+
+async function openTaskCanvasWorkflow(taskId) {
+  const workflowResult = await request(`/cline/tasks/${encodeURIComponent(taskId)}/workflow`);
+  await loadWorkflowToCanvas(taskCanvasWorkflow(workflowResult));
+  if (currentTaskId() === taskId) await syncCurrentWorkflow({ force: true, silent: false });
+}
+
+async function openTaskWorkflow(taskId) {
+  state.error = "";
+  renderTasks();
+  await loadTask(taskId, { openWorkflow: true });
 }
 
 async function refreshTask() {
@@ -3135,7 +3203,7 @@ async function loadSkills() {
 
 async function pollEvents() {
   await pollWorkflowRepairCards();
-  if (state.polling || state.globalChatActive || !currentTaskId()) return;
+  if (state.polling || state.taskLoading || state.globalChatActive || !currentTaskId()) return;
   state.polling = true;
   try {
     await syncCurrentWorkflow();

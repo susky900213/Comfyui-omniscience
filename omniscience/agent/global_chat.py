@@ -223,6 +223,15 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                             )
                     except Exception as exc:
                         result = {"error": str(exc)}
+                    self.store.append_global_message({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "workflow-search-fallback",
+                            "type": "function",
+                            "function": {"name": "search_runninghub_workflows", "arguments": "{}"},
+                        }],
+                    })
                     self.store.append_global_message(
                         {"role": "tool", "tool_call_id": "workflow-search-fallback", "content": json_text(result)}
                     )
@@ -233,6 +242,15 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                         result = self.install_uploaded_workflow(effective_workflow_source)
                     except Exception as exc:
                         result = {"error": str(exc)}
+                    self.store.append_global_message({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "workflow-install-fallback",
+                            "type": "function",
+                            "function": {"name": "install_uploaded_workflow", "arguments": "{}"},
+                        }],
+                    })
                     self.store.append_global_message(
                         {"role": "tool", "tool_call_id": "workflow-install-fallback", "content": json_text(result)}
                     )

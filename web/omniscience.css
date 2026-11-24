@@ -77,6 +77,8 @@
 .cline-node-scan { border: 1px solid #4d4766; border-radius: 6px; padding: 2px 8px; color: #c8c2da; background: #2c2939; font-size: 10px; cursor: pointer; }
 .cline-node-scan:hover { border-color: #7665e6; color: #ede9f7; }
 .cline-node-scan.busy { opacity: 0.55; cursor: progress; }
+.cline-node-open { align-self: flex-end; border: 1px solid #4d6382; border-radius: 5px; padding: 2px 7px; color: #9dc0e8; background: #243043; font-size: 10px; cursor: pointer; }
+.cline-node-open:hover, .cline-node-open:focus { border-color: #7665e6; color: #ede9f7; background: #302b4f; outline: none; }
 .cline-node-delete { align-self: flex-end; border: 1px solid #684955; border-radius: 5px; padding: 2px 7px; color: #e2aab4; background: #33232b; font-size: 10px; cursor: pointer; }
 .cline-node-delete:hover, .cline-node-delete:focus { border-color: #c56d7c; color: #ffe1e5; background: #512c36; outline: none; }
 .cline-scan-nodes { width: 100%; margin-top: 10px; font-size: 11px; }
