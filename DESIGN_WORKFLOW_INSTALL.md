@@ -526,7 +526,7 @@ Omniscience 模型缓存/<模型标识>/<文件>
 - 需要重启时先进入 `restart_required`，重启后继续依赖检查，不能提前执行。
 
 当前实现入口为 `omniscience/workflow_executor.py` 和
-`POST /cline/global-chat/workflows/{job_id}/execute`。执行默认只允许本机
+`POST /omniscience/global-chat/workflows/{job_id}/execute`。执行默认只允许本机
 `127.0.0.1`/`localhost` ComfyUI；远程执行必须由用户显式配置并允许。执行按钮只在依赖确认流程之后出现。
 
 ---

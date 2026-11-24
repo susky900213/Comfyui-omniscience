@@ -24,18 +24,18 @@ from .route_common import FEATURES, HEALTH_VERSION, _body, _composer_workspace, 
 def register_system_routes(routes: Any) -> None:
     from aiohttp import web
 
-    @routes.get("/cline/settings")
-    async def cline_settings(request):
+    @routes.get("/omniscience/settings")
+    async def omniscience_settings(request):
         return _response(deps.legacy_agent().settings.public())
-    @routes.post("/cline/settings")
-    async def cline_update_settings(request):
+    @routes.post("/omniscience/settings")
+    async def omniscience_update_settings(request):
         try:
             values = await _body(request)
             return _response(deps.legacy_agent().settings.update(values))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/files")
-    async def cline_files(request):
+    @routes.get("/omniscience/files")
+    async def omniscience_files(request):
         try:
             path = request.query.get("path", ".")
             recursive = request.query.get("recursive", "false").lower() == "true"
@@ -49,24 +49,24 @@ def register_system_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/file")
-    async def cline_file(request):
+    @routes.get("/omniscience/file")
+    async def omniscience_file(request):
         try:
             path = request.query.get("path", "")
             workspace = _composer_workspace(request)
             return _response({"path": path, "content": workspace.read_file(path)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/chat")
-    async def cline_chat(request):
+    @routes.post("/omniscience/chat")
+    async def omniscience_chat(request):
         try:
             values = await _body(request)
             result = await deps.legacy_agent().chat(values.get("messages", []), str(values.get("context") or ""))
             return _response(result)
         except (ValueError, RuntimeError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/confirm")
-    async def cline_confirm(request):
+    @routes.post("/omniscience/confirm")
+    async def omniscience_confirm(request):
         try:
             values = await _body(request)
             action_id = str(values.get("id") or "")
@@ -76,8 +76,8 @@ def register_system_routes(routes: Any) -> None:
             return _response(result)
         except (ValueError, RuntimeError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/approvals/{approval_id}")
-    async def cline_task_confirm(request):
+    @routes.post("/omniscience/approvals/{approval_id}")
+    async def omniscience_task_confirm(request):
         try:
             values = await _body(request)
             result = await deps.task_agent().confirm(request.match_info["approval_id"], bool(values.get("approved")))

@@ -24,11 +24,11 @@ from .route_common import FEATURES, HEALTH_VERSION, _body, _composer_workspace, 
 def register_health_routes(routes: Any) -> None:
     from aiohttp import web
 
-    @routes.get("/cline/health")
-    async def cline_health(request):
+    @routes.get("/omniscience/health")
+    async def omniscience_health(request):
         return _response({"name": PRODUCT_NAME, "status": "ok", "version": HEALTH_VERSION, "features": FEATURES})
-    @routes.get("/cline/tasks")
-    async def cline_tasks(request):
+    @routes.get("/omniscience/tasks")
+    async def omniscience_tasks(request):
         try:
             return _response({"tasks": deps.task_agent().store.list_tasks(int(request.query.get("limit", "100")))})
         except (ValueError, OSError) as exc:

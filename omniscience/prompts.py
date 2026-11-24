@@ -194,7 +194,7 @@ def skill_prompt(skills: list[dict[str, Any]]) -> str:
 
 
 def project_rules(project_root: Path | None, filename: str = "OMNISCIENCE.md") -> str:
-    """Read the per-project rules file equivalent to Cline's .clinerules."""
+    """Read the per-project rules file equivalent to Cline's .omnisciencerules."""
     if project_root is None:
         return ""
     try:

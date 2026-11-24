@@ -95,7 +95,7 @@ class ClineAgent:
         action.messages.append(
             {
                 "role": "tool",
-                "tool_call_id": tool_call.get("id", "cline-tool"),
+                "tool_call_id": tool_call.get("id", "omniscience-tool"),
                 "content": json_text(result),
             }
         )
@@ -115,7 +115,7 @@ class ClineAgent:
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": tool_calls[index].get("id", f"cline-tool-{index}"),
+                            "tool_call_id": tool_calls[index].get("id", f"omniscience-tool-{index}"),
                             "content": json_text(result),
                         }
                     )

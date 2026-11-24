@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 DEFAULT_STATE_DIRECTORY = Path.home() / ".local" / "share" / "comfyui-omniscience"
-LEGACY_STATE_DIRECTORY = Path.home() / ".local" / "share" / "comfyui-cline"
+LEGACY_STATE_DIRECTORY = Path.home() / ".local" / "share" / "comfyui-omniscience"
 STATE_DIRECTORY = Path(
     os.environ.get(
         "OMNISCIENCE_STATE_DIRECTORY",
@@ -37,7 +37,7 @@ SKILL_DATABASE = Path(
 ).expanduser()
 
 DEFAULT_MCP_SETTINGS_PATH = Path.home() / ".config" / "comfyui-omniscience" / "mcp_settings.json"
-LEGACY_MCP_SETTINGS_PATH = Path.home() / ".cline" / "data" / "settings" / "cline_mcp_settings.json"
+LEGACY_MCP_SETTINGS_PATH = Path.home() / ".omniscience" / "data" / "settings" / "omniscience_mcp_settings.json"
 MCP_SETTINGS_PATH = Path(
     os.environ.get(
         "OMNISCIENCE_MCP_SETTINGS_PATH",
@@ -53,7 +53,7 @@ MCP_SETTINGS_PATH = Path(
 ).expanduser()
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "comfyui-omniscience" / "config.json"
-LEGACY_CONFIG_PATH = Path.home() / ".config" / "comfyui-cline" / "config.json"
+LEGACY_CONFIG_PATH = Path.home() / ".config" / "comfyui-omniscience" / "config.json"
 CONFIG_PATH = Path(
     os.environ.get("OMNISCIENCE_CONFIG_FILE", os.environ.get("CLINE_CONFIG_FILE", str(DEFAULT_CONFIG_PATH)))
 ).expanduser()

@@ -25,8 +25,8 @@ from .route_common import FEATURES, HEALTH_VERSION, _body, _composer_workspace, 
 def register_tasks_routes(routes: Any) -> None:
     from aiohttp import web
 
-    @routes.post("/cline/tasks")
-    async def cline_create_task(request):
+    @routes.post("/omniscience/tasks")
+    async def omniscience_create_task(request):
         try:
             values = await _body(request)
             if "folder" not in values:
@@ -42,14 +42,14 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"error": str(exc), "code": "folder_exists"}, status=409)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/custom-nodes")
-    async def cline_custom_nodes(request):
+    @routes.get("/omniscience/custom-nodes")
+    async def omniscience_custom_nodes(request):
         try:
             return _response({"projects": deps.task_agent().custom_node_projects()})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/custom-nodes/adopt")
-    async def cline_adopt_custom_node(request):
+    @routes.post("/omniscience/custom-nodes/adopt")
+    async def omniscience_adopt_custom_node(request):
         try:
             values = await _body(request)
             folder = str(values.get("folder") or "")
@@ -64,8 +64,8 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/custom-nodes/install")
-    async def cline_install_custom_node(request):
+    @routes.post("/omniscience/custom-nodes/install")
+    async def omniscience_install_custom_node(request):
         """Install a node project from GitHub or an archive into ``custom_nodes``.
 
         The installer stages and scans outside ``custom_nodes``, so a ``blocked``
@@ -119,15 +119,15 @@ def register_tasks_routes(routes: Any) -> None:
         if acknowledged:
             report["acknowledged"] = True
         return report, None
-    @routes.post("/cline/custom-nodes/scan")
-    async def cline_scan_custom_node(request):
+    @routes.post("/omniscience/custom-nodes/scan")
+    async def omniscience_scan_custom_node(request):
         try:
             values = await _body(request)
             return _response({"security": await _node_scan(str(values.get("folder") or ""))})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/custom-nodes/scan-all")
-    async def cline_scan_all_custom_nodes(request):
+    @routes.post("/omniscience/custom-nodes/scan-all")
+    async def omniscience_scan_all_custom_nodes(request):
         """Batch scanning always uses the static engine: no model call, no cost."""
         try:
             agent = deps.task_agent()
@@ -149,8 +149,8 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/scan")
-    async def cline_scan_task_project(request):
+    @routes.post("/omniscience/tasks/{task_id}/scan")
+    async def omniscience_scan_task_project(request):
         """Re-scan an adopted task's project with the configured engine."""
         try:
             agent = deps.task_agent()
@@ -162,14 +162,14 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"security": report, "task": agent.record_task_security(task_id, report)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.delete("/cline/tasks/{task_id}")
-    async def cline_delete_task(request):
+    @routes.delete("/omniscience/tasks/{task_id}")
+    async def omniscience_delete_task(request):
         try:
             return _response(deps.task_agent().delete_task(request.match_info["task_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=409 if "运行" in str(exc) else 404)
-    @routes.get("/cline/tasks/{task_id}")
-    async def cline_task(request):
+    @routes.get("/omniscience/tasks/{task_id}")
+    async def omniscience_task(request):
         try:
             agent = deps.task_agent()
             task = agent.task(request.match_info["task_id"])
@@ -182,8 +182,8 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/tasks/{task_id}/workflow")
-    async def cline_task_workflow(request):
+    @routes.get("/omniscience/tasks/{task_id}/workflow")
+    async def omniscience_task_workflow(request):
         try:
             agent = deps.task_agent()
             task_id = request.match_info["task_id"]
@@ -199,8 +199,8 @@ def register_tasks_routes(routes: Any) -> None:
             })
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/tasks/{task_id}/current-workflow")
-    async def cline_current_workflow(request):
+    @routes.get("/omniscience/tasks/{task_id}/current-workflow")
+    async def omniscience_current_workflow(request):
         try:
             agent = deps.task_agent()
             task_id = request.match_info["task_id"]
@@ -208,16 +208,16 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"current": agent.store.current_workflow(task_id), "task": agent.task(task_id)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/tasks/{task_id}/context")
-    async def cline_task_context(request):
+    @routes.get("/omniscience/tasks/{task_id}/context")
+    async def omniscience_task_context(request):
         try:
             raw_skill_ids = request.query.get("skill_ids", "[]")
             skill_ids = json.loads(raw_skill_ids)
             return _response(await deps.task_agent().context_status(request.match_info["task_id"], skill_ids))
         except (ValueError, OSError, RuntimeError, MCPProtocolError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/current-workflow")
-    async def cline_update_current_workflow(request):
+    @routes.post("/omniscience/tasks/{task_id}/current-workflow")
+    async def omniscience_update_current_workflow(request):
         try:
             if request.content_length and request.content_length > MAX_CURRENT_WORKFLOW_BYTES + 10_000:
                 return _response({"error": f"当前工作流请求过大，不能超过 {MAX_CURRENT_WORKFLOW_BYTES // 1_000_000} MB。"}, status=413)
@@ -228,15 +228,15 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"current": current, "task": deps.task_agent().task(request.match_info["task_id"])})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.patch("/cline/tasks/{task_id}")
-    async def cline_update_task(request):
+    @routes.patch("/omniscience/tasks/{task_id}")
+    async def omniscience_update_task(request):
         try:
             values = await _body(request)
             return _response(deps.task_agent().store.update_task(request.match_info["task_id"], **values))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/messages")
-    async def cline_task_message(request):
+    @routes.post("/omniscience/tasks/{task_id}/messages")
+    async def omniscience_task_message(request):
         try:
             values = await _body(request)
             content = str(values.get("content") or "")
@@ -254,24 +254,24 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/upload")
-    async def cline_task_upload(request):
+    @routes.post("/omniscience/tasks/{task_id}/upload")
+    async def omniscience_task_upload(request):
         try:
             values = await _body(request)
             workspace = deps.task_agent().workspace(request.match_info["task_id"])
             return _response(uploads.store_upload(workspace, values.get("name"), values.get("content_base64")))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global/upload")
-    async def cline_global_upload(request):
+    @routes.post("/omniscience/global/upload")
+    async def omniscience_global_upload(request):
         try:
             values = await _body(request)
             workspace = deps.global_chat_agent().chat_workspace()
             return _response(uploads.store_upload(workspace, values.get("name"), values.get("content_base64")))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global/network")
-    async def cline_global_network(request):
+    @routes.post("/omniscience/global/network")
+    async def omniscience_global_network(request):
         try:
             values = await _body(request)
             settings = deps.global_chat_agent().settings
@@ -280,8 +280,8 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"network_enabled": enabled})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/network")
-    async def cline_task_network(request):
+    @routes.post("/omniscience/tasks/{task_id}/network")
+    async def omniscience_task_network(request):
         try:
             values = await _body(request)
             task_id = request.match_info["task_id"]
@@ -291,14 +291,14 @@ def register_tasks_routes(routes: Any) -> None:
             return _response(agent.store.update_task(task_id, metadata=metadata))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/cancel")
-    async def cline_cancel_task(request):
+    @routes.post("/omniscience/tasks/{task_id}/cancel")
+    async def omniscience_cancel_task(request):
         try:
             return _response(deps.controller().abort(request.match_info["task_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.delete("/cline/tasks/{task_id}/history")
-    async def cline_clear_task_history(request):
+    @routes.delete("/omniscience/tasks/{task_id}/history")
+    async def omniscience_clear_task_history(request):
         try:
             task_id = request.match_info["task_id"]
             task = deps.task_agent().clear_history(task_id)
@@ -307,8 +307,8 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"error": str(exc)}, status=400)
         except OSError as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/tasks/{task_id}/events")
-    async def cline_task_events(request):
+    @routes.get("/omniscience/tasks/{task_id}/events")
+    async def omniscience_task_events(request):
         try:
             task_id = request.match_info["task_id"]
             agent = deps.task_agent()
@@ -323,8 +323,8 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/tasks/{task_id}/skills")
-    async def cline_task_skills(request):
+    @routes.get("/omniscience/tasks/{task_id}/skills")
+    async def omniscience_task_skills(request):
         """Compatibility response for clients that still request task Skills.
 
         Skills are global and selected per message now, so this route never
@@ -337,8 +337,8 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"task": task, "skills": agent.skills.list(), "selected_ids": [], "selected": []})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.post("/cline/tasks/{task_id}/skills")
-    async def cline_update_task_skills(request):
+    @routes.post("/omniscience/tasks/{task_id}/skills")
+    async def omniscience_update_task_skills(request):
         """Validate legacy task-Skill updates without persisting them."""
         try:
             values = await _body(request)
@@ -349,15 +349,15 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"task": task, "skills": agent.skills.list(), "selected_ids": [], "selected": []})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/tasks/{task_id}/mode")
-    async def cline_task_mode(request):
+    @routes.post("/omniscience/tasks/{task_id}/mode")
+    async def omniscience_task_mode(request):
         try:
             values = await _body(request)
             return _response(deps.task_agent().store.update_task(request.match_info["task_id"], mode=str(values.get("mode") or "act")))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/tasks/{task_id}/checkpoints")
-    async def cline_task_checkpoints(request):
+    @routes.get("/omniscience/tasks/{task_id}/checkpoints")
+    async def omniscience_task_checkpoints(request):
         try:
             task_id = request.match_info["task_id"]
             agent = deps.task_agent()
@@ -365,8 +365,8 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"checkpoints": agent.store.checkpoints(task_id)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/checkpoints/{checkpoint_id}/diff")
-    async def cline_checkpoint_diff(request):
+    @routes.get("/omniscience/checkpoints/{checkpoint_id}/diff")
+    async def omniscience_checkpoint_diff(request):
         try:
             agent = deps.task_agent()
             checkpoint = agent.store.checkpoint(request.match_info["checkpoint_id"])
@@ -377,8 +377,8 @@ def register_tasks_routes(routes: Any) -> None:
             return _response({"diff": diff})
         except (ValueError, OSError, RuntimeError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/checkpoints/{checkpoint_id}/restore")
-    async def cline_checkpoint_restore(request):
+    @routes.post("/omniscience/checkpoints/{checkpoint_id}/restore")
+    async def omniscience_checkpoint_restore(request):
         try:
             values = await _body(request)
             return _response(
@@ -390,11 +390,11 @@ def register_tasks_routes(routes: Any) -> None:
             )
         except (ValueError, OSError, RuntimeError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/mcp")
-    async def cline_mcp(request):
+    @routes.get("/omniscience/mcp")
+    async def omniscience_mcp(request):
         return _response({"servers": deps.task_agent().mcp.public()})
-    @routes.post("/cline/mcp")
-    async def cline_update_mcp(request):
+    @routes.post("/omniscience/mcp")
+    async def omniscience_update_mcp(request):
         try:
             values = await _body(request)
             return _response({"servers": deps.task_agent().mcp.update(values)})

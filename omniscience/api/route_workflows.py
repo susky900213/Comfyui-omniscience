@@ -24,8 +24,8 @@ from .route_common import FEATURES, HEALTH_VERSION, _body, _composer_workspace, 
 def register_workflows_routes(routes: Any) -> None:
     from aiohttp import web
 
-    @routes.post("/cline/global-chat/workflows/search")
-    async def cline_search_workflows(request):
+    @routes.post("/omniscience/global-chat/workflows/search")
+    async def omniscience_search_workflows(request):
         try:
             values = await _body(request)
             return _response(
@@ -35,8 +35,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/select")
-    async def cline_select_workflow(request):
+    @routes.post("/omniscience/global-chat/workflows/select")
+    async def omniscience_select_workflow(request):
         try:
             values = await _body(request)
             return _response(
@@ -44,8 +44,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/inspect")
-    async def cline_inspect_workflow(request):
+    @routes.post("/omniscience/global-chat/workflows/inspect")
+    async def omniscience_inspect_workflow(request):
         try:
             values = await _body(request)
             return _response(
@@ -55,8 +55,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies")
-    async def cline_workflow_dependencies(request):
+    @routes.get("/omniscience/global-chat/workflows/{job_id}/dependencies")
+    async def omniscience_workflow_dependencies(request):
         try:
             # dependency_plan performs blocking local HTTP/file operations while
             # consulting ComfyUI and ComfyUI-Manager.  Running it directly in
@@ -70,8 +70,8 @@ def register_workflows_routes(routes: Any) -> None:
             return _response(plan)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/search")
-    async def cline_search_workflow_node_sources(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/nodes/search")
+    async def omniscience_search_workflow_node_sources(request):
         try:
             agent = deps.global_chat_agent()
             job = agent.workflow_job(request.match_info["job_id"])
@@ -80,8 +80,8 @@ def register_workflows_routes(routes: Any) -> None:
             return _response(await agent.search_workflow_node_sources(request.match_info["job_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/web-search")
-    async def cline_search_workflow_node_web_sources(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/nodes/web-search")
+    async def omniscience_search_workflow_node_web_sources(request):
         try:
             agent = deps.global_chat_agent()
             job = agent.workflow_job(request.match_info["job_id"])
@@ -95,8 +95,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/source")
-    async def cline_select_workflow_node_source(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/nodes/source")
+    async def omniscience_select_workflow_node_source(request):
         try:
             values = await _body(request)
             return _response(
@@ -123,8 +123,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/search")
-    async def cline_search_workflow_model_sources(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/models/search")
+    async def omniscience_search_workflow_model_sources(request):
         try:
             values = await _body(request)
             return _response(
@@ -134,8 +134,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/models/local")
-    async def cline_list_local_workflow_models(request):
+    @routes.get("/omniscience/global-chat/workflows/{job_id}/dependencies/models/local")
+    async def omniscience_list_local_workflow_models(request):
         try:
             # The inventory may call ComfyUI's /internal/folder_paths endpoint
             # and scan the local model tree.  This handler itself runs on the
@@ -149,8 +149,8 @@ def register_workflows_routes(routes: Any) -> None:
             return _response(inventory)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/source")
-    async def cline_select_workflow_model_source(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/models/source")
+    async def omniscience_select_workflow_model_source(request):
         try:
             values = await _body(request)
             return _response(
@@ -160,8 +160,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/local")
-    async def cline_select_workflow_local_model(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/models/local")
+    async def omniscience_select_workflow_local_model(request):
         try:
             values = await _body(request)
             agent = deps.global_chat_agent()
@@ -174,8 +174,8 @@ def register_workflows_routes(routes: Any) -> None:
             return _response(selected)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/nodes/confirm")
-    async def cline_confirm_workflow_nodes(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/nodes/confirm")
+    async def omniscience_confirm_workflow_nodes(request):
         try:
             values = await _body(request)
             return _response(
@@ -190,14 +190,14 @@ def register_workflows_routes(routes: Any) -> None:
             return _response({"error": str(exc), "security": exc.report}, status=409)
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/nodes/status")
-    async def cline_workflow_node_install_status(request):
+    @routes.get("/omniscience/global-chat/workflows/{job_id}/dependencies/nodes/status")
+    async def omniscience_workflow_node_install_status(request):
         try:
             return _response(deps.global_chat_agent().node_install_status(request.match_info["job_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/confirm")
-    async def cline_confirm_workflow_models(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/models/confirm")
+    async def omniscience_confirm_workflow_models(request):
         try:
             values = await _body(request)
             return _response(
@@ -210,8 +210,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/global-chat/workflows/{job_id}/dependencies/models/status")
-    async def cline_workflow_model_download_status(request):
+    @routes.get("/omniscience/global-chat/workflows/{job_id}/dependencies/models/status")
+    async def omniscience_workflow_model_download_status(request):
         try:
             return _response(
                 deps.global_chat_agent().model_download_status(
@@ -220,8 +220,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/models/cancel")
-    async def cline_cancel_workflow_model_download(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/models/cancel")
+    async def omniscience_cancel_workflow_model_download(request):
         try:
             values = await _body(request)
             return _response(
@@ -231,8 +231,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/dependencies/confirm")
-    async def cline_confirm_workflow_dependencies(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/dependencies/confirm")
+    async def omniscience_confirm_workflow_dependencies(request):
         try:
             values = await _body(request)
             return _response(
@@ -242,8 +242,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/develop")
-    async def cline_create_workflow_development_task(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/develop")
+    async def omniscience_create_workflow_development_task(request):
         try:
             values = await _body(request)
             return _response(
@@ -253,8 +253,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/execute")
-    async def cline_execute_workflow(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/execute")
+    async def omniscience_execute_workflow(request):
         def execution_diagnostic(job: dict[str, Any] | None, error: BaseException, code: str) -> dict[str, Any]:
             persisted = (job or {}).get("metadata", {}).get("execution_diagnostic")
             if isinstance(persisted, dict) and persisted:
@@ -297,8 +297,8 @@ def register_workflows_routes(routes: Any) -> None:
                 )
             diagnostic = execution_diagnostic(job, exc, "preflight_error")
             return _response({"error": str(exc), "workflow": job, "diagnostic": diagnostic}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/repair")
-    async def cline_repair_workflow(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/repair")
+    async def omniscience_repair_workflow(request):
         """Execute one explicitly confirmed, server-side repair action."""
         try:
             values = await _body(request)
@@ -312,8 +312,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/workflows/{job_id}/repair-ai")
-    async def cline_ai_repair_workflow(request):
+    @routes.post("/omniscience/global-chat/workflows/{job_id}/repair-ai")
+    async def omniscience_ai_repair_workflow(request):
         """Hand a persisted workflow failure to the confirmed ACT coding agent."""
         try:
             values = await _body(request)
@@ -325,14 +325,14 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/global-chat/workflows/{job_id}")
-    async def cline_workflow_job(request):
+    @routes.get("/omniscience/global-chat/workflows/{job_id}")
+    async def omniscience_workflow_job(request):
         try:
             return _response(deps.global_chat_agent().workflow_job(request.match_info["job_id"]))
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.get("/cline/global-chat")
-    async def cline_global_chat(request):
+    @routes.get("/omniscience/global-chat")
+    async def omniscience_global_chat(request):
         try:
             agent = deps.global_chat_agent()
             return _response(
@@ -343,8 +343,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/global-chat/messages")
-    async def cline_global_chat_message(request):
+    @routes.post("/omniscience/global-chat/messages")
+    async def omniscience_global_chat_message(request):
         try:
             values = await _body(request)
             return _response(
@@ -357,8 +357,8 @@ def register_workflows_routes(routes: Any) -> None:
             )
         except (ValueError, RuntimeError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.delete("/cline/global-chat/history")
-    async def cline_clear_global_chat(request):
+    @routes.delete("/omniscience/global-chat/history")
+    async def omniscience_clear_global_chat(request):
         try:
             await deps.global_chat_agent().clear_global_history()
             return _response({"messages": []})

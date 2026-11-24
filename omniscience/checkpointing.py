@@ -70,7 +70,7 @@ class CheckpointManager:
             root,
             destination,
             symlinks=True,
-            ignore=shutil.ignore_patterns(".git", "__pycache__", ".cline-checkpoints"),
+            ignore=shutil.ignore_patterns(".git", "__pycache__", ".omniscience-checkpoints"),
         )
         return "snapshot", reference
 

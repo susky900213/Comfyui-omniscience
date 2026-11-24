@@ -1,7 +1,7 @@
 # ComfyUI Omniscience 编程插件设计文档
 
 本文档描述 ComfyUI Omniscience 侧栏编程助手的架构设计，参照
-`ref_code/cline/apps/vscode/ARCHITECTURE.md` 中 Cline VS Code 扩展的分层方式：
+`ref_code/omniscience/apps/vscode/ARCHITECTURE.md` 中 Cline VS Code 扩展的分层方式：
 激活与初始化、前后端通信通道、Controller/Coordinator 协调边界、任务与 Session 生命周期、
 事件回灌、工具执行与审批、取消 fence，以及关键设计约束。
 
@@ -16,7 +16,7 @@
 - 浏览器工具：`omniscience_browser.py`
 - 下游边界：OpenAI-compatible LLM 接口、Playwright、MCP server、Shadow Git
 
-本文档不覆盖 Cline SDK 包（`@cline/core`、`@cline/agents` 等）的内部实现；
+本文档不覆盖 Cline SDK 包（`@omniscience/core`、`@omniscience/agents` 等）的内部实现；
 本项目不依赖 Cline 运行时，只参考其架构模式。
 
 ## 总体链路
@@ -26,7 +26,7 @@ ComfyUI 前端
   │
   └─ __init__.py: register_routes(PromptServer.instance) + WEB_DIRECTORY
        │
-       ├─ aiohttp 路由层（/cline/*）
+       ├─ aiohttp 路由层（/omniscience/*）
        └─ web/omniscience.js: app.registerExtension()
             │
             ├─ 侧栏面板 UI（任务 / 对话 / 检查点 / 文件 / 工作流 / MCP / Skill / 设置）
@@ -187,7 +187,7 @@ Cline 把任务/session 协调集中在 `SdkController`，按职责拆出多个 
 
 | 类 | 位置 | 现状职责 |
 | --- | --- | --- |
-| `ClineAgent` | omniscience_server.py:838 | 旧版无状态 `/cline/chat` 兼容 |
+| `ClineAgent` | omniscience_server.py:838 | 旧版无状态 `/omniscience/chat` 兼容 |
 | `GlobalChatAgent` | omniscience_server.py:1145 | 全局对话 + GitHub Skill 安装 |
 | `PersistentClineAgent` | omniscience_server.py:1585 | 主运行时：任务、循环、工具、检查点 |
 
@@ -239,7 +239,7 @@ fireAndForgetSend`：
 ```text
 前端 sendMessage()（新任务先 createTask）
   ↓
-POST /cline/tasks                       controller.create_task
+POST /omniscience/tasks                       controller.create_task
   ↓
 TaskStartCoordinator.init_task()
   ├─ _project_folder_name 校验（防穿越，L134）；重名目录明确拒绝
@@ -441,14 +441,14 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
   `project_source = "comfyui_custom_nodes"`，`_ensure_task_workflow` 见到该标记只回读已有
   工作流，任务完成时也不会补写——别人的仓库由用户自己管。
 
-前端把 `/cline/tasks` 与 `/cline/custom-nodes` 合并成一个节点流（按时间倒序），未接管的
-条目用虚线卡片 + `ComfyUI` 角标 + "待接管"显示，点击即 `POST /cline/custom-nodes/adopt`
+前端把 `/omniscience/tasks` 与 `/omniscience/custom-nodes` 合并成一个节点流（按时间倒序），未接管的
+条目用虚线卡片 + `ComfyUI` 角标 + "待接管"显示，点击即 `POST /omniscience/custom-nodes/adopt`
 并直接打开该任务。`create_task` 的同名冲突提示改为引导点击接管，而不是只让用户改名。
 
 安全边界随之放宽：接管后 `Workspace` 的根就是 `ComfyUI/custom_nodes/<name>`，文件与命令
 工具在该目录内的读写是预期行为，路径仍受 `Workspace.resolve()` 约束不得越出该目录。
 
-接管同时是一道安全门禁：`POST /cline/custom-nodes/adopt` 先扫描再落库，报告为 `blocked`
+接管同时是一道安全门禁：`POST /omniscience/custom-nodes/adopt` 先扫描再落库，报告为 `blocked`
 且请求没有 `acknowledge_security` 时返回 `409` + `security`，此时任务、软链、文件都未产生。
 详见 §11.2。
 
@@ -456,11 +456,11 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
 
 | 路由 | 作用 | 是否可能调用模型 |
 | --- | --- | --- |
-| `POST /cline/custom-nodes/scan` | 检测单个未接管项目，结果写入 `node_scans` | 取决于 `skill_security_mode` |
-| `POST /cline/custom-nodes/scan-all` | 批量静态检测，单次最多 `MAX_NODE_BATCH_SCANS` 个，返回 `remaining` | 否，强制 `static` |
-| `POST /cline/custom-nodes/adopt` | 接管门禁 + 建任务，报告随元数据落库 | 取决于 `skill_security_mode` |
-| `POST /cline/custom-nodes/install` | 暂存、检测并安装 GitHub 仓库或前端上传的节点压缩包；blocked 返回 `409` + `security` | GitHub 下载 + 取决于 `skill_security_mode`；静态上传不调用模型 |
-| `POST /cline/tasks/{id}/scan` | 复检已接管任务的项目，并回写 `metadata.security` | 取决于 `skill_security_mode` |
+| `POST /omniscience/custom-nodes/scan` | 检测单个未接管项目，结果写入 `node_scans` | 取决于 `skill_security_mode` |
+| `POST /omniscience/custom-nodes/scan-all` | 批量静态检测，单次最多 `MAX_NODE_BATCH_SCANS` 个，返回 `remaining` | 否，强制 `static` |
+| `POST /omniscience/custom-nodes/adopt` | 接管门禁 + 建任务，报告随元数据落库 | 取决于 `skill_security_mode` |
+| `POST /omniscience/custom-nodes/install` | 暂存、检测并安装 GitHub 仓库或前端上传的节点压缩包；blocked 返回 `409` + `security` | GitHub 下载 + 取决于 `skill_security_mode`；静态上传不调用模型 |
+| `POST /omniscience/tasks/{id}/scan` | 复检已接管任务的项目，并回写 `metadata.security` | 取决于 `skill_security_mode` |
 
 扫描是同步的文件遍历，路由用 `asyncio.to_thread` 包裹，避免阻塞 aiohttp 事件循环。
 
@@ -478,7 +478,7 @@ tool result 按顺序写入 runtime state，下一轮请求携带完整历史。
 本项目有意弱化逐项审批（README"Act 模式下……不再逐项弹出授权"）：
 
 - `_requires_confirmation`（L1070、L2354）恒为 False；
-- `TaskStore.create_approval` 生产路径零调用，但 `/cline/approvals` 路由、
+- `TaskStore.create_approval` 生产路径零调用，但 `/omniscience/approvals` 路由、
   `confirm()`、旧 pending approval 自动批准（L1908-1913）整条链路仍在；
 - 安全边界换成：workspace 沙箱 + `BLOCKED_COMMANDS`（L261）+ Plan 模式工具白名单
   `PLAN_TOOL_NAMES`（L55）。
@@ -604,12 +604,12 @@ Cline 的 session config 把 system prompt、规则、skills、模式、mention�
    runtime 每次组装 `AgentModelRequest` 时重新求值（shell 换了，在途请求不受影响，
    下一请求自动带上）。本项目对应点：Plan/Act 切换、MCP 服务器增删、Skill 选择
    变化都应体现在**下一次请求**的工具集合与描述里，而不是 session 级缓存；
-5. `.clinerules` 等价物：项目目录内 `OMNISCIENCE.md` 规则文件自动注入（ComfyUI 节点
+5. `.omnisciencerules` 等价物：项目目录内 `OMNISCIENCE.md` 规则文件自动注入（ComfyUI 节点
    开发约定常与项目绑定，价值高于全局规则）。
 
 **System prompt 本体**从 Cline 直接借鉴改写：Act 基础提示词
 （`shared/src/prompt/system/act.ts`）、Plan 契约
-（`prompt/cline.ts` 的 `PLAN_MODE_INSTRUCTIONS_MANUAL_SWITCH`——VS Code 变体与我们
+（`prompt/omniscience.ts` 的 `PLAN_MODE_INSTRUCTIONS_MANUAL_SWITCH`——VS Code 变体与我们
 一样要求用户手动切换开关，不存在 `switch_to_act_mode` 工具）、组装顺序
 （base → `{{CLINE_RULES}}`（含模式说明）→ `{{CLINE_METADATA}}` workspace 元数据
 → preferred language 追加）。完整可用版本见**附录 A**。
@@ -693,16 +693,16 @@ verdict 取最高等级：critical → `blocked`，high/medium → `review`，�
   `blocked` 抛 `SkillSecurityBlockedError` 并写入该包的 `skipped` 原因，恶意包不会落库；
   仓库其余合规包照常安装。结果里的 `security` 数组给出每个已安装 Skill 的结论与
   详情，供模型转述。
-- 手动保存/编辑：`POST /cline/skills`、`PATCH /cline/skills/{id}` 命中 `blocked` 返回
+- 手动保存/编辑：`POST /omniscience/skills`、`PATCH /omniscience/skills/{id}` 命中 `blocked` 返回
   `409` + `security`；前端确认「仍然保存」后带 `acknowledge_security: true` 重试，报告
-  记 `acknowledged`。`POST /cline/skills/scan` 可对草稿做只读预检。
+  记 `acknowledged`。`POST /omniscience/skills/scan` 可对草稿做只读预检。
 - JSON 导入：`import_items` 先全量预扫描，存在 `blocked` 且未确认则整批拒绝（不产生
   部分写入）；确认导入后每条报告记 `acknowledged`。
 - 存储：`skills.security` 列（JSON，`_initialize` 用 `PRAGMA table_info` + `ALTER TABLE`
   迁移旧库）；`rescan()` 用于规则升级后重扫，保留既有 `acknowledged`。
-- 手动检测：面板提供三个入口——Skill 卡片「安全检测」（`POST /cline/skills/{id}/rescan`）、
-  工具栏「全部安全检测」（`POST /cline/skills/rescan` → `rescan_all()`，规则更新后批量重扫）、
-  编辑器「立即检测」（`POST /cline/skills/scan`，只检草稿、不写库）。结论实时刷新徽章与状态行。
+- 手动检测：面板提供三个入口——Skill 卡片「安全检测」（`POST /omniscience/skills/{id}/rescan`）、
+  工具栏「全部安全检测」（`POST /omniscience/skills/rescan` → `rescan_all()`，规则更新后批量重扫）、
+  编辑器「立即检测」（`POST /omniscience/skills/scan`，只检草稿、不写库）。结论实时刷新徽章与状态行。
 - 模型无法自行放行：`acknowledged` 只来自前端用户显式确认，`install_github_skill` 工具
   参数不含该字段。
 
@@ -782,7 +782,7 @@ GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gi
 
 安装顺序固定为：下载/解包 → 定位节点根 → 静态 `node_security.scan_project` → 按 `skill_security_mode` 运行 `node_review.review` → 只有报告完成且允许时才移动到 `custom_nodes` → 保存 `node_scans` 缓存。安装不执行 `git clone`、`pip install`、`setup.py`、`requirements.txt` 或包内脚本，不创建 `workflow.json`，不自动接管为任务；成功后项目会出现在待接管列表，需用户另行接管并重启 ComfyUI。
 
-全局工具永远不传 `acknowledged`。blocked 安装通过普通工具结果返回给模型并保持拒绝；只有面板 `/cline/custom-nodes/install` 收到用户明确确认后才可带 `acknowledge_security` 重试。AI/hybrid 模式每次单独安装产生一次审核模型调用，静态模式与批量检测不产生调用；模型审核只能加严结论，不能放宽静态命中。
+全局工具永远不传 `acknowledged`。blocked 安装通过普通工具结果返回给模型并保持拒绝；只有面板 `/omniscience/custom-nodes/install` 收到用户明确确认后才可带 `acknowledge_security` 重试。AI/hybrid 模式每次单独安装产生一次审核模型调用，静态模式与批量检测不产生调用；模型审核只能加严结论，不能放宽静态命中。
 
 ---
 
@@ -803,7 +803,7 @@ GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gi
 
 移植并改写 Cline 第 17 节的九条约束：
 
-1. **前端不直接访问 Agent Runtime。** 所有任务操作经 `/cline/*` 路由进入后端。
+1. **前端不直接访问 Agent Runtime。** 所有任务操作经 `/omniscience/*` 路由进入后端。
 2. **`OmniscienceController` 是任务与 session 的真实协调边界**，路由 handler 只做
    参数转换与转发。
 3. **内存态不是 canonical transcript。** SQLite messages/events 是唯一事实源，
@@ -894,7 +894,7 @@ GitHub 仓库通过 `codeload.github.com` 下载 tarball；Gitee 仓库通过 Gi
     展开；项目 `OMNISCIENCE.md` 规则注入；
 15. follow-up 队列与运行中插话；
 16. 路由层收敛到 `OmniscienceController` 单一入口；
-17. 清理 `cline_runtime/` 残留目录与旧 pyc。
+17. 清理 `omniscience_runtime/` 残留目录与旧 pyc。
 
 ### 验证
 
@@ -912,7 +912,7 @@ python3 -m py_compile __init__.py omniscience_server.py
 
 ## 附录 A：提示词设计（借鉴 Cline，可直接采用）
 
-来源：`ref_code/cline/sdk/packages/shared/src/prompt/`（act.ts、cline.ts、
+来源：`ref_code/omniscience/sdk/packages/shared/src/prompt/`（act.ts、omniscience.ts、
 format.ts），已按 ComfyUI Omniscience 场景改写。占位符由
 `SessionConfigBuilder`（第 9 节）在每次组装请求时填充。
 

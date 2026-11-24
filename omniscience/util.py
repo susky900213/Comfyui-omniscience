@@ -145,7 +145,7 @@ def workflow_template(project_name: str) -> dict[str, Any]:
         "groups": [],
         "config": {},
         "extra": {
-            "cline": {
+            "omniscience": {
                 "project": project_name,
                 "purpose": "ComfyUI custom node development test workflow",
             },

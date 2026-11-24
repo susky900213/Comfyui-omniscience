@@ -24,8 +24,8 @@ from .route_common import FEATURES, HEALTH_VERSION, _body, _composer_workspace, 
 def register_skills_routes(routes: Any) -> None:
     from aiohttp import web
 
-    @routes.get("/cline/skills")
-    async def cline_skills(request):
+    @routes.get("/omniscience/skills")
+    async def omniscience_skills(request):
         return _response({"skills": deps.task_agent().skills.list()})
     async def _skill_gate(values: dict[str, Any], acknowledged: bool, *, source: str = ""):
         """Review with the configured engine and return ``(report, error_response)``."""
@@ -38,16 +38,16 @@ def register_skills_routes(routes: Any) -> None:
         if acknowledged:
             report["acknowledged"] = True
         return report, None
-    @routes.post("/cline/skills/scan")
-    async def cline_scan_skill(request):
+    @routes.post("/omniscience/skills/scan")
+    async def omniscience_scan_skill(request):
         try:
             values = await _body(request)
             report = await skill_review.review(values, settings=deps.task_agent().settings)
             return _response({"security": report})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/skills")
-    async def cline_create_skill(request):
+    @routes.post("/omniscience/skills")
+    async def omniscience_create_skill(request):
         try:
             values = await _body(request)
             report, blocked = await _skill_gate(values, bool(values.pop("acknowledge_security", False)))
@@ -56,8 +56,8 @@ def register_skills_routes(routes: Any) -> None:
             return _response({"skill": deps.task_agent().skills.create(values, security=report)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.patch("/cline/skills/{skill_id}")
-    async def cline_update_skill(request):
+    @routes.patch("/omniscience/skills/{skill_id}")
+    async def omniscience_update_skill(request):
         try:
             skill_id = request.match_info["skill_id"]
             values = await _body(request)
@@ -77,8 +77,8 @@ def register_skills_routes(routes: Any) -> None:
             return _response({"skill": store.update(skill_id, values)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/skills/{skill_id}/rescan")
-    async def cline_rescan_skill(request):
+    @routes.post("/omniscience/skills/{skill_id}/rescan")
+    async def omniscience_rescan_skill(request):
         try:
             agent = deps.task_agent()
             store = agent.skills
@@ -94,8 +94,8 @@ def register_skills_routes(routes: Any) -> None:
             return _response({"skill": store.rescan(skill_id, report)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.post("/cline/skills/rescan")
-    async def cline_rescan_skills(request):
+    @routes.post("/omniscience/skills/rescan")
+    async def omniscience_rescan_skills(request):
         try:
             agent = deps.task_agent()
             store = agent.skills
@@ -110,14 +110,14 @@ def register_skills_routes(routes: Any) -> None:
             return _response({"skills": store.rescan_all(reports)})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.delete("/cline/skills/{skill_id}")
-    async def cline_delete_skill(request):
+    @routes.delete("/omniscience/skills/{skill_id}")
+    async def omniscience_delete_skill(request):
         try:
             return _response({"skill": deps.task_agent().remove_skill(request.match_info["skill_id"])})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=404)
-    @routes.post("/cline/skills/import")
-    async def cline_import_skills(request):
+    @routes.post("/omniscience/skills/import")
+    async def omniscience_import_skills(request):
         try:
             values = await _body(request)
             imported = deps.task_agent().skills.import_items(
@@ -127,11 +127,11 @@ def register_skills_routes(routes: Any) -> None:
             return _response({"skills": deps.task_agent().skills.list(), "imported": imported})
         except (ValueError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
-    @routes.get("/cline/skills/export")
-    async def cline_export_skills(request):
+    @routes.get("/omniscience/skills/export")
+    async def omniscience_export_skills(request):
         return _response({"version": 1, "skills": deps.task_agent().skills.export_items()})
-    @routes.get("/cline/mcp/tools")
-    async def cline_mcp_tools(request):
+    @routes.get("/omniscience/mcp/tools")
+    async def omniscience_mcp_tools(request):
         try:
             return _response({"groups": await deps.task_agent().mcp.list_tools()})
         except (ValueError, RuntimeError, OSError, MCPProtocolError) as exc:

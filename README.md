@@ -153,8 +153,8 @@ export OMNISCIENCE_WORKSPACE='/path/to/project-parent'
 export OMNISCIENCE_COMFYUI_DIRECTORY='/path/to/ComfyUI'
 ```
 
-旧版 `CLINE_*` 环境变量仍然兼容；已有 `~/.config/comfyui-cline` 配置和
-`~/.local/share/comfyui-cline` 数据，以及旧版 `~/.cline/data/settings/cline_mcp_settings.json`
+旧版 `CLINE_*` 环境变量仍然兼容；已有 `~/.config/comfyui-omniscience` 配置和
+`~/.local/share/comfyui-omniscience` 数据，以及旧版 `~/.omniscience/data/settings/omniscience_mcp_settings.json`
 MCP 配置，也会在新目录不存在时继续读取。
 
 ## 安全边界
