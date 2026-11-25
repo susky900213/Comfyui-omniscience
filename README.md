@@ -14,15 +14,15 @@ It runs entirely inside ComfyUI and does not require VS Code or a separate edito
 
 **Assistant chat**
 
-![ComfyUI Omniscience assistant chat](web/assets/screenshots/assistant.png)
+![ComfyUI Omniscience assistant chat](web/assets/screenshots/assistant-full.png)
 
 **Create a task**
 
-![New ComfyUI node project dialog](web/assets/screenshots/new-task.png)
+![New ComfyUI node project dialog](web/assets/screenshots/new-task-full.png)
 
 **Inspect the live workflow**
 
-![Live ComfyUI workflow JSON viewer](web/assets/screenshots/workflow.png)
+![Live ComfyUI workflow JSON viewer](web/assets/screenshots/workflow-full.png)
 
 ## Features
 
