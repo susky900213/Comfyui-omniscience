@@ -61,7 +61,11 @@ def register_system_routes(routes: Any) -> None:
     async def omniscience_chat(request):
         try:
             values = await _body(request)
-            result = await deps.legacy_agent().chat(values.get("messages", []), str(values.get("context") or ""))
+            result = await deps.legacy_agent().chat(
+                values.get("messages", []),
+                str(values.get("context") or ""),
+                locale=str(values.get("locale") or ""),
+            )
             return _response(result)
         except (ValueError, RuntimeError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
@@ -72,7 +76,9 @@ def register_system_routes(routes: Any) -> None:
             action_id = str(values.get("id") or "")
             if not action_id:
                 raise ValueError("Confirmation id is required.")
-            result = await deps.legacy_agent().confirm(action_id, bool(values.get("approved")))
+            result = await deps.legacy_agent().confirm(
+                action_id, bool(values.get("approved")), locale=str(values.get("locale") or "")
+            )
             return _response(result)
         except (ValueError, RuntimeError, OSError) as exc:
             return _response({"error": str(exc)}, status=400)
@@ -80,7 +86,11 @@ def register_system_routes(routes: Any) -> None:
     async def omniscience_task_confirm(request):
         try:
             values = await _body(request)
-            result = await deps.task_agent().confirm(request.match_info["approval_id"], bool(values.get("approved")))
+            result = await deps.task_agent().confirm(
+                request.match_info["approval_id"],
+                bool(values.get("approved")),
+                locale=str(values.get("locale") or ""),
+            )
             return _response(result)
         except (ValueError, RuntimeError, OSError, MCPProtocolError, BrowserUnavailable) as exc:
             return _response({"error": str(exc)}, status=400)

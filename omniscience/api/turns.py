@@ -49,13 +49,21 @@ class TaskTurnController:
             raise ValueError("Message cannot be empty.")
         self.agent._validated_skill_ids(skill_ids if skill_ids is not None else [])
 
-    def submit(self, task_id: str, content: str, context: str = "", skill_ids: Any = None) -> dict[str, Any]:
+    def submit(
+        self,
+        task_id: str,
+        content: str,
+        context: str = "",
+        skill_ids: Any = None,
+        locale: str = "",
+    ) -> dict[str, Any]:
         self.agent.task(task_id)
         session = self._session(task_id)
         payload = {
             "content": str(content),
             "context": str(context or ""),
             "skill_ids": list(skill_ids or []),
+            "locale": str(locale or ""),
         }
         queued = session.running
         cursor = self.agent.store.last_event_seq(task_id)
@@ -77,6 +85,7 @@ class TaskTurnController:
                 payload["content"],
                 payload.get("context", ""),
                 payload.get("skill_ids"),
+                locale=payload.get("locale", ""),
             )
         except asyncio.CancelledError:
             logger.info("Turn for task %s was cancelled", session.task_id)

@@ -75,7 +75,7 @@ __init__.py
 前端初始化在 `omniscience.js` 的 `registerExtension.setup()` 中完成：
 
 - `ensureStyle()` 动态注入 CSS；
-- `installLauncher()` 注册右上角 `Omniscience` 按钮；
+- `installLauncher()` 将 `AI 助手` 按钮注册到左侧竖向菜单栏；
 - `buildPanel()` 构建侧栏 DOM；
 - 启动事件轮询定时器。
 

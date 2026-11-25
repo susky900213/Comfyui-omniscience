@@ -213,7 +213,11 @@ def register_tasks_routes(routes: Any) -> None:
         try:
             raw_skill_ids = request.query.get("skill_ids", "[]")
             skill_ids = json.loads(raw_skill_ids)
-            return _response(await deps.task_agent().context_status(request.match_info["task_id"], skill_ids))
+            return _response(await deps.task_agent().context_status(
+                request.match_info["task_id"],
+                skill_ids,
+                locale=request.query.get("locale"),
+            ))
         except (ValueError, OSError, RuntimeError, MCPProtocolError) as exc:
             return _response({"error": str(exc)}, status=400)
     @routes.post("/omniscience/tasks/{task_id}/current-workflow")
@@ -249,6 +253,7 @@ def register_tasks_routes(routes: Any) -> None:
                     content,
                     str(values.get("context") or ""),
                     skill_ids,
+                    locale=str(values.get("locale") or ""),
                 ),
                 status=202,
             )

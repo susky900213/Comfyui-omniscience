@@ -12,7 +12,7 @@ ComfyUI Omniscience 是一个 ComfyUI 自定义节点扩展，会在 ComfyUI 网
 
 ## 功能
 
-- **ComfyUI 内嵌助手**：点击右上角 **Omniscience** 按钮即可打开侧栏。
+- **ComfyUI 内嵌助手**：点击左侧竖向菜单栏的 **AI 助手** 按钮即可打开侧栏。
 - **兼容 OpenAI 接口**：支持 OpenAI、DeepSeek、OpenRouter、Ollama、LM Studio 及自定义兼容服务。
 - **Plan / Act 双模式**：Plan 用于只读分析和制定计划；确认后再切换到 Act 执行修改。
 - **项目工具**：列出、读取和搜索文件，写入文件，应用 unified diff，并在任务项目目录内执行开发命令。
@@ -48,7 +48,7 @@ cp -R /path/to/Comfyui-omniscience \
   /path/to/ComfyUI/custom_nodes/Comfyui-omniscience
 ```
 
-如果已经克隆了仓库，请在仓库的上级目录执行。安装完成后重启 ComfyUI，右上角会出现 **Omniscience** 按钮。
+如果已经克隆了仓库，请在仓库的上级目录执行。安装完成后重启 ComfyUI，左侧竖向菜单栏会出现 **AI 助手** 按钮。
 
 ### 使用 Git 安装
 
@@ -73,7 +73,7 @@ cp -R Comfyui-omniscience /path/to/ComfyUI/custom_nodes/
 ## 快速开始
 
 1. 安装扩展并重启 ComfyUI。
-2. 点击右上角 **Omniscience**。
+2. 点击左侧竖向菜单栏的 **AI 助手**。
 3. 打开 **设置**，填写：
    - **Provider** 和 **API 地址**，例如 `https://api.openai.com/v1` 或 `http://127.0.0.1:11434/v1`；
    - **模型**，以及托管服务需要的 **API Key**；

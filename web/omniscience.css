@@ -1,14 +1,47 @@
 #comfyui-omniscience-launcher {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--sidebar-width, 44px);
+  min-width: var(--sidebar-width, 44px);
+  height: var(--sidebar-item-height, 52px);
+  padding: 8px;
+  color: var(--fg-primary, inherit);
+  background: transparent;
+  border: 0;
+}
+
+#comfyui-omniscience-launcher:hover,
+#comfyui-omniscience-launcher.active {
+  color: var(--fg-primary, inherit);
+  background: var(--bg-secondary, #ffffff12);
+}
+
+#comfyui-omniscience-launcher .side-bar-button-content {
+  justify-content: center;
+  height: 100%;
+  gap: 2px;
+}
+
+#comfyui-omniscience-launcher .side-bar-button-icon {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+
+#comfyui-omniscience-launcher .side-bar-button-label {
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+body > #comfyui-omniscience-launcher {
   position: fixed;
-  bottom: max(88px, calc(env(safe-area-inset-bottom) + 72px));
-  right: 18px;
+  top: 50%;
+  left: 0;
   z-index: 10002 !important;
-  border: 1px solid #6d5ce7;
-  border-radius: 6px;
-  padding: 7px 13px;
   color: #fff;
   background: #4f3db5;
-  cursor: pointer;
+  border-radius: 0 6px 6px 0;
   box-shadow: 0 2px 10px #0006;
 }
 

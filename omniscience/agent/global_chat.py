@@ -16,7 +16,8 @@ from .. import paths
 from ..constants import MAX_GLOBAL_CHAT_STEPS, MAX_MESSAGE_CHARS
 from ..context import ContextManager
 from ..host import browser_manager
-from ..prompts import GLOBAL_CHAT_SYSTEM_PROMPT, skill_prompt
+from ..i18n import language_instruction, normalize_locale, text as localized_text
+from ..prompts import global_chat_system_prompt, skill_prompt
 from ..settings import SettingsStore
 from ..skills import SkillStore
 from ..storage import TaskStore
@@ -89,22 +90,32 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
             self.store.clear_global_messages()
 
     @staticmethod
-    def _tool_catalog(tools: list[dict[str, Any]]) -> str:
-        lines = ["\n\n## 本轮可用工具说明", "只调用与用户请求直接相关的工具；工具返回结果是真实执行结果，不要凭空声称成功。"]
+    def _tool_catalog(tools: list[dict[str, Any]], locale: str = "") -> str:
+        if locale == "en":
+            lines = [
+                "\n\n## Tools Available This Turn",
+                "Call only tools directly relevant to the user's request. Tool results are real execution results; never claim success without them.",
+            ]
+        else:
+            lines = ["\n\n## 本轮可用工具说明", "只调用与用户请求直接相关的工具；工具返回结果是真实执行结果，不要凭空声称成功。"]
         for tool in tools:
             function = tool.get("function") or {}
             name = str(function.get("name") or "unknown")
-            description = str(function.get("description") or "未提供说明").strip()
+            description = str(function.get("description") or localized_text(locale, "未提供说明", "No description provided")).strip()
             parameters = function.get("parameters") or {}
             properties = parameters.get("properties") if isinstance(parameters, dict) else {}
-            arguments = ", ".join(str(key) for key in properties or {}) or "无参数"
-            lines.append(f"- {name}（参数：{arguments}）：{description}")
+            arguments = ", ".join(str(key) for key in properties or {}) or localized_text(locale, "无参数", "none")
+            lines.append(
+                f"- {name}（参数：{arguments}）：{description}"
+                if not locale
+                else f"- {name} (arguments: {arguments}): {description}"
+            )
         return "\n".join(lines)
 
     @staticmethod
     def _model_messages(messages: list[dict[str, Any]], context: str = "") -> list[dict[str, Any]]:
         prepared = [
-            {key: value for key, value in message.items() if key not in {"seq", "created_at", "skill_ids"}}
+            {key: value for key, value in message.items() if key not in {"seq", "created_at", "skill_ids", "locale"}}
             for message in messages
             if message.get("role") in {"user", "assistant", "tool"}
         ]
@@ -143,19 +154,30 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
         skill_ids: Any = None,
         context: str = "",
         workflow_source: str = "",
+        locale: str = "",
     ) -> dict[str, Any]:
+        active_locale = normalize_locale(locale) if locale else ""
         text = str(content or "").strip()
         if not text:
-            raise ValueError("请输入对话内容。")
+            raise ValueError(localized_text(active_locale or "zh", "请输入对话内容。", "Enter a message."))
         if len(text) > MAX_MESSAGE_CHARS:
-            raise ValueError("单条对话消息过大。")
+            raise ValueError(localized_text(active_locale or "zh", "单条对话消息过大。", "The message is too long."))
         extra_context = str(context or "").strip()[: 200_000]
         selected_skill_ids = self._validated_skill_ids([] if skill_ids is None else skill_ids)
         async with self._lock:
-            self.store.append_global_message({"role": "user", "content": text, "skill_ids": selected_skill_ids})
+            self.store.append_global_message({
+                "role": "user",
+                "content": text,
+                "skill_ids": selected_skill_ids,
+                "locale": active_locale,
+            })
             system_prompt = (
-                GLOBAL_CHAT_SYSTEM_PROMPT + self.chat_prompt_note() + skill_prompt(self.selected_skills(selected_skill_ids))
+                global_chat_system_prompt(active_locale)
+                + self.chat_prompt_note(active_locale)
+                + skill_prompt(self.selected_skills(selected_skill_ids), active_locale)
             )
+            if active_locale:
+                system_prompt += "\n\n" + language_instruction(active_locale)
             node_install_requested = self._explicit_node_install_request(text)
             workflow_install_requested = self.workflow_install_requested(text)
             effective_workflow_source = str(workflow_source or "").strip().replace("\\", "/")
@@ -177,7 +199,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                 workflow_requested,
                 workflow_install_requested,
             )
-            system_prompt += self._tool_catalog(tools)
+            system_prompt += self._tool_catalog(tools, active_locale)
             tool_names = [tool.get("function", {}).get("name") for tool in tools]
             search_injected = "search_runninghub_workflows" in tool_names
             logger.info(
@@ -259,7 +281,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                 if not calls:
                     assistant_message = {
                         "role": "assistant",
-                        "content": str(assistant.get("content") or "模型没有返回文本。"),
+                        "content": str(assistant.get("content") or localized_text(active_locale or "zh", "模型没有返回文本。", "The model returned no text.")),
                     }
                     self.store.append_global_message(assistant_message)
                     return {"status": "ok", "message": assistant_message, "messages": self.store.global_messages()}
@@ -312,7 +334,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                                 raise ValueError("工具参数必须对应本轮待安装的上传工作流文件。")
                             result = self.install_uploaded_workflow(source)
                         else:
-                            result = await self.execute_chat_tool(tool_name, arguments)
+                            result = await self.execute_chat_tool(tool_name, arguments, active_locale)
                     except Exception as exc:
                         logger.warning("Global chat tool failed: %s", exc)
                         result = {"error": str(exc)}
@@ -320,4 +342,4 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
                         {"role": "tool", "tool_call_id": call_id, "content": json_text(result)}
                     )
                 force_tool = False
-            raise RuntimeError("全局对话的工具调用超过步骤限制。")
+            raise RuntimeError(localized_text(active_locale or "zh", "全局对话的工具调用超过步骤限制。", "Global chat exceeded the tool-call step limit."))

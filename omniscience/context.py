@@ -226,7 +226,10 @@ class ContextManager:
                 minimum = len("[Earlier context summarized by Cline]") if largest == 1 else 0
                 if len(content) <= minimum:
                     break
-                compacted[largest]["content"] = content[: max(minimum, len(content) - 256)] + "…"
+                target_length = max(minimum, len(content) - 256)
+                if target_length >= len(content):
+                    break
+                compacted[largest]["content"] = content[:target_length]
         return compacted, True
 
     def prepare(self, messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:

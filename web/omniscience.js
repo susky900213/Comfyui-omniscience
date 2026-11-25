@@ -1,11 +1,15 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { createTranslator, normalizeLocale } from "./i18n.js";
 
 const STYLE_ID = "comfyui-omniscience-style";
 const PANEL_ID = "comfyui-omniscience-panel";
+const LAUNCHER_ID = "comfyui-omniscience-launcher";
 const WORKFLOW_INSPECTION_VERSION = 6;
 
 const state = {
+  locale: normalizeLocale(navigator.languages?.[0] || navigator.language),
+  composerDraft: "",
   tasks: [],
   projects: [],
   task: null,
@@ -53,10 +57,97 @@ const state = {
   currentWorkflowTaskId: "",
 };
 
+const { translate: t, localize } = createTranslator(() => state.locale);
+
+function configuredLocale() {
+  const stores = [
+    app?.ui?.settings,
+    app?.settingStore,
+    app?.settings,
+    window.comfyAPI?.app?.settings,
+    window.comfyAPI?.settings,
+  ];
+  for (const store of stores) {
+    try {
+      const value =
+        store?.getSettingValue?.("Comfy.Locale") ??
+        store?.get?.("Comfy.Locale") ??
+        store?.settingsValues?.["Comfy.Locale"] ??
+        store?.value?.["Comfy.Locale"];
+      if (value) return normalizeLocale(value);
+    } catch { /* try the next compatible settings facade */ }
+  }
+  return "";
+}
+
+async function resolveConfiguredLocale() {
+  const direct = configuredLocale();
+  if (direct) return direct;
+  try {
+    const response = await api.fetchApi("/settings/Comfy.Locale");
+    if (response.ok) {
+      const value = await response.json();
+      if (value) return normalizeLocale(value);
+    }
+  } catch { /* navigator language remains the fallback */ }
+  return normalizeLocale(navigator.languages?.[0] || navigator.language);
+}
+
+let localeRequestPending = false;
+let lastLocaleFetch = 0;
+
+function applyLocale(locale) {
+  const nextLocale = normalizeLocale(locale);
+  if (nextLocale === state.locale) return;
+  const draft = document.querySelector(`#${PANEL_ID} textarea[data-composer]`)?.value ?? state.composerDraft;
+  state.locale = nextLocale;
+  state.composerDraft = draft;
+  localize(document.getElementById(PANEL_ID));
+  localize(document.getElementById(LAUNCHER_ID));
+  renderPanel();
+  if (!["settings", "skills", "mcp"].includes(state.view)) setView(state.view);
+}
+
+async function syncLocale(force = false) {
+  if (localeRequestPending || !force && !configuredLocale() && Date.now() - lastLocaleFetch < 10_000) return;
+  localeRequestPending = true;
+  try {
+    applyLocale(await resolveConfiguredLocale());
+  } finally {
+    localeRequestPending = false;
+    lastLocaleFetch = Date.now();
+  }
+}
+
+function installLocaleListener() {
+  const onLocaleChange = (event) => {
+    const locale = event.detail?.value || configuredLocale();
+    if (locale) applyLocale(locale);
+    else void syncLocale(true);
+  };
+  app?.ui?.settings?.addEventListener?.("Comfy.Locale.change", onLocaleChange);
+  window.addEventListener("focus", () => { void syncLocale(true); });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void syncLocale(true);
+  });
+}
+
+function installTranslationObserver() {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel || panel.dataset.translationObserver) return;
+  panel.dataset.translationObserver = "true";
+  new MutationObserver(() => localize(panel)).observe(panel, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: ["placeholder", "title", "aria-label", "alt"],
+  });
+}
+
 function el(tag, className = "", text = "") {
   const node = document.createElement(tag);
   if (className) node.className = className;
-  if (text !== "") node.textContent = text;
+  if (text !== "") node.textContent = t(text);
   return node;
 }
 
@@ -64,6 +155,14 @@ function button(label, className = "") {
   const node = el("button", className, label);
   node.type = "button";
   return node;
+}
+
+function confirm(message) {
+  return window.confirm(t(message));
+}
+
+function alert(message) {
+  window.alert(t(message));
 }
 
 async function request(path, options = {}) {
@@ -74,7 +173,7 @@ async function request(path, options = {}) {
   let data = null;
   try { data = await response.json(); } catch { /* status is enough below */ }
   if (!response.ok) {
-    const error = new Error(data?.error || `请求失败 (${response.status})`);
+    const error = new Error(data?.error || t(`请求失败 (${response.status})`));
     error.status = response.status;
     error.payload = data;
     throw error;
@@ -558,7 +657,12 @@ function ensureStyle() {
 
 function lines(value) {
   const fragment = document.createDocumentFragment();
-  for (const line of String(value ?? "").split("\n")) fragment.appendChild(el("div", "omniscience-line", line));
+  for (const line of String(value ?? "").split("\n")) {
+    const row = el("div", "omniscience-line");
+    row.dataset.omniscienceNoTranslate = "true";
+    row.textContent = line;
+    fragment.appendChild(row);
+  }
   return fragment;
 }
 
@@ -878,7 +982,7 @@ function appendWorkflowExecutionFailure(card, errorOrJob) {
 
 async function repairWorkflowFailure(card, jobId, action, control) {
   if (!jobId || control.disabled) return;
-  if (!window.confirm(`确定执行“${action.label || "自动处理"}”吗？服务只会执行该错误报告授权的安全动作。`)) return;
+  if (!confirm(`确定执行“${action.label || "自动处理"}”吗？服务只会执行该错误报告授权的安全动作。`)) return;
   control.disabled = true;
   const originalLabel = control.textContent;
   control.textContent = "处理中…";
@@ -907,13 +1011,13 @@ async function repairWorkflowFailure(card, jobId, action, control) {
 
 async function createAIRepairTask(card, jobId, control) {
   if (!jobId || control.disabled) return;
-  if (!window.confirm("确定调用 AI 修复吗？这会创建一个 Act 任务，让 AI 在隔离项目工作区检查并修改代码；不会自动安装节点、下载模型或伪造修复结果。")) return;
+  if (!confirm("确定调用 AI 修复吗？这会创建一个 Act 任务，让 AI 在隔离项目工作区检查并修改代码；不会自动安装节点、下载模型或伪造修复结果。")) return;
   control.disabled = true;
   const originalLabel = control.textContent;
   control.textContent = "正在启动 AI…";
   try {
     const result = await request(`/omniscience/global-chat/workflows/${encodeURIComponent(jobId)}/repair-ai`, {
-      method: "POST", body: JSON.stringify({ confirmed: true }),
+      method: "POST", body: JSON.stringify({ confirmed: true, locale: state.locale }),
     });
     const box = card.querySelector(".omniscience-workflow-execution-error");
     const taskId = result.task_id || result.task?.id || "";
@@ -1161,7 +1265,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         loadCanvas.textContent = "正在加载到当前画布…";
         void loadCanvas.onclick();
       } else if (!restoring && report.format === "ui" && inspection.workflow?.nodes && typeof app.loadGraphData === "function") {
-        if (window.confirm("工作流检查完成。是否先加载到当前 ComfyUI 画布？\n\n当前画布中的未保存内容可能会被替换。")) {
+        if (confirm("工作流检查完成。是否先加载到当前 ComfyUI 画布？\n\n当前画布中的未保存内容可能会被替换。")) {
           void loadCanvas.onclick();
         }
       }
@@ -1986,7 +2090,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         const retry = button("查看报告后，单独确认仍要安装此风险节点", "omniscience-secondary omniscience-workflow-node-risk-confirm");
         retry.onclick = async () => {
           const findings = (security.findings || []).map((finding) => `${finding.severity}: ${finding.title}`).join("\n");
-          if (!window.confirm(`安全检测报告为“${securityVerdict(security)}”。\n\n${findings}\n\n继续会把风险代码放入 ComfyUI，并可能在重启时执行。仍要继续吗？`)) return;
+          if (!confirm(`安全检测报告为“${securityVerdict(security)}”。\n\n${findings}\n\n继续会把风险代码放入 ComfyUI，并可能在重启时执行。仍要继续吗？`)) return;
           if (options.retry) {
             retry.disabled = true;
             try {
@@ -2021,7 +2125,7 @@ function workflowCandidateCard(jobId, candidate, options = {}) {
         prepare.disabled = true;
         try {
           if (hasNodes) {
-            if (!window.confirm(`将通过 ComfyUI-Manager 安装已映射节点，并对手动 GitHub 来源执行安全扫描与 NODE_CLASS_MAPPINGS 校验：\n\n${nodeTypes.map((node) => `${node.class_type} ← ${node.manager_id ? `Manager:${node.manager_id}` : node.source}`).join("\n")}\n\n继续？`)) {
+            if (!confirm(`将通过 ComfyUI-Manager 安装已映射节点，并对手动 GitHub 来源执行安全扫描与 NODE_CLASS_MAPPINGS 校验：\n\n${nodeTypes.map((node) => `${node.class_type} ← ${node.manager_id ? `Manager:${node.manager_id}` : node.source}`).join("\n")}\n\n继续？`)) {
               prepare.disabled = false;
               return;
             }
@@ -2186,7 +2290,7 @@ function appendWorkflowCandidates(content, article) {
       develop.disabled = true;
       try {
         const result = await request(`/omniscience/global-chat/workflows/${encodeURIComponent(payload.job_id)}/develop`, {
-          method: "POST", body: JSON.stringify({ confirmed: true }),
+          method: "POST", body: JSON.stringify({ confirmed: true, locale: state.locale }),
         });
         develop.textContent = `已创建任务：${result.folder || result.task_id}`;
         if (result.task_id) await loadTask(result.task_id);
@@ -2502,7 +2606,7 @@ function nodeInstallControls() {
 
 async function deleteTask(task) {
   const folder = task.folder || task.title || "未命名项目";
-  if (!window.confirm(`确定删除任务节点“${folder}”？\n\n只删除任务记录、对话历史和由任务创建的软链接，不删除项目文件夹或源码。`)) return;
+  if (!confirm(`确定删除任务节点“${folder}”？\n\n只删除任务记录、对话历史和由任务创建的软链接，不删除项目文件夹或源码。`)) return;
   try {
     await request(`/omniscience/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
     if (state.task?.id === task.id) {
@@ -3220,6 +3324,7 @@ async function loadSkills() {
 }
 
 async function pollEvents() {
+  await syncLocale();
   await pollWorkflowRepairCards();
   if (state.polling || state.taskLoading || state.globalChatActive || !currentTaskId()) return;
   state.polling = true;
@@ -3256,7 +3361,7 @@ async function createTask() {
 async function clearHistory() {
   if (state.globalChatActive) {
     if (state.globalBusy) return;
-    if (!window.confirm("确定清理全局对话吗？这不会影响任何任务的历史记录。")) return;
+    if (!confirm("确定清理全局对话吗？这不会影响任何任务的历史记录。")) return;
     try {
       await request("/omniscience/global-chat/history", { method: "DELETE" });
       state.globalMessages = [];
@@ -3281,7 +3386,7 @@ async function clearHistory() {
   const taskId = currentTaskId();
   if (!taskId || state.busy) return;
   const folder = state.task?.folder || state.task?.title || "当前项目";
-  if (!window.confirm(`确定清理“${folder}”的历史对话吗？\n项目文件夹和文件不会被删除。`)) return;
+  if (!confirm(`确定清理“${folder}”的历史对话吗？\n项目文件夹和文件不会被删除。`)) return;
   try {
     await request(`/omniscience/tasks/${encodeURIComponent(taskId)}/history`, { method: "DELETE" });
     state.messages = [];
@@ -3321,6 +3426,7 @@ async function sendMessage() {
       const previousSkillIds = new Set(state.skills.map((skill) => skill.id));
       const mentioned = await expandFileMentions(content);
       input.value = "";
+      state.composerDraft = "";
       state.skillMenuOpen = false;
       state.skillQuery = "";
       state.skillMenuIndex = 0;
@@ -3334,6 +3440,7 @@ async function sendMessage() {
           skill_ids: [...state.selectedSkillIds],
           context: mentioned,
           workflow_source: workflowSourceFromContent(content),
+          locale: state.locale,
         }),
       });
       state.globalMessages = result.messages || [...state.globalMessages, result.message].filter(Boolean);
@@ -3366,12 +3473,13 @@ async function sendMessage() {
     state.skillMenuIndex = 0;
     resetFileMenu();
     input.value = "";
+    state.composerDraft = "";
     state.busy = true;
     renderPanel();
     // POST /messages only accepts the turn (202); progress arrives via pollEvents.
     await request(`/omniscience/tasks/${encodeURIComponent(currentTaskId())}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content, context, skill_ids: [...state.selectedSkillIds] }),
+      body: JSON.stringify({ content, context, skill_ids: [...state.selectedSkillIds], locale: state.locale }),
     });
     await refreshTask();
     await loadTasks();
@@ -3387,7 +3495,7 @@ async function sendMessage() {
 async function cancelTask() {
   const taskId = currentTaskId();
   if (!taskId || state.cancelling || !["running", "waiting_approval"].includes(state.task?.status)) return;
-  if (!window.confirm("确定要取消当前运行吗？正在运行的命令会被终止，之后仍可在这个节点继续提问。")) return;
+  if (!confirm("确定要取消当前运行吗？正在运行的命令会被终止，之后仍可在这个节点继续提问。")) return;
   state.cancelling = true;
   renderPanel();
   try {
@@ -3428,7 +3536,7 @@ async function addFileContext(path) {
     const result = await request(`/omniscience/file?task_id=${encodeURIComponent(currentTaskId())}&path=${encodeURIComponent(path)}`);
     state.context.push(`文件：${result.path}\n${result.content}`);
     renderContext();
-  } catch (error) { window.alert(`读取文件失败：${error.message}`); }
+  } catch (error) { alert(`读取文件失败：${error.message}`); }
 }
 
 async function renderFiles() {
@@ -3553,7 +3661,7 @@ async function renderCheckpoints() {
       } catch (error) { output.textContent = error.message; }
     };
     restore.onclick = async () => {
-      if (!window.confirm("恢复该检查点的文件？当前未保存的文件修改可能丢失。")) return;
+      if (!confirm("恢复该检查点的文件？当前未保存的文件修改可能丢失。")) return;
       try {
         await request(`/omniscience/checkpoints/${encodeURIComponent(checkpoint.id)}/restore`, { method: "POST", body: JSON.stringify({ restore_files: true, restore_task: false }) });
         state.error = "检查点文件已恢复。";
@@ -3578,7 +3686,7 @@ async function loadContextStats() {
     return null;
   }
   const skillQuery = encodeURIComponent(JSON.stringify(state.selectedSkillIds));
-  state.contextStats = await request(`/omniscience/tasks/${encodeURIComponent(currentTaskId())}/context?skill_ids=${skillQuery}`);
+  state.contextStats = await request(`/omniscience/tasks/${encodeURIComponent(currentTaskId())}/context?skill_ids=${skillQuery}&locale=${encodeURIComponent(state.locale)}`);
   return state.contextStats;
 }
 
@@ -3641,7 +3749,7 @@ function renderSettings() {
   for (const provider of providerOptions()) {
     const option = document.createElement("option");
     option.value = provider.id;
-    option.textContent = provider.label;
+    option.textContent = t(provider.label);
     if (provider.id === settings.provider) option.selected = true;
     providerSelect.appendChild(option);
   }
@@ -3921,7 +4029,7 @@ function securityConfirmation(error, action = "保存") {
   const findings = (security.findings || []).filter((item) => item.severity !== "low");
   const list = findings.length ? findings.map((item) => `· ${item.title}`).join("\n") : error.message;
   const engine = securityEngineText(security);
-  return window.confirm(`安全检测阻止${action}：\n${list}\n\n${engine ? `${engine}\n` : ""}确认来源可信并要求仍然${action}？`);
+  return confirm(`安全检测阻止${action}：\n${list}\n\n${engine ? `${engine}\n` : ""}确认来源可信并要求仍然${action}？`);
 }
 
 function securityStatusText(security) {
@@ -4034,14 +4142,14 @@ function renderSkills() {
       await request("/omniscience/skills/import", { method: "POST", body: JSON.stringify(imported) });
     } catch (error) {
       const blocked = String(error.message).includes("安全检测阻止导入");
-      if (!blocked || !window.confirm(`${error.message}\n\n确认全部来源可信并要求仍然导入？`)) {
-        window.alert(`导入失败：${error.message}`);
+      if (!blocked || !confirm(`${error.message}\n\n确认全部来源可信并要求仍然导入？`)) {
+        alert(`导入失败：${error.message}`);
         importInput.value = "";
         return;
       }
       try {
         await request("/omniscience/skills/import", { method: "POST", body: JSON.stringify({ ...imported, acknowledge_security: true }) });
-      } catch (retryError) { window.alert(`导入失败：${retryError.message}`); }
+      } catch (retryError) { alert(`导入失败：${retryError.message}`); }
     }
     await loadSkills();
     await loadContextStats().catch(() => {});
@@ -4113,13 +4221,13 @@ function renderSkills() {
     };
     toggle.onclick = async () => {
       try { await request(`/omniscience/skills/${encodeURIComponent(skill.id)}`, { method: "PATCH", body: JSON.stringify({ enabled: !skill.enabled }) }); await loadSkills(); await loadContextStats().catch(() => {}); renderSkills(); renderPanel(); }
-      catch (error) { window.alert(`更新失败：${error.message}`); }
+      catch (error) { alert(`更新失败：${error.message}`); }
     };
     edit.onclick = () => { state.editingSkillId = skill.id; renderSkills(); };
     remove.onclick = async () => {
-       if (!window.confirm(`确定删除全局 Skill“${skill.name}”？删除后，历史消息仍保留但不会再注入提示词。`)) return;
+       if (!confirm(`确定删除全局 Skill“${skill.name}”？删除后，历史消息仍保留但不会再注入提示词。`)) return;
        try { await request(`/omniscience/skills/${encodeURIComponent(skill.id)}`, { method: "DELETE" }); await loadSkills(); await loadContextStats().catch(() => {}); renderSkills(); renderPanel(); }
-      catch (error) { window.alert(`删除失败：${error.message}`); }
+      catch (error) { alert(`删除失败：${error.message}`); }
     };
     cardActions.append(toggle, edit, scan, remove);
     card.append(heading, description, preview, cardActions);
@@ -4187,11 +4295,7 @@ function buildPanel() {
   const globalChat = button("全局对话", "omniscience-secondary omniscience-global-chat-toggle");
   globalChat.onclick = toggleGlobalChat;
   const close = button("×", "omniscience-close");
-  close.onclick = () => {
-    panel.classList.remove("open");
-    const launcher = document.getElementById("comfyui-omniscience-launcher");
-    if (launcher) launcher.hidden = false;
-  };
+  close.onclick = () => setPanelOpen(false);
   const headerActions = el("div", "omniscience-header-actions");
   headerActions.append(globalChat, close);
   header.append(heading, headerActions);
@@ -4244,6 +4348,7 @@ function buildPanel() {
   const composer = el("div", "omniscience-composer");
   const textarea = document.createElement("textarea");
   textarea.dataset.composer = "true";
+  textarea.value = state.composerDraft;
   textarea.placeholder = "描述你要完成的编程任务…";
   textarea.rows = 3;
   textarea.onkeydown = (event) => {
@@ -4330,6 +4435,7 @@ function buildPanel() {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); sendMessage(); }
   };
   textarea.oninput = () => {
+    state.composerDraft = textarea.value;
     const command = skillCommand(textarea.value);
     const tool = command ? null : toolCommand(textarea.value);
     const mention = command || tool ? null : fileCommand(textarea.value);
@@ -4392,25 +4498,85 @@ function buildPanel() {
   layout.append(sidebar, main);
   panel.append(header, layout);
   document.body.appendChild(panel);
+  installTranslationObserver();
+  localize(panel);
   renderPanel();
 }
 
+function setPanelOpen(open) {
+  document.getElementById(PANEL_ID)?.classList.toggle("open", open);
+  const launcher = document.getElementById(LAUNCHER_ID);
+  if (!launcher) return;
+  launcher.classList.toggle("active", open);
+  launcher.classList.toggle("side-bar-button-selected", open);
+  launcher.setAttribute("aria-expanded", String(open));
+  launcher.setAttribute("aria-pressed", String(open));
+}
+
 function installLauncher() {
-  if (document.getElementById("comfyui-omniscience-launcher")) return;
-  const launcher = button("Omniscience", "omniscience-launcher");
-  launcher.id = "comfyui-omniscience-launcher";
+  if (document.getElementById(LAUNCHER_ID)) return;
+  const launcher = button("", "omniscience-launcher side-bar-button");
+  launcher.id = LAUNCHER_ID;
+  launcher.setAttribute("aria-controls", PANEL_ID);
+  launcher.setAttribute("aria-label", t("AI 助手"));
+  launcher.title = t("AI 助手");
+  launcher.setAttribute("aria-expanded", "false");
+  launcher.setAttribute("aria-pressed", "false");
+  const content = el("div", "side-bar-button-content flex flex-col items-center gap-2");
+  const iconWrapper = el("span", "sidebar-icon-wrapper relative");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("fill", "none");
+  icon.setAttribute("stroke", "currentColor");
+  icon.setAttribute("stroke-width", "1.8");
+  icon.setAttribute("stroke-linecap", "round");
+  icon.setAttribute("stroke-linejoin", "round");
+  icon.setAttribute("aria-hidden", "true");
+  icon.style.fill = "none";
+  icon.style.stroke = "currentColor";
+  icon.classList.add("side-bar-button-icon");
+  for (const [tag, attributes] of [
+    ["path", { d: "M12 8V5M8 5h8" }],
+    ["rect", { x: "4", y: "8", width: "16", height: "13", rx: "3" }],
+    ["path", { d: "M2 12v4M22 12v4M9 14h.01M15 14h.01M9 18h6" }],
+  ]) {
+    const shape = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [name, value] of Object.entries(attributes)) shape.setAttribute(name, value);
+    shape.style.fill = "none";
+    shape.style.stroke = "currentColor";
+    icon.append(shape);
+  }
+  iconWrapper.append(icon);
+  const label = el("span", "side-bar-button-label text-center text-2xs leading-none", "全能");
+  content.append(iconWrapper, label);
+  launcher.append(content);
   launcher.onclick = () => {
     buildPanel();
-    document.getElementById(PANEL_ID).classList.add("open");
-    launcher.hidden = true;
+    setPanelOpen(!document.getElementById(PANEL_ID).classList.contains("open"));
   };
-  document.body.appendChild(launcher);
+  localize(launcher);
+
+  const mount = () => {
+    const target = document.querySelector('[data-testid="sidebar-top-group"]');
+    if (!target) return false;
+    target.append(launcher);
+    return true;
+  };
+  if (!mount()) {
+    document.body.appendChild(launcher);
+    const observer = new MutationObserver(() => {
+      if (mount()) observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
 }
 
 app.registerExtension({
   name: "ComfyUI.Omniscience",
   async setup() {
     ensureStyle();
+    state.locale = await resolveConfiguredLocale();
+    installLocaleListener();
     installLauncher();
     buildPanel();
     try {

@@ -248,7 +248,9 @@ def register_workflows_routes(routes: Any) -> None:
             values = await _body(request)
             return _response(
                 await deps.global_chat_agent().create_development_task(
-                    request.match_info["job_id"], confirmed=bool(values.get("confirmed"))
+                    request.match_info["job_id"],
+                    confirmed=bool(values.get("confirmed")),
+                    locale=str(values.get("locale") or ""),
                 )
             )
         except (ValueError, OSError) as exc:
@@ -319,7 +321,9 @@ def register_workflows_routes(routes: Any) -> None:
             values = await _body(request)
             return _response(
                 await deps.global_chat_agent().create_ai_repair_task(
-                    request.match_info["job_id"], confirmed=bool(values.get("confirmed"))
+                    request.match_info["job_id"],
+                    confirmed=bool(values.get("confirmed")),
+                    locale=str(values.get("locale") or ""),
                 ),
                 status=202,
             )
@@ -353,6 +357,7 @@ def register_workflows_routes(routes: Any) -> None:
                     values.get("skill_ids", []),
                     str(values.get("context") or ""),
                     str(values.get("workflow_source") or ""),
+                    locale=str(values.get("locale") or ""),
                 )
             )
         except (ValueError, RuntimeError, OSError) as exc:

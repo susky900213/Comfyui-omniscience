@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import paths
+from ..i18n import text
 from ..tools.defs import global_chat_definitions
 from ..workspace import Workspace
 
@@ -63,13 +64,24 @@ class GlobalChatToolMixin:
                 continue
         return max(candidates, default=(0, ""))[1]
 
-    def chat_prompt_note(self) -> str:
+    def chat_prompt_note(self, locale: str = "") -> str:
         workspace = self.chat_workspace()
-        network = (
+        network = text(
+            locale or "zh",
             "已开启网络访问：可以调用 browser_navigate、browser_content、browser_screenshot 查阅公开网页。"
             if self.chat_network_allowed()
-            else "未开启网络访问：浏览器工具会被拒绝。需要联网时提醒用户点击输入区下方的“网络访问”按钮。"
+            else "未开启网络访问：浏览器工具会被拒绝。需要联网时提醒用户点击输入区下方的“网络访问”按钮。",
+            "Network access is enabled. You may use browser_navigate, browser_content, and browser_screenshot to read public web pages."
+            if self.chat_network_allowed()
+            else "Network access is disabled and browser tools will be rejected. Ask the user to enable the Network access button below the composer when needed.",
         )
+        if locale == "en":
+            return (
+                "\n\n## Global Workspace\n"
+                f"User uploads are stored in {workspace.root}/uploads. Use list_files, read_file, and search_files to inspect them. "
+                "Content of files marked with @ is included with the message."
+                f"\n\n## Network Access\n{network}"
+            )
         return (
             "\n\n## 全局工作区\n"
             f"用户上传的文件存放在 {workspace.root} 的 uploads/ 目录，可用 list_files、read_file、search_files 查阅；"
@@ -77,7 +89,7 @@ class GlobalChatToolMixin:
             f"## 网络访问\n{network}"
         )
 
-    async def execute_chat_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def execute_chat_tool(self, name: str, arguments: dict[str, Any], locale: str = "") -> Any:
         workspace = self.chat_workspace()
         if name == "list_files":
             return workspace.list_files(arguments.get("path", "."), bool(arguments.get("recursive", False)))
@@ -88,7 +100,7 @@ class GlobalChatToolMixin:
         if not name.startswith("browser_"):
             raise ValueError(f"全局对话不支持此工具：{name}")
         if not self.chat_network_allowed():
-            return {"error": GLOBAL_NETWORK_DENIED}
+            return {"error": text(locale, GLOBAL_NETWORK_DENIED, "Network access is disabled for global chat. Enable the Network access button below the composer before using browser tools.") if locale else GLOBAL_NETWORK_DENIED}
         if name == "browser_navigate":
             return await self.browser.navigate(GLOBAL_BROWSER_SESSION, str(arguments["url"]))
         if name == "browser_content":

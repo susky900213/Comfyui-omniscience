@@ -12,7 +12,7 @@ It runs entirely inside ComfyUI and does not require VS Code or a separate edito
 
 ## Features
 
-- **In-ComfyUI assistant** — open the assistant from the **Omniscience** button in the upper-right corner.
+- **In-ComfyUI assistant** — open the assistant from the **AI Assistant** button in the left vertical menu.
 - **OpenAI-compatible providers** — OpenAI, DeepSeek, OpenRouter, Ollama, LM Studio, and compatible custom endpoints.
 - **Plan / Act modes** — plan without mutation tools, then switch to Act to apply reviewed changes.
 - **Project-aware tools** — list, read, and search files; write files; apply unified diffs; and run development commands inside the task project.
@@ -48,7 +48,7 @@ cp -R /path/to/Comfyui-omniscience \
   /path/to/ComfyUI/custom_nodes/Comfyui-omniscience
 ```
 
-If you cloned the repository, run the command from its parent directory. Restart ComfyUI after installation, then look for **Omniscience** in the upper-right corner.
+If you cloned the repository, run the command from its parent directory. Restart ComfyUI after installation, then look for **AI Assistant** in the left vertical menu.
 
 ### Git installation
 
@@ -73,7 +73,7 @@ Adjust the Python path for portable installations. Browser automation is optiona
 ## Quick start
 
 1. Install the extension and restart ComfyUI.
-2. Click **Omniscience** in the upper-right corner.
+2. Click **AI Assistant** in the left vertical menu.
 3. Open **Settings** and configure:
    - **Provider** and **API base URL**, for example `https://api.openai.com/v1` or `http://127.0.0.1:11434/v1`.
    - **Model** and, when required, **API key**.

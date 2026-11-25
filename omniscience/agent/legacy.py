@@ -27,7 +27,8 @@ from ..constants import (
 )
 from ..context import ContextManager
 from ..model_client import complete
-from ..prompts import COMPACTION_SYSTEM_PROMPT, SYSTEM_PROMPT
+from ..i18n import normalize_locale
+from ..prompts import COMPACTION_SYSTEM_PROMPT, SYSTEM_PROMPT, build_system_prompt
 from ..settings import SettingsStore
 from ..tools.defs import TOOL_DEFINITIONS
 from ..tools.guards import BLOCKED_COMMANDS
@@ -72,7 +73,7 @@ class ClineAgent:
         configured = self.settings.load().get("workspace") or str(default_workspace())
         return Workspace(configured)
 
-    async def chat(self, messages: list[dict[str, Any]], context: str = "") -> dict[str, Any]:
+    async def chat(self, messages: list[dict[str, Any]], context: str = "", locale: str = "") -> dict[str, Any]:
         clean_messages = self._clean_messages(messages)
         if context:
             clean_messages.append(
@@ -81,9 +82,9 @@ class ClineAgent:
                     "content": f"Additional workspace context:\n{context}",
                 }
             )
-        return await self._run_loop(clean_messages)
+        return await self._run_loop(clean_messages, locale=locale)
 
-    async def confirm(self, action_id: str, approved: bool) -> dict[str, Any]:
+    async def confirm(self, action_id: str, approved: bool, locale: str = "") -> dict[str, Any]:
         action = self.pending.pop(action_id, None)
         if action is None:
             raise ValueError("This confirmation has expired. Please send the request again.")
@@ -99,14 +100,21 @@ class ClineAgent:
                 "content": json_text(result),
             }
         )
-        return await self._run_loop(action.messages, action.tool_calls, action.action_index + 1)
+        return await self._run_loop(action.messages, action.tool_calls, action.action_index + 1, locale=locale)
 
     async def _run_loop(
         self,
         messages: list[dict[str, Any]],
         tool_calls: list[dict[str, Any]] | None = None,
         tool_index: int = 0,
+        locale: str = "",
     ) -> dict[str, Any]:
+        active_locale = normalize_locale(locale) if locale else ""
+        system_prompt = (
+            build_system_prompt("act", locale=active_locale)
+            if active_locale
+            else SYSTEM_PROMPT + "\nYou are currently in ACT mode. In PLAN mode, do not modify files or run commands."
+        )
         for _ in range(MAX_AGENT_STEPS):
             if tool_calls is not None:
                 for index in range(tool_index, len(tool_calls)):
@@ -122,8 +130,8 @@ class ClineAgent:
                 tool_calls = None
                 tool_index = 0
 
-            messages, _ = await self._compact_messages(messages, TOOL_DEFINITIONS)
-            response = await self._call_model(messages, tools=TOOL_DEFINITIONS)
+            messages, _ = await self._compact_messages(messages, TOOL_DEFINITIONS, system_prompt, active_locale)
+            response = await self._call_model(messages, tools=TOOL_DEFINITIONS, system_prompt=system_prompt)
             choice = (response.get("choices") or [{}])[0]
             assistant = choice.get("message") or {}
             calls = assistant.get("tool_calls") or []
@@ -150,6 +158,8 @@ class ClineAgent:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
+        system_prompt: str = SYSTEM_PROMPT,
+        locale: str = "",
     ) -> tuple[list[dict[str, Any]], bool]:
         try:
             configured = max_context_tokens(
@@ -167,7 +177,7 @@ class ClineAgent:
                 keep_messages=self.context.keep_messages,
                 compaction_threshold=threshold / 100,
             )
-        reserved = ContextManager.estimate_tokens(SYSTEM_PROMPT) + ContextManager.estimate_tokens(json_text(tools))
+        reserved = ContextManager.estimate_tokens(system_prompt) + ContextManager.estimate_tokens(json_text(tools))
         if not self.context.needs_compaction(messages, reserved):
             return messages, False
         summary_input = self.context.bounded_summary_messages(messages)

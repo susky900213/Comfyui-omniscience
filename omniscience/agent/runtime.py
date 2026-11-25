@@ -26,11 +26,13 @@ from ..constants import (
 )
 from ..context import ContextManager
 from ..host import browser_manager, mcp_manager
+from ..i18n import normalize_locale, text
 from ..model_client import complete
 from ..prompts import (
     SYSTEM_PROMPT,
     COMPACTION_SYSTEM_PROMPT,
     build_system_prompt,
+    compaction_system_prompt,
     project_rules,
     skill_prompt,
     wrap_user_input,
@@ -186,6 +188,13 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
                 return values if isinstance(values, list) else []
         return []
 
+    def _latest_message_locale(self, task_id: str) -> str:
+        for message in reversed(self.store.messages(task_id)):
+            if message.get("role") == "user":
+                value = str(message.get("locale") or "")
+                return normalize_locale(value) if value else ""
+        return ""
+
     def update_task_skills(self, task_id: str, skill_ids: Any) -> dict[str, Any]:
         """Compatibility adapter: validate IDs without persisting them on a task."""
         self.task(task_id)
@@ -196,32 +205,53 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         """Delete a Skill from the global library."""
         return self.skills.delete(skill_id)
 
-    def system_prompt(self, task_id: str, mode: str | None = None, skill_ids: Any = None) -> str:
+    def system_prompt(
+        self,
+        task_id: str,
+        mode: str | None = None,
+        skill_ids: Any = None,
+        locale: str | None = None,
+    ) -> str:
         """Assemble the per-request system prompt (DESIGN Appendix A.5)."""
         task = self.task(task_id)
         task_mode = mode or task["mode"]
+        active_locale = normalize_locale(locale) if locale is not None else self._latest_message_locale(task_id)
         settings_data = self.settings.load()
         comfyui_directory = str(settings_data.get("comfyui_directory") or paths.DEFAULT_COMFYUI_DIRECTORY or "")
         workspace_path = Path(str(task["workspace"]))
         folder_name = (task.get("metadata") or {}).get("project_folder") or workspace_path.name
         network_enabled = bool((task.get("metadata") or {}).get("network_enabled"))
-        network_note = (
-            "\n\n## 网络访问\n当前任务已开启网络访问：可以调用 browser_* 工具，命令中的 curl/git clone 等联网操作会被允许。"
-            if network_enabled
-            else "\n\n## 网络访问\n当前任务未开启网络访问：browser_* 工具和联网命令（curl、wget、git clone 等）会被后端拒绝。"
-            "需要联网时提醒用户点击输入区下方的“网络访问”按钮。"
-        )
+        if active_locale:
+            network_note = text(
+                active_locale,
+                "\n\n## 网络访问\n当前任务已开启网络访问：可以调用 browser_* 工具，命令中的 curl/git clone 等联网操作会被允许。"
+                if network_enabled
+                else "\n\n## 网络访问\n当前任务未开启网络访问：browser_* 工具和联网命令（curl、wget、git clone 等）会被后端拒绝。"
+                "需要联网时提醒用户点击输入区下方的“网络访问”按钮。",
+                "\n\n## Network Access\nNetwork access is enabled for this task. You may call browser_* tools, and network commands such as curl/git clone are allowed."
+                if network_enabled
+                else "\n\n## Network Access\nNetwork access is disabled for this task. browser_* tools and network commands (curl, wget, git clone, etc.) are rejected by the backend. "
+                "Ask the user to enable the Network access button below the composer when network access is needed.",
+            )
+        else:
+            network_note = (
+                "\n\n## 网络访问\n当前任务已开启网络访问：可以调用 browser_* 工具，命令中的 curl/git clone 等联网操作会被允许。"
+                if network_enabled
+                else "\n\n## 网络访问\n当前任务未开启网络访问：browser_* 工具和联网命令（curl、wget、git clone 等）会被后端拒绝。"
+                "需要联网时提醒用户点击输入区下方的“网络访问”按钮。"
+            )
         return build_system_prompt(
             task_mode,
             cwd=str(workspace_path),
             project_name=str(folder_name),
             comfyui_directory=comfyui_directory,
             skills=self.selected_skills(task_id, skill_ids),
-            rules_text=project_rules(workspace_path),
+            rules_text=project_rules(workspace_path, locale=active_locale),
             metadata_text=workspace_metadata(
-                {**task, "folder": folder_name, "mode": task_mode}, comfyui_directory
+                {**task, "folder": folder_name, "mode": task_mode}, comfyui_directory, active_locale
             ),
             preferred_language=str(settings_data.get("preferred_language") or ""),
+            locale=active_locale,
         ) + network_note
 
     def update_current_workflow(self, task_id: str, workflow: Any, source: str = "comfyui_canvas") -> dict[str, Any]:
@@ -247,7 +277,14 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
     def _cancelled_result(self, task_id: str) -> dict[str, Any]:
         return {
             "status": "cancelled",
-            "message": {"role": "system", "content": "本次运行已被强制取消，可以继续提问。"},
+            "message": {
+                "role": "system",
+                "content": text(
+                    self._latest_message_locale(task_id) or "zh",
+                    "本次运行已被强制取消，可以继续提问。",
+                    "This run was force-cancelled. You can continue asking questions.",
+                ),
+            },
             "task": self.task(task_id),
         }
 
@@ -277,6 +314,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
                 "role": "user",
                 "content": str(followup.get("content") or "").strip(),
                 "skill_ids": list(followup.get("skill_ids") or []),
+                "locale": normalize_locale(followup["locale"]) if followup.get("locale") else "",
             }
             if not message["content"]:
                 continue
@@ -319,7 +357,14 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         # pending map as part of the HTTP API.
         return None
 
-    async def chat(self, task_id: str, content: str, context: str = "", skill_ids: Any = None) -> dict[str, Any]:
+    async def chat(
+        self,
+        task_id: str,
+        content: str,
+        context: str = "",
+        skill_ids: Any = None,
+        locale: str = "",
+    ) -> dict[str, Any]:
         self.task(task_id)
         if not str(content).strip():
             raise ValueError("Message cannot be empty.")
@@ -336,8 +381,13 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             # Tasks created by an older version may still contain one paused
             # approval. Resume that action automatically so the task does not
             # remain blocked after upgrading to direct execution.
-            return await self.confirm(pending["id"], True)
-        message = {"role": "user", "content": str(content).strip(), "skill_ids": selected_skill_ids}
+            return await self.confirm(pending["id"], True, locale=locale)
+        message = {
+            "role": "user",
+            "content": str(content).strip(),
+            "skill_ids": selected_skill_ids,
+            "locale": normalize_locale(locale) if locale else "",
+        }
         if context:
             message["content"] += f"\n\n--- Additional workspace context ---\n{context}"
         self.store.append_message(task_id, message)
@@ -355,7 +405,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             self._unregister_running_task(task_id)
             self._cancel_requested.discard(task_id)
 
-    async def confirm(self, approval_id: str, approved: bool) -> dict[str, Any]:
+    async def confirm(self, approval_id: str, approved: bool, locale: str = "") -> dict[str, Any]:
         approval = self.store.approval(approval_id)
         if not approval or approval["status"] != "pending":
             raise ValueError("This confirmation has expired or was already resolved.")
@@ -395,7 +445,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             )
             if next_result is not None:
                 return next_result
-            return await self._run_loop(task_id)
+            return await self._run_loop(task_id, locale=locale)
         except TaskCancelled:
             return self._cancelled_result(task_id)
         except asyncio.CancelledError:
@@ -413,7 +463,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             value = {
                 key: value
                 for key, value in message.items()
-                if key not in {"seq", "created_at", "skill_ids"}
+                if key not in {"seq", "created_at", "skill_ids", "locale"}
             }
             if value.get("role") == "user" and mode is not None:
                 # Mode stamping happens only at the model boundary; the
@@ -430,9 +480,10 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         mode: str,
         task_id: str | None = None,
         skill_ids: Any = None,
+        locale: str = "",
     ) -> tuple[list[dict[str, Any]], bool]:
         system_prompt = (
-            self.system_prompt(task_id, mode, skill_ids)
+            self.system_prompt(task_id, mode, skill_ids, locale)
             if task_id
             else SYSTEM_PROMPT + f"\nYou are currently in {mode.upper()} mode. In PLAN mode, do not modify files or run commands."
         )
@@ -462,12 +513,16 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         summary_input.append(
             {
                 "role": "user",
-                "content": "Summarize the preceding conversation now. Preserve concrete task state and unresolved work.",
+                "content": text(
+                    locale,
+                    "请立即总结前面的对话。保留具体任务状态和未完成工作。",
+                    "Summarize the preceding conversation now. Preserve concrete task state and unresolved work.",
+                ),
             }
         )
         try:
-            summary_system_prompt = COMPACTION_SYSTEM_PROMPT + (
-                skill_prompt(self.selected_skills(task_id, skill_ids)) if task_id else ""
+            summary_system_prompt = compaction_system_prompt(locale) + (
+                skill_prompt(self.selected_skills(task_id, skill_ids), locale) if task_id else ""
             )
             response = await self._call_model(
                 summary_input,
@@ -478,7 +533,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             )
             summary = ((response.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
             if not str(summary).strip():
-                raise RuntimeError("模型摘要响应为空。")
+                raise RuntimeError(text(locale or "zh", "模型摘要响应为空。", "The model returned an empty summary."))
             compacted, changed = self.context.with_summary(messages, summary, reserved)
             if changed:
                 return compacted, True
@@ -487,7 +542,12 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             logger.warning("Context summary request failed; using local fallback: %s", exc)
             return self.context.fallback(messages, reserved)
 
-    async def context_status(self, task_id: str, skill_ids: Any = None) -> dict[str, Any]:
+    async def context_status(
+        self,
+        task_id: str,
+        skill_ids: Any = None,
+        locale: str | None = None,
+    ) -> dict[str, Any]:
         """Return the estimated prompt size using the current message Skills."""
         task = self.task(task_id)
         settings_data = self.settings.load()
@@ -509,7 +569,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         if model_messages is None:
             model_messages = self._messages_for_model(stored_messages)
         tools = await self._tool_definitions(task["mode"])
-        system_prompt = self.system_prompt(task_id, skill_ids=skill_ids)
+        system_prompt = self.system_prompt(task_id, skill_ids=skill_ids, locale=locale)
         system_tokens = ContextManager.estimate_tokens(system_prompt)
         tools_tokens = ContextManager.estimate_tokens(json_text(tools))
         message_tokens = ContextManager.estimate_messages_tokens(model_messages)
@@ -563,7 +623,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             "messages": [dict(message) for message in model_messages],
         }
 
-    async def _run_loop(self, task_id: str) -> dict[str, Any]:
+    async def _run_loop(self, task_id: str, locale: str = "") -> dict[str, Any]:
         async with self._lock_for(task_id):
             task = self.task(task_id)
             task = self.store.start_task(task_id)
@@ -577,9 +637,10 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
                     if model_messages is None:
                         model_messages = self._messages_for_model(stored_messages, task["mode"])
                     active_skill_ids = self._latest_message_skill_ids(task_id)
+                    active_locale = normalize_locale(locale) if locale else self._latest_message_locale(task_id)
                     tools = await self._tool_definitions(task["mode"])
                     model_messages, compacted = await self._compact_messages(
-                        model_messages, tools, task["mode"], task_id, active_skill_ids
+                        model_messages, tools, task["mode"], task_id, active_skill_ids, active_locale
                     )
                     if compacted:
                         self._event(task_id, "context_compacted", {"message_count": len(model_messages)})
@@ -588,7 +649,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
                         model_messages,
                         tools,
                         task["mode"],
-                        system_prompt=self.system_prompt(task_id, skill_ids=active_skill_ids),
+                        system_prompt=self.system_prompt(task_id, skill_ids=active_skill_ids, locale=active_locale),
                     )
                     self._check_cancelled(task_id)
                     choice = (response.get("choices") or [{}])[0]
@@ -610,7 +671,11 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
                             "status": "ok",
                             "message": {
                                 "role": "assistant",
-                                "content": assistant_message["content"] or "模型没有返回文本。",
+                                "content": assistant_message["content"] or text(
+                                    active_locale or "zh",
+                                    "模型没有返回文本。",
+                                    "The model returned no text.",
+                                ),
                             },
                             "comfyui_link": comfyui_link,
                             "workflow": workflow,
