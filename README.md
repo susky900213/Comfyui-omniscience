@@ -10,6 +10,16 @@ It runs entirely inside ComfyUI and does not require VS Code or a separate edito
 
 [中文说明](README_zh-CN.md)
 
+## Screenshots
+
+<p align="center">
+  <img src="web/assets/screenshots/assistant.png" width="320" alt="ComfyUI Omniscience assistant chat">
+</p>
+
+| Create a task | Inspect the live workflow |
+| --- | --- |
+| <img src="web/assets/screenshots/new-task.png" width="100%" alt="New ComfyUI node project dialog"> | <img src="web/assets/screenshots/workflow.png" width="100%" alt="Live ComfyUI workflow JSON viewer"> |
+
 ## Features
 
 - **In-ComfyUI assistant** — open the assistant from the **AI Assistant** button in the left vertical menu.
