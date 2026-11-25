@@ -12,13 +12,17 @@ ComfyUI Omniscience 是一个 ComfyUI 自定义节点扩展，会在 ComfyUI 网
 
 ## 使用截图
 
-<p align="center">
-  <img src="web/assets/screenshots/assistant.png" width="320" alt="ComfyUI Omniscience 助手对话">
-</p>
+**助手对话**
 
-| 新建节点任务 | 查看实时工作流 |
-| --- | --- |
-| <img src="web/assets/screenshots/new-task.png" width="100%" alt="新建 ComfyUI 节点项目对话框"> | <img src="web/assets/screenshots/workflow.png" width="100%" alt="ComfyUI 实时工作流 JSON 查看器"> |
+![ComfyUI Omniscience 助手对话](web/assets/screenshots/assistant.png)
+
+**新建节点任务**
+
+![新建 ComfyUI 节点项目对话框](web/assets/screenshots/new-task.png)
+
+**查看实时工作流**
+
+![ComfyUI 实时工作流 JSON 查看器](web/assets/screenshots/workflow.png)
 
 ## 功能
 

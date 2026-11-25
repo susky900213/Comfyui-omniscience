@@ -12,13 +12,17 @@ It runs entirely inside ComfyUI and does not require VS Code or a separate edito
 
 ## Screenshots
 
-<p align="center">
-  <img src="web/assets/screenshots/assistant.png" width="320" alt="ComfyUI Omniscience assistant chat">
-</p>
+**Assistant chat**
 
-| Create a task | Inspect the live workflow |
-| --- | --- |
-| <img src="web/assets/screenshots/new-task.png" width="100%" alt="New ComfyUI node project dialog"> | <img src="web/assets/screenshots/workflow.png" width="100%" alt="Live ComfyUI workflow JSON viewer"> |
+![ComfyUI Omniscience assistant chat](web/assets/screenshots/assistant.png)
+
+**Create a task**
+
+![New ComfyUI node project dialog](web/assets/screenshots/new-task.png)
+
+**Inspect the live workflow**
+
+![Live ComfyUI workflow JSON viewer](web/assets/screenshots/workflow.png)
 
 ## Features
 
