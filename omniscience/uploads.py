@@ -7,18 +7,24 @@ client-supplied name, so a crafted path cannot escape the workspace.
 from __future__ import annotations
 
 import base64
+import re
 from pathlib import PurePosixPath
 from typing import Any
 
 from .constants import MAX_WRITE_BYTES
+from .util import validate_windows_path_component
 from .workspace import Workspace
 
 
 def decode_upload(name: Any, content_base64: Any, *, max_bytes: int = MAX_WRITE_BYTES) -> tuple[str, bytes]:
     """Validate a client upload and return its safe basename plus decoded bytes."""
-    filename = PurePosixPath(str(name or "").replace("\\", "/")).name
+    raw_name = str(name or "")
+    if raw_name.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw_name):
+        raise ValueError("上传文件名不能是绝对路径或 Windows 盘符路径。")
+    filename = PurePosixPath(raw_name.replace("\\", "/")).name
     if not filename or filename.startswith("."):
         raise ValueError("文件名无效。")
+    validate_windows_path_component(filename, "文件名")
     encoded = str(content_base64 or "")
     if len(encoded) > (max_bytes + 4) // 3 * 4 + 1024:
         raise ValueError(f"上传文件超过 {max_bytes} 字节限制。")

@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Any
 
 from ..constants import MAX_CUSTOM_NODE_PROJECTS, WORKFLOW_FILENAME
-from ..util import ProjectFolderExistsError, default_workspace, project_folder_name, write_workflow_if_missing
+from ..util import (
+    ProjectFolderExistsError,
+    create_filesystem_link,
+    default_workspace,
+    is_filesystem_link,
+    project_folder_name,
+    remove_filesystem_link,
+    write_workflow_if_missing,
+)
 from ..workspace import Workspace
 
 CUSTOM_NODES_SOURCE = "comfyui_custom_nodes"
@@ -34,7 +42,7 @@ class ProjectProvisioningMixin:
     def _ensure_comfyui_link(self, project: Path | str, folder_name: str) -> tuple[str, bool]:
         """Ensure a project is available from ComfyUI's custom_nodes directory.
 
-        The boolean reports whether this call created the symlink.  Keeping it
+        The boolean reports whether this call created the link.  Keeping it
         separate lets task creation roll back only a link that it owns, while
         completion can safely repair a link that was removed after creation.
         """
@@ -43,18 +51,22 @@ class ProjectProvisioningMixin:
         if link is None:
             return "", False
 
-        if link.is_symlink() and link.resolve(strict=False) == project_path:
+        if is_filesystem_link(link) and link.resolve(strict=False) == project_path:
             return str(link), False
-        if link.exists() or link.is_symlink():
+        if link.exists() or is_filesystem_link(link):
             raise ProjectFolderExistsError(f"ComfyUI custom_nodes 中已存在：{link.name}。请换一个文件夹名称。")
         try:
-            link.symlink_to(project_path, target_is_directory=True)
-        except FileExistsError as exc:
+            create_filesystem_link(link, project_path, target_is_directory=True)
+        except (FileExistsError, OSError) as exc:
             # Another process may have created the correct link between the
-            # collision check and symlink creation. Never replace its target.
-            if link.is_symlink() and link.resolve(strict=False) == project_path:
+            # collision check and link creation. Never replace its target.
+            if is_filesystem_link(link) and link.resolve(strict=False) == project_path:
                 return str(link), False
-            raise ProjectFolderExistsError(f"ComfyUI custom_nodes 中已存在：{link.name}。请换一个文件夹名称。") from exc
+            if link.exists() or is_filesystem_link(link):
+                raise ProjectFolderExistsError(
+                    f"ComfyUI custom_nodes 中已存在：{link.name}。请换一个文件夹名称。"
+                ) from exc
+            raise
         return str(link), True
 
     def _ensure_task_comfyui_link(self, task_id: str) -> str:
@@ -97,8 +109,8 @@ class ProjectProvisioningMixin:
         folder_name = project_folder_name(folder) if folder is not None else f"task-{uuid.uuid4().hex[:12]}"
         project = root / folder_name
         link = self._comfyui_link_path(project, folder_name)
-        if link is not None and (link.exists() or link.is_symlink()):
-            if link.is_symlink():
+        if link is not None and (link.exists() or is_filesystem_link(link)):
+            if is_filesystem_link(link):
                 raise ProjectFolderExistsError(f"ComfyUI custom_nodes 中已存在：{folder_name}。请换一个文件夹名称。")
             raise ProjectFolderExistsError(
                 f"ComfyUI custom_nodes 中已有项目 {folder_name}。请在任务历史里点击它接管，或换一个文件夹名称。"
@@ -127,7 +139,7 @@ class ProjectProvisioningMixin:
         except Exception:
             if link_created:
                 try:
-                    Path(link_value).unlink()
+                    remove_filesystem_link(link_value)
                 except OSError:
                     pass
             # Do not leave an orphan directory if persistence fails before the
@@ -172,7 +184,7 @@ class ProjectProvisioningMixin:
             try:
                 if entry.name.startswith(".") or entry.name == "__pycache__" or not entry.is_dir():
                     continue
-                if entry.is_symlink():
+                if is_filesystem_link(entry):
                     continue
                 path = entry.resolve()
                 if path in registered:
@@ -206,8 +218,8 @@ class ProjectProvisioningMixin:
         if nodes is None:
             raise ValueError("请先在设置里填写 ComfyUI 目录，再接管 custom_nodes 中的项目。")
         project = nodes / name
-        if project.is_symlink():
-            raise ValueError(f"{name} 是指向工作区的软链接，对应任务已经在历史里。")
+        if is_filesystem_link(project):
+            raise ValueError(f"{name} 是指向工作区的软链接或目录 Junction，对应任务已经在历史里。")
         if not project.is_dir():
             raise ValueError(f"ComfyUI custom_nodes 中没有项目文件夹：{name}")
         return project.resolve()

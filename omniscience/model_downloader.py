@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import re
+import shutil
 import time
 from threading import Event
 from pathlib import Path
@@ -13,6 +15,7 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .region_router import RegionRouter
+from .util import create_filesystem_link, is_filesystem_link, validate_windows_path_component
 
 MAX_MODEL_BYTES = 50 * 1024 * 1024 * 1024
 MAX_TRANSIENT_RETRIES = 2
@@ -58,8 +61,18 @@ class ModelDownloader:
         category = str(category or "").strip()
         if not repo_id or "/" not in repo_id or any(part in {"", ".", ".."} for part in repo_id.split("/")):
             raise ModelDownloadError("Hugging Face repo_id 无效。")
+        try:
+            for component in repo_id.split("/"):
+                validate_windows_path_component(component, "Hugging Face 仓库名")
+        except ValueError as exc:
+            raise ModelDownloadError(str(exc)) from exc
         if not filename or filename.startswith("/") or ".." in Path(filename).parts:
             raise ModelDownloadError("模型文件名无效。")
+        try:
+            for component in filename.split("/"):
+                validate_windows_path_component(component, "模型文件名")
+        except ValueError as exc:
+            raise ModelDownloadError(str(exc)) from exc
         if category not in CATEGORIES:
             raise ModelDownloadError(f"不支持的模型目录类别：{category}")
         endpoint, decision = self.router.endpoint("huggingface")
@@ -232,6 +245,10 @@ class ModelDownloader:
         link_name = str(target_name or source.name).strip().replace("\\", "/")
         if not link_name or Path(link_name).name != link_name or ".." in Path(link_name).parts:
             raise ModelDownloadError("模型目标文件名无效。")
+        try:
+            validate_windows_path_component(link_name, "模型目标文件名")
+        except ValueError as exc:
+            raise ModelDownloadError(str(exc)) from exc
         destination_root = (
             Path(target_root).expanduser().resolve()
             if target_root is not None
@@ -239,14 +256,27 @@ class ModelDownloader:
         )
         destination_root.mkdir(parents=True, exist_ok=True)
         target = destination_root / link_name
-        if target.exists() or target.is_symlink():
-            if target.is_symlink() and target.resolve(strict=False) == source:
+        if target.exists() or is_filesystem_link(target):
+            if is_filesystem_link(target) and target.resolve(strict=False) == source:
                 return {"path": str(target), "created": False}
             if target.is_file() and self._sha256(target) == self._sha256(source):
                 return {"path": str(target), "created": False, "same_content": True}
             raise ModelDownloadError(f"模型目标已存在且内容不同，不覆盖：{target}")
-        target.symlink_to(source)
-        return {"path": str(target), "created": True}
+        try:
+            create_filesystem_link(target, source)
+            return {"path": str(target), "created": True}
+        except OSError as exc:
+            # Windows hard links cannot cross volumes. A copied model is still
+            # safer and more useful than failing an otherwise valid download;
+            # preserve the result shape and tell callers that it is independent.
+            if getattr(exc, "winerror", None) != 17 and getattr(exc, "errno", None) != errno.EXDEV:
+                raise
+            try:
+                shutil.copy2(source, target)
+            except OSError:
+                target.unlink(missing_ok=True)
+                raise
+            return {"path": str(target), "created": True, "link_type": "copy"}
 
     @staticmethod
     def _sha256(path: Path) -> str:

@@ -31,6 +31,7 @@ from .skill_security import (
     VERDICT_BY_TOP_SEVERITY,
     Rule,
 )
+from .util import is_filesystem_link
 
 ENGINE_VERSION = "node-security-v1"
 
@@ -442,14 +443,15 @@ def _collect(root: Path) -> tuple[list[tuple[str, Path]], list[Path], int, int, 
     skipped = 0
     truncated = False
     for current, directories, filenames in os.walk(str(root), followlinks=False):
+        base = Path(current)
         directories[:] = sorted(
             name
             for name in directories
             if not name.startswith(".")
             and name.lower() not in SKIP_DIR_NAMES
             and not name.lower().endswith("egg-info")
+            and not is_filesystem_link(base / name)
         )
-        base = Path(current)
         for name in sorted(filenames):
             discovered += 1
             if discovered > MAX_DISCOVERED_PATHS:
@@ -467,7 +469,7 @@ def _collect(root: Path) -> tuple[list[tuple[str, Path]], list[Path], int, int, 
             if suffix not in TEXT_SUFFIXES and lowered not in MANIFEST_NAMES:
                 continue
             try:
-                if path.is_symlink() or not path.is_file():
+                if is_filesystem_link(path) or not path.is_file():
                     continue
                 if path.stat().st_size > MAX_FILE_BYTES:
                     skipped += 1

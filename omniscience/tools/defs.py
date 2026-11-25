@@ -79,7 +79,9 @@ def build_command_definition(mode: str, max_timeout: int = 120) -> dict[str, Any
     return _function(
         "run_command",
         (
-            "Run a non-interactive shell command from the root of the task workspace using the POSIX shell "
+            "Run a non-interactive shell command from the root of the task workspace using the operating system's native command interpreter "
+            "(cmd.exe on Windows, /bin/sh or the configured SHELL on POSIX) "
+            "On Windows, cmd.exe syntax and PowerShell commands are supported when explicitly invoked; command-guard rejects destructive cmd/PowerShell operations such as recursive deletion, format, diskpart, and shutdown. "
             "(single command per call; chain with '&&' only when the steps must share state). "
             "Commands must be non-interactive: skip pagers and prompts with flags or env (git --no-pager, DEBIAN_FRONTEND=noninteractive, -y). "
             "Output beyond ~20k characters is middle-truncated (start and end preserved); filter output with grep/head/tail when you need specific sections. "

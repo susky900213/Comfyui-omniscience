@@ -133,7 +133,7 @@ class ModelSourceSearcher:
         # Hugging Face, but Bing can return unrelated local-language results
         # for a model filename.  The caller retries with this focused query
         # when no validated file URL was found.
-        query = f'site:huggingface.co "{basename}"' if huggingface_only else basename
+        query = f'{basename}' if huggingface_only else basename
         count = max(1, min(10, int(limit)))
         if region == "domestic":
             # ``first=1`` deliberately keeps this request on Bing's first page.
@@ -143,7 +143,7 @@ class ModelSourceSearcher:
 
     @staticmethod
     def _bing_search_url(region: str, basename: str, *, limit: int = MAX_MODEL_SOURCE_RESULTS) -> str:
-        query = f'site:huggingface.co "{basename}"'
+        query = f'{basename}'
         count = max(1, min(10, int(limit)))
         host = "cn.bing.com" if region == "domestic" else "www.bing.com"
         return "https://" + host + "/search?" + urlencode({"q": query, "count": count, "first": 1})

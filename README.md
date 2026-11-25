@@ -137,7 +137,7 @@ Settings are stored at:
 ~/.config/comfyui-omniscience/config.json
 ```
 
-The extension attempts to restrict this file to mode `0600`. API keys are not returned by the settings API. Local state, including task history and Skill data, is stored at `~/.local/share/comfyui-omniscience/` by default.
+On Windows, settings use `%APPDATA%\\comfyui-omniscience\\config.json` and MCP settings use the same application-data directory; local state uses `%LOCALAPPDATA%\\comfyui-omniscience\\`. On POSIX, the paths above remain unchanged. The extension uses mode `0600` on POSIX and a non-inherited owner ACL through `icacls` on Windows. API keys are not returned by the settings API.
 
 ### Environment variables
 

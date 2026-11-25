@@ -1,0 +1,7 @@
+# Core runtime dependency. ComfyUI normally provides aiohttp in its own
+# Python environment, but it is listed here for standalone dependency setup.
+aiohttp>=3.9,<4.0
+
+# Optional browser automation support. Uncomment this line when browser tools
+# are enabled, then run: python -m playwright install chromium
+# playwright>=1.40,<2.0

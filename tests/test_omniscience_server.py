@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import asyncio
 import base64
+import errno
 import hashlib
 import contextlib
 import io
@@ -27,7 +28,7 @@ from omniscience_server import (
     apply_unified_patch,
 )
 from omniscience import access_tokens, archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
-from omniscience import model_downloader, model_source, node_search, workflow_diagnostics, workflow_executor, workflow_manager
+from omniscience import model_downloader, model_source, node_search, util, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience.workflow_manager_install import WorkflowInstallMixin
 from omniscience.tools.defs import global_chat_definitions
@@ -79,6 +80,129 @@ class WorkspaceTests(unittest.TestCase):
     def test_unified_patch_can_create_a_file(self):
         patch = "@@ -0,0 +1,2 @@\n" + "+first\n" + "+second\n"
         self.assertEqual(apply_unified_patch("", patch), "first\nsecond\n")
+
+
+class CrossPlatformLinkTests(unittest.TestCase):
+    def test_windows_directory_link_uses_mklink_junction(self):
+        with patch.object(util.os, "name", "nt"), patch.object(util, "_run_windows_mklink") as mklink:
+            util.create_filesystem_link(Path("link"), Path("target"), target_is_directory=True)
+
+        self.assertEqual([str(value) for value in mklink.call_args.args[:2]], ["link", "target"])
+        self.assertEqual(mklink.call_args.args[2], "/J")
+
+    def test_windows_file_link_uses_mklink_hard_link(self):
+        with patch.object(util.os, "name", "nt"), patch.object(util, "_run_windows_mklink") as mklink:
+            util.create_filesystem_link(Path("link"), Path("target"))
+
+        self.assertEqual([str(value) for value in mklink.call_args.args[:2]], ["link", "target"])
+        self.assertEqual(mklink.call_args.args[2], "/H")
+
+    def test_command_runner_uses_windows_command_interpreter(self):
+        from omniscience.tools.commands import CommandRunner
+
+        with patch("omniscience.tools.commands.os.name", "nt"), patch.dict(
+            "os.environ", {"COMSPEC": "C:\\Windows\\System32\\cmd.exe"}
+        ):
+            self.assertEqual(CommandRunner.shell_executable(), "C:\\Windows\\System32\\cmd.exe")
+
+    def test_windows_process_tree_termination_uses_taskkill(self):
+        from omniscience.tools.commands import CommandRunner
+
+        class Process:
+            pid = 321
+
+            def terminate(self):
+                self.terminated = True
+
+        process = Process()
+        with patch("omniscience.tools.commands.os.name", "nt"), patch(
+            "omniscience.tools.commands.subprocess.run"
+        ) as run:
+            CommandRunner.terminate_process_tree(process)
+
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "321", "/T", "/F"], capture_output=True, check=False
+        )
+
+    def test_windows_default_directories_use_appdata(self):
+        from omniscience import paths
+        from pathlib import PureWindowsPath
+
+        with patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": r"C:\\Users\\alice\\AppData\\Local",
+                "APPDATA": r"C:\\Users\\alice\\AppData\\Roaming",
+                "USERPROFILE": r"C:\\Users\\alice",
+            },
+            clear=False,
+        ):
+            state, legacy, mcp, config = paths._default_platform_directories("nt", PureWindowsPath)
+
+        self.assertEqual(str(state), r"C:\Users\alice\AppData\Local\comfyui-omniscience")
+        self.assertEqual(str(mcp), r"C:\Users\alice\AppData\Roaming\comfyui-omniscience\mcp_settings.json")
+        self.assertEqual(str(config), r"C:\Users\alice\AppData\Roaming\comfyui-omniscience\config.json")
+        self.assertNotEqual(state, legacy)
+
+    def test_windows_secret_file_permissions_use_icacls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text("{}", encoding="utf-8")
+            with patch.object(util.os, "name", "nt"), patch.dict(
+                os.environ, {"USERDOMAIN": "DOMAIN", "USERNAME": "omniscience"}, clear=False
+            ), patch.object(util.subprocess, "run") as run:
+                util.secure_file_permissions(path)
+
+        run.assert_called_once_with(
+            ["icacls", str(path).replace("/", "\\"), "/inheritance:r", "/grant:r", "DOMAIN\\omniscience:F"],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+
+
+class WindowsPathValidationTests(unittest.TestCase):
+    def test_workspace_rejects_windows_absolute_drive_relative_and_ntfs_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Workspace(directory)
+            for value in ("C:foo.txt", r"C:\\foo.txt", r"\\\\server\\share\\file.txt", "note.txt:secret"):
+                with self.assertRaises(ValueError, msg=value):
+                    workspace.resolve(value)
+
+    def test_shared_filename_validation_rejects_reserved_and_ambiguous_names(self):
+        for value in ("CON", "con.txt", "LPT1.log", "name.", "name ", "report:secret"):
+            with self.assertRaises(ValueError, msg=value):
+                util.validate_windows_path_component(value)
+
+    def test_upload_and_archive_validation_share_windows_rules(self):
+        from omniscience import uploads
+
+        content = base64.b64encode(b"x").decode()
+        for name in ("CON.txt", "report.txt:secret", "file.", r"C:\\file.txt"):
+            with self.assertRaises(ValueError, msg=name):
+                uploads.decode_upload(name, content)
+        for name in ("CON.txt", "report.txt:secret", "file.", "folder\\name "):
+            with self.assertRaises(archives.ArchiveError, msg=name):
+                archives._relative_path(name)
+
+
+class WindowsCommandGuardTests(unittest.TestCase):
+    def test_windows_mutating_commands_are_guarded(self):
+        from omniscience.tools import guards
+
+        blocked = (
+            r"cmd.exe /c del /s /q C:\\work\\file.txt",
+            r"powershell -NoProfile -Command \"Remove-Item -Recurse -Force file.txt\"",
+            "format C:",
+            "rmdir /s /q folder",
+        )
+        for command in blocked:
+            self.assertIsNotNone(guards.guard_error(command, "act"), command)
+        self.assertIsNone(guards.guard_error("cmd.exe /c echo ok", "act"))
+        self.assertIsNone(guards.guard_error("echo del /s /q", "plan"))
+        self.assertIsNone(guards.guard_error(r"echo ok > %TEMP%\\probe.txt", "plan"))
+        self.assertIsNotNone(guards.guard_error(r"echo ok > C:\\work\\probe.txt", "plan"))
 
 
 class AccessTokenTests(unittest.TestCase):
@@ -1458,6 +1582,19 @@ class NodeArchiveSafetyTests(unittest.TestCase):
             archives.extract(self._tar({"Demo/__init__.py": "x"}, symlink_to="/etc/passwd"), self.root / "out3")
         self.assertIn("非常规文件", str(caught.exception))
         self.assertFalse((self.root / "out2" / "Demo" / "evil").exists())
+
+    def test_existing_parent_symlink_is_not_followed_during_extract(self):
+        destination = self.root / "out-parent-link"
+        destination.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            (destination / "Demo").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks are not available in this environment")
+        with self.assertRaises(ValueError):
+            archives.extract(self._zip({"Demo/evil.py": "outside"}), destination)
+        self.assertFalse((outside / "evil.py").exists())
 
     def test_file_count_and_uncompressed_size_are_capped(self):
         with patch("omniscience.archives.MAX_NODE_PACKAGE_FILES", 1):
@@ -6084,6 +6221,30 @@ class ModelDownloaderTests(unittest.TestCase):
             self.assertEqual(target.resolve(), source.resolve())
             self.assertFalse((legacy / "vae" / source.name).exists())
 
+    def test_cross_volume_hard_link_falls_back_to_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cache" / "model.safetensors"
+            target_root = root / "registered" / "vae"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"model")
+            with patch.object(
+                model_downloader,
+                "create_filesystem_link",
+                side_effect=OSError(errno.EXDEV, "different volume"),
+            ):
+                result = model_downloader.ModelDownloader({}).link_to_comfyui(
+                    source,
+                    category="vae",
+                    models_root=root / "ComfyUI" / "models",
+                    target_root=target_root,
+                )
+
+            target = target_root / source.name
+            self.assertEqual(result["link_type"], "copy")
+            self.assertEqual(target.read_bytes(), b"model")
+            self.assertFalse(target.is_symlink())
+
     def test_direct_download_resumes_partial_file_with_range_request(self):
         import hashlib
         from types import SimpleNamespace
@@ -6587,7 +6748,18 @@ class SkillReviewSettingsTests(unittest.TestCase):
 
 class PersistentCoreTests(unittest.TestCase):
     def test_project_folder_name_rejects_traversal(self):
-        for value in ("", ".", "..", "../outside", "nested/project", "/tmp/project", "project\\child"):
+        for value in (
+            "",
+            ".",
+            "..",
+            "../outside",
+            "nested/project",
+            "/tmp/project",
+            "project\\child",
+            "CON",
+            "project.",
+            "project ",
+        ):
             with self.assertRaises(ValueError):
                 _project_folder_name(value)
 
@@ -6675,10 +6847,10 @@ class PersistentCoreTests(unittest.TestCase):
                 link = comfyui / "custom_nodes" / "linked-project"
 
                 self.assertTrue(project.is_dir())
-                self.assertTrue(link.is_symlink())
+                self.assertTrue(util.is_filesystem_link(link))
                 self.assertEqual(link.resolve(), project.resolve())
                 metadata_link = Path(task["metadata"]["comfyui_link"])
-                self.assertTrue(metadata_link.is_symlink())
+                self.assertTrue(util.is_filesystem_link(metadata_link))
                 self.assertEqual(metadata_link.resolve(), project.resolve())
             finally:
                 paths.TASK_DATABASE = old_database
@@ -7328,6 +7500,23 @@ class PersistentCoreTests(unittest.TestCase):
             manager.restore("task", root, backend, reference)
             self.assertEqual(file_path.read_text(encoding="utf-8"), "before\n")
 
+    def test_snapshot_skips_directory_junctions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            (root / "ordinary.txt").write_text("keep", encoding="utf-8")
+            (root / "junction").mkdir()
+            manager = CheckpointManager(Path(directory) / "state")
+            with patch(
+                "omniscience.checkpointing.is_directory_junction",
+                side_effect=lambda path: path.name == "junction",
+            ):
+                _, reference = manager._snapshot_checkpoint("task", root)
+
+            snapshot = Path(directory) / "state" / "snapshots" / "task" / reference
+            self.assertTrue((snapshot / "ordinary.txt").is_file())
+            self.assertFalse((snapshot / "junction").exists())
+
 
 class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
     """custom_nodes folders join the task history; symlinks stay invisible."""
@@ -7392,7 +7581,7 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
             project = workspace / "delete-me"
             link = nodes / "delete-me"
             self.assertTrue(project.is_dir())
-            self.assertTrue(link.is_symlink())
+            self.assertTrue(util.is_filesystem_link(link))
             agent.store.append_message(task["id"], {"role": "user", "content": "keep project"})
 
             result = agent.delete_task(task["id"])

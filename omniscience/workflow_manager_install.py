@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .workflow_parser import inspect_workflow, load_workflow
+from .util import is_filesystem_link, secure_file_permissions
 
 
 class WorkflowInstallMixin:
@@ -21,10 +22,10 @@ class WorkflowInstallMixin:
             raise ValueError("目前只支持安装 JSON 格式的 ComfyUI 工作流。")
         workspace = self.chat_workspace()
         uploads_root = workspace.root / "uploads"
-        if uploads_root.is_symlink() or not uploads_root.is_dir():
+        if is_filesystem_link(uploads_root) or not uploads_root.is_dir():
             raise ValueError("全局工作区 uploads/ 目录无效。")
         raw_path = workspace.root.joinpath(*path.parts)
-        if raw_path.is_symlink() or not raw_path.is_file():
+        if is_filesystem_link(raw_path) or not raw_path.is_file():
             raise ValueError("上传的工作流文件不存在或不是普通文件。")
         uploaded = raw_path.resolve()
         try:
@@ -61,7 +62,7 @@ class WorkflowInstallMixin:
         except ValueError as exc:
             raise ValueError("ComfyUI 工作流目录不能位于 ComfyUI 目录之外。") from exc
         destination = workflow_directory / uploaded.name
-        if destination.exists() or destination.is_symlink():
+        if destination.exists() or is_filesystem_link(destination):
             raise ValueError(f"ComfyUI 工作流目录中已存在：{destination.name}。请换一个文件名。")
         try:
             file_descriptor = os.open(
@@ -73,9 +74,11 @@ class WorkflowInstallMixin:
                 output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
+            secure_file_permissions(destination)
         except FileExistsError as exc:
             raise ValueError(f"ComfyUI 工作流目录中已存在：{destination.name}。请换一个文件名。") from exc
         except OSError as exc:
+            destination.unlink(missing_ok=True)
             raise ValueError(f"无法写入 ComfyUI 工作流目录：{exc}") from exc
         workflow_job_id = ""
         candidate_id = ""

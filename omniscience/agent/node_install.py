@@ -38,7 +38,7 @@ from ..constants import (
     MAX_NODE_PACKAGE_FILES,
     MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES,
 )
-from ..util import ProjectFolderExistsError, project_folder_name
+from ..util import ProjectFolderExistsError, is_filesystem_link, project_folder_name
 from ..workspace import Workspace
 
 # GitHub hands the tarball to us through its own blob host, so redirects are
@@ -381,7 +381,7 @@ class NodeInstallerMixin:
         preferred = [nodes / project_folder_name(name) for name in names if name]
         candidates = preferred + [
             item for item in sorted(nodes.iterdir())
-            if item.is_dir() and not item.is_symlink() and item.name not in {"__pycache__", ".disabled"}
+            if item.is_dir() and not is_filesystem_link(item) and item.name not in {"__pycache__", ".disabled"}
         ]
         seen: set[Path] = set()
         for root in candidates:
@@ -430,7 +430,7 @@ class NodeInstallerMixin:
         }
 
     def _place_package(self, root: Path, target: Path, report: dict[str, Any]) -> int:
-        if target.exists() or target.is_symlink():
+        if target.exists() or is_filesystem_link(target):
             raise ProjectFolderExistsError(
                 f"ComfyUI custom_nodes 中已存在：{target.name}。已拒绝覆盖现有项目，请改名后再安装。"
             )
@@ -446,7 +446,7 @@ class NodeInstallerMixin:
         """Find the installable node directory inside a freshly unpacked package."""
         if not unpacked.is_dir():
             raise ValueError("压缩包解包后为空。")
-        entries = [item for item in sorted(unpacked.iterdir()) if not item.is_symlink()]
+        entries = [item for item in sorted(unpacked.iterdir()) if not is_filesystem_link(item)]
         root = unpacked
         if subdirectory:
             relative = PurePosixPath(subdirectory)
@@ -486,7 +486,7 @@ class NodeInstallerMixin:
         scanned_bytes = 0
         scanned_files = 0
         for path in sorted(root.rglob("*.py")):
-            if path.is_symlink() or not path.is_file():
+            if is_filesystem_link(path) or not path.is_file():
                 continue
             scanned_files += 1
             if scanned_files > 400:

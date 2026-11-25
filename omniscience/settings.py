@@ -16,6 +16,7 @@ from .util import (
     compaction_threshold_percent,
     default_workspace,
     max_context_tokens,
+    secure_file_permissions,
 )
 from .workspace import Workspace
 
@@ -186,10 +187,7 @@ class SettingsStore:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
+            secure_file_permissions(self.path)
         return self.public()
 
     def api_key(self) -> str:

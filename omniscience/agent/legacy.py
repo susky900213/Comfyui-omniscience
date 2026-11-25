@@ -31,7 +31,8 @@ from ..i18n import normalize_locale
 from ..prompts import COMPACTION_SYSTEM_PROMPT, SYSTEM_PROMPT, build_system_prompt
 from ..settings import SettingsStore
 from ..tools.defs import TOOL_DEFINITIONS
-from ..tools.guards import BLOCKED_COMMANDS
+from ..tools import guards
+from ..tools.commands import CommandRunner
 from ..util import (
     compaction_threshold_percent,
     default_workspace,
@@ -310,33 +311,49 @@ class ClineAgent:
         raise ValueError(f"Unknown assistant tool: {name}")
 
     @staticmethod
+    def _shell_executable() -> str:
+        """Return the native command interpreter used by the current OS."""
+
+        if os.name == "nt":
+            return os.environ.get("COMSPEC", "cmd.exe")
+        return os.environ.get("SHELL", "/bin/sh")
+
+    @staticmethod
     def _run_command(command: str, timeout: Any, workspace: Workspace) -> dict[str, Any]:
         if not command or len(command) > 2_000:
             raise ValueError("Command must be between 1 and 2,000 characters.")
-        if "\x00" in command or BLOCKED_COMMANDS.search(command):
-            raise ValueError("This command is blocked by the local safety policy.")
+        guard_message = guards.guard_error(command, "act")
+        if guard_message:
+            raise ValueError(guard_message)
         try:
             timeout_seconds = min(120, max(1, int(timeout)))
         except (TypeError, ValueError):
             timeout_seconds = 120
+        process = subprocess.Popen(
+            command,
+            cwd=workspace.root,
+            shell=True,  # noqa: S602 - command execution is bounded by local policy
+            executable=ClineAgent._shell_executable(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=(os.name != "nt"),
+            creationflags=CommandRunner.creation_flags(),
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=workspace.root,
-                shell=True,  # noqa: S602 - command execution is bounded by local policy
-                executable=os.environ.get("SHELL", "/bin/sh"),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            output = (completed.stdout + completed.stderr)[-MAX_COMMAND_OUTPUT:]
-            return {"exit_code": completed.returncode, "output": output}
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            return {"exit_code": process.returncode, "output": (stdout + stderr)[-MAX_COMMAND_OUTPUT:]}
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode(errors="replace")
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode(errors="replace")
-            return {"exit_code": None, "timed_out": True, "output": (stdout + stderr)[-MAX_COMMAND_OUTPUT:]}
+            CommandRunner.terminate_process_tree(process)
+            stdout, stderr = process.communicate()
+            partial_stdout = exc.stdout or stdout or ""
+            partial_stderr = exc.stderr or stderr or ""
+            if isinstance(partial_stdout, bytes):
+                partial_stdout = partial_stdout.decode(errors="replace")
+            if isinstance(partial_stderr, bytes):
+                partial_stderr = partial_stderr.decode(errors="replace")
+            return {
+                "exit_code": None,
+                "timed_out": True,
+                "output": (partial_stdout + partial_stderr)[-MAX_COMMAND_OUTPUT:],
+            }

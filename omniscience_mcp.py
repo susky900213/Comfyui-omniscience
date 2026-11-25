@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from .omniscience.util import secure_file_permissions
+except ImportError:
+    from omniscience.util import secure_file_permissions
+
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -103,10 +108,7 @@ class MCPManager:
             cleaned[str(name)] = value
         with self._lock:
             self.path.write_text(_json({"mcpServers": cleaned}), encoding="utf-8")
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
+            secure_file_permissions(self.path)
         self._stdio_tools.clear()
         self._tools_cache = None
         self._tools_cache_key = None

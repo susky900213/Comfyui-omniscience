@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .util import is_directory_junction, is_filesystem_link, remove_filesystem_link
+
 
 class CheckpointManager:
     """Shadow-Git checkpoints with a filesystem snapshot fallback."""
@@ -66,11 +68,23 @@ class CheckpointManager:
         snapshot_root.mkdir(parents=True, exist_ok=True)
         reference = uuid.uuid4().hex
         destination = snapshot_root / reference
+
+        def ignore_snapshot_entries(source: str, names: list[str]) -> set[str]:
+            ignored = {name for name in names if name in {".git", "__pycache__", ".omniscience-checkpoints"}}
+            for name in names:
+                candidate = Path(source) / name
+                if is_directory_junction(candidate):
+                    # Junctions are not reliably represented as symlinks by
+                    # shutil on Windows. Skipping them prevents copytree from
+                    # traversing into a linked directory outside the project.
+                    ignored.add(name)
+            return ignored
+
         shutil.copytree(
             root,
             destination,
             symlinks=True,
-            ignore=shutil.ignore_patterns(".git", "__pycache__", ".omniscience-checkpoints"),
+            ignore=ignore_snapshot_entries,
         )
         return "snapshot", reference
 
@@ -100,8 +114,11 @@ class CheckpointManager:
         for relative in tracked:
             if relative and relative not in target_set:
                 path = root / relative
-                if path.is_file() or path.is_symlink():
-                    path.unlink(missing_ok=True)
+                if path.is_file() or is_filesystem_link(path):
+                    if is_filesystem_link(path):
+                        remove_filesystem_link(path)
+                    else:
+                        path.unlink(missing_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as temporary:
             archive_path = Path(temporary.name)
         try:
@@ -112,15 +129,37 @@ class CheckpointManager:
             archive_path.unlink(missing_ok=True)
 
     def _restore_snapshot(self, root: Path, snapshot: Path) -> None:
-        snapshot_files = {path.relative_to(snapshot) for path in snapshot.rglob("*")}
-        for path in sorted(root.rglob("*"), key=lambda value: len(value.parts), reverse=True):
+        def walk_tree(start: Path) -> list[Path]:
+            found: list[Path] = []
+            try:
+                entries = list(start.iterdir())
+            except OSError:
+                return found
+            for entry in entries:
+                found.append(entry)
+                if entry.is_dir() and not is_filesystem_link(entry):
+                    found.extend(walk_tree(entry))
+            return found
+
+        snapshot_files = {path.relative_to(snapshot) for path in walk_tree(snapshot)}
+        root_entries = walk_tree(root)
+        # Remove every existing link before copytree. A Junction may occupy a
+        # path that is a normal directory in the snapshot; leaving it in place
+        # would make dirs_exist_ok follow the Junction and write outside root.
+        for path in root_entries:
+            if is_filesystem_link(path):
+                remove_filesystem_link(path)
+        for path in sorted(walk_tree(root), key=lambda value: len(value.parts), reverse=True):
             if ".git" in path.relative_to(root).parts:
                 continue
             if path.relative_to(root) not in snapshot_files:
-                if path.is_dir() and not path.is_symlink():
+                if path.is_dir() and not is_filesystem_link(path):
                     shutil.rmtree(path, ignore_errors=True)
                 else:
-                    path.unlink(missing_ok=True)
+                    if is_filesystem_link(path):
+                        remove_filesystem_link(path)
+                    else:
+                        path.unlink(missing_ok=True)
         shutil.copytree(snapshot, root, symlinks=True, dirs_exist_ok=True)
 
     def restore(self, task_id: str, root: Path, backend: str, reference: str) -> None:

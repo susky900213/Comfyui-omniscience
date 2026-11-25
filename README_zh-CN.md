@@ -64,7 +64,7 @@ cp -R Comfyui-omniscience /path/to/ComfyUI/custom_nodes/
 在 ComfyUI 实际使用的 Python 环境中安装 Playwright，然后安装 Chromium：
 
 ```bash
-/path/to/ComfyUI/.venv/bin/python -m pip install playwright
+/path/to/ComfyUI/.venv/bin/python -m pip install playwright -i https://mirrors.aliyun.com/pypi/simple/
 /path/to/ComfyUI/.venv/bin/python -m playwright install chromium
 ```
 
@@ -137,7 +137,7 @@ cp -R Comfyui-omniscience /path/to/ComfyUI/custom_nodes/
 ~/.config/comfyui-omniscience/config.json
 ```
 
-扩展会尝试把该文件权限限制为 `0600`。设置接口不会返回 API Key。任务历史和 Skill 等本地数据默认保存在 `~/.local/share/comfyui-omniscience/`。
+在 Windows 上，配置使用 `%APPDATA%\\comfyui-omniscience\\config.json`，MCP 配置使用同一应用数据目录；任务历史和 Skill 等本地数据使用 `%LOCALAPPDATA%\\comfyui-omniscience\\`。POSIX 路径保持不变。扩展在 POSIX 上使用 `0600`，在 Windows 上通过 `icacls` 移除继承权限并限制到当前账户。设置接口不会返回 API Key。
 
 ### 环境变量
 

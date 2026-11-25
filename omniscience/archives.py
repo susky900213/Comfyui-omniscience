@@ -20,6 +20,7 @@ from .constants import (
     MAX_NODE_PACKAGE_FILES,
     MAX_NODE_PACKAGE_UNCOMPRESSED_BYTES,
 )
+from .util import is_filesystem_link, validate_windows_path_component
 
 ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 # Resource forks and VCS metadata are never part of an installed node.
@@ -45,6 +46,11 @@ def _relative_path(name: Any) -> PurePosixPath | None:
         return None
     if value.startswith("/") or ":" in parts[0] or ".." in parts:
         raise ArchiveError(f"压缩包中的路径尝试逃出安装目录：{value}")
+    try:
+        for part in parts:
+            validate_windows_path_component(part, "压缩包文件名")
+    except ValueError as exc:
+        raise ArchiveError(f"压缩包中存在 Windows 不支持的文件名：{value}") from exc
     if any(part.lower() in IGNORED_ENTRIES for part in parts):
         return None
     return PurePosixPath(*parts)
@@ -72,8 +78,11 @@ class _Budget:
 
 def _target(root: Path, relative: PurePosixPath) -> Path:
     target = root.joinpath(*relative.parts)
-    if target.is_symlink():
-        raise ArchiveError(f"拒绝写入已存在的符号链接：{relative}")
+    current = root
+    for part in relative.parts:
+        current /= part
+        if is_filesystem_link(current):
+            raise ArchiveError(f"拒绝写入已存在的文件链接：{relative}")
     return target
 
 

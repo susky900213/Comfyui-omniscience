@@ -47,8 +47,10 @@ from ..util import (
     TaskCancelled,
     compaction_threshold_percent,
     default_workspace,
+    is_filesystem_link,
     json_text,
     max_context_tokens,
+    remove_filesystem_link,
 )
 from ..workspace import Workspace
 from .legacy import ClineAgent
@@ -132,11 +134,11 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             link = Path(link_value).expanduser()
             workspace = Path(str(task.get("workspace") or "")).expanduser()
             try:
-                owns_link = link.is_symlink() and link.resolve(strict=False) == workspace.resolve()
+                owns_link = is_filesystem_link(link) and link.resolve(strict=False) == workspace.resolve()
             except OSError:
                 owns_link = False
             if owns_link:
-                link.unlink()
+                remove_filesystem_link(link)
         if not self.store.delete_task(task_id):
             raise ValueError("任务不存在。")
         self._context_cache.pop(task_id, None)
