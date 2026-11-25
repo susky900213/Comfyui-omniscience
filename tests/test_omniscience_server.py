@@ -8444,6 +8444,31 @@ class WebRegressionTests(unittest.TestCase):
         self.assertIn("requestProjectFolder()", send_message)
         self.assertIn('/messages', send_message)
 
+    def test_completed_agent_message_is_the_only_green_chat_bubble(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")
+        style = (root / "web" / "omniscience.css").read_text(encoding="utf-8")
+
+        render_start = source.index("function completedAssistantMessageIndex(messages)")
+        render_end = source.index("function renderMessages()", render_start)
+        completion = source[render_start:render_end]
+        self.assertIn("if (displayedBusy() || !messages.length) return -1;", completion)
+        self.assertIn('lastMessage?.role !== "assistant"', completion)
+        self.assertIn("lastMessage.tool_calls?.length", completion)
+        self.assertIn('return outcome === "completed" ? lastIndex : -1;', completion)
+
+        messages_start = source.index("function renderMessages()")
+        messages_end = source.index("function nodeScanStateKey", messages_start)
+        messages = source[messages_start:messages_end]
+        self.assertIn('const completed = index === completedIndex ? " completed" : "";', messages)
+        self.assertIn('`omniscience-message ${role}${completed}`', messages)
+        self.assertIn("messages.forEach((message, index)", messages)
+
+        self.assertIn('state.lastTaskOutcome = "completed"', source)
+        self.assertIn('state.lastGlobalOutcome = "completed"', source)
+        self.assertIn(".omniscience-message.assistant.completed", style)
+        self.assertIn("background: #21382f", style)
+
     def test_failed_workflow_card_offers_ai_repair_without_automatic_action(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "web" / "omniscience.js").read_text(encoding="utf-8")

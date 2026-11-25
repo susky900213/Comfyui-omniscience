@@ -234,6 +234,8 @@ body > #comfyui-omniscience-launcher {
 .omniscience-message.user { background: #302b4f; }
 .omniscience-message.assistant { background: #292832; }
 .omniscience-message.tool { background: #242630; }
+.omniscience-message.assistant.completed { border: 1px solid #4d9b79; color: #e1f5e8; background: #21382f; box-shadow: 0 0 0 1px #315d48; }
+.omniscience-message.assistant.completed .omniscience-message-role { color: #9be0b7; }
 .omniscience-message-role { margin-bottom: 5px; color: #a99bf2; font-weight: 600; }
 .omniscience-tool-calls { margin-top: 8px; color: #aaa5b8; font-size: 11px; }
 .omniscience-workflow-install-card { margin-top: 4px; border: 1px solid #4c6f5b; border-radius: 8px; padding: 10px; color: #dcefe3; background: #202d27; }

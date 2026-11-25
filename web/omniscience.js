@@ -6,6 +6,7 @@ const STYLE_ID = "comfyui-omniscience-style";
 const PANEL_ID = "comfyui-omniscience-panel";
 const LAUNCHER_ID = "comfyui-omniscience-launcher";
 const WORKFLOW_INSPECTION_VERSION = 6;
+const TERMINAL_FAILURES = new Set(["failed", "cancelled"]);
 
 const state = {
   locale: normalizeLocale(navigator.languages?.[0] || navigator.language),
@@ -44,6 +45,8 @@ const state = {
   cursor: -1,
   view: "chat",
   busy: false,
+  lastTaskOutcome: "",
+  lastGlobalOutcome: "",
   cancelling: false,
   error: "",
   polling: false,
@@ -650,7 +653,7 @@ function ensureStyle() {
     link.rel = "stylesheet";
   }
   const stylesheetUrl = new URL("./omniscience.css", import.meta.url);
-  stylesheetUrl.searchParams.set("v", "launcher-layer-3");
+  stylesheetUrl.searchParams.set("v", "launcher-layer-4");
   if (link.href !== stylesheetUrl.href) link.href = stylesheetUrl.href;
   if (!link.isConnected) document.head.appendChild(link);
 }
@@ -2387,6 +2390,26 @@ function toolResultView(content) {
   return details;
 }
 
+function completedAssistantMessageIndex(messages) {
+  if (displayedBusy() || !messages.length) return -1;
+  const lastIndex = messages.length - 1;
+  const lastMessage = messages[lastIndex];
+  if (lastMessage?.role !== "assistant" || lastMessage.tool_calls?.length) return -1;
+  if (!state.globalChatActive && ["running", "waiting_approval"].includes(state.task?.status)) return -1;
+  const outcome = state.globalChatActive ? state.lastGlobalOutcome : state.lastTaskOutcome;
+  if (TERMINAL_FAILURES.has(outcome)) return -1;
+  return outcome === "completed" ? lastIndex : -1;
+}
+
+function restoreCompletedTaskOutcome() {
+  if (state.busy || ["running", "waiting_approval"].includes(state.task?.status)) return;
+  if (TERMINAL_FAILURES.has(state.lastTaskOutcome)) return;
+  const lastMessage = state.messages.at(-1);
+  if (lastMessage?.role === "assistant" && !lastMessage.tool_calls?.length) {
+    state.lastTaskOutcome = "completed";
+  }
+}
+
 function renderMessages() {
   const log = document.querySelector(`#${PANEL_ID} .omniscience-messages`);
   if (!log) return;
@@ -2402,6 +2425,7 @@ function renderMessages() {
     log.appendChild(welcome);
   }
   const toolNames = new Map();
+  const completedIndex = completedAssistantMessageIndex(messages);
   for (const message of messages) {
     for (const call of message.tool_calls || []) {
       const callId = String(call.id || "").trim();
@@ -2409,9 +2433,10 @@ function renderMessages() {
       if (callId && name) toolNames.set(callId, name);
     }
   }
-  for (const message of messages) {
+  messages.forEach((message, index) => {
     const role = message.role || "assistant";
-    const article = el("article", `omniscience-message ${role}`);
+    const completed = index === completedIndex ? " completed" : "";
+    const article = el("article", `omniscience-message ${role}${completed}`);
     article.appendChild(el("div", "omniscience-message-role", role === "user" ? "你" : role === "assistant" ? "Omniscience" : "工具结果"));
     const content = el("div", "omniscience-message-content");
     const toolName = role === "tool" ? toolNames.get(String(message.tool_call_id || "")) : "";
@@ -2426,7 +2451,7 @@ function renderMessages() {
       article.appendChild(el("div", "omniscience-tool-calls", `工具调用：${message.tool_calls.map((call) => call.function?.name || "未知工具").join("、")}`));
     }
     log.appendChild(article);
-  }
+  });
   if (state.error) log.appendChild(el("div", "omniscience-error", state.error));
   if (displayedBusy() || (!state.globalChatActive && state.task?.status === "running")) log.appendChild(el("div", "omniscience-status", "Omniscience 正在思考或执行…"));
   if (shouldFollow) log.scrollTop = log.scrollHeight;
@@ -3176,6 +3201,10 @@ async function loadGlobalChat() {
   const result = await request("/omniscience/global-chat");
   state.globalMessages = result.messages || [];
   state.globalNetworkEnabled = !!result.network_enabled;
+  const lastMessage = state.globalMessages.at(-1);
+  state.lastGlobalOutcome = lastMessage?.role === "assistant" && !lastMessage.tool_calls?.length
+    ? "completed"
+    : "";
   return state.globalMessages;
 }
 
@@ -3207,10 +3236,22 @@ function applyEvents(events, { allowCanvasOpen = true } = {}) {
   for (const event of events) {
     state.cursor = Math.max(state.cursor, Number(event.seq ?? -1));
     const payload = event.payload || {};
-    if (event.kind === "task_started") state.busy = true;
-    if (event.kind === "task_finished" || event.kind === "task_failed" || event.kind === "task_cancelled") state.busy = false;
-    if (event.kind === "task_failed") state.error = payload.error || "任务执行失败。";
+    if (event.kind === "task_started") {
+      state.busy = true;
+      state.lastTaskOutcome = "running";
+    }
+    if (event.kind === "task_finished") {
+      state.busy = false;
+      state.lastTaskOutcome = "completed";
+    }
+    if (event.kind === "task_failed") {
+      state.busy = false;
+      state.lastTaskOutcome = "failed";
+      state.error = payload.error || "任务执行失败。";
+    }
     if (event.kind === "task_cancelled") {
+      state.busy = false;
+      state.lastTaskOutcome = "cancelled";
       state.error = "本次运行已被强制取消，可以继续提问。";
     }
     if (
@@ -3231,6 +3272,7 @@ async function loadTask(taskId, { resetSkills = true, openWorkflow = false } = {
   state.taskLoading = true;
   state.globalChatActive = false;
   state.globalBusy = false;
+  state.lastTaskOutcome = "";
   state.error = "";
   state.cursor = -1;
   state.context = [];
@@ -3260,6 +3302,7 @@ async function loadTask(taskId, { resetSkills = true, openWorkflow = false } = {
     const events = await request(`/omniscience/tasks/${encodeURIComponent(taskId)}/events?after=-1`);
     applyEvents(events.events || [], { allowCanvasOpen: false });
     state.busy = result.task.status === "running";
+    restoreCompletedTaskOutcome();
     loaded = true;
   } catch (error) {
     state.error = error.message;
@@ -3299,6 +3342,7 @@ async function refreshTask() {
   state.messages = result.messages || [];
   try { await loadSkills(); } catch (error) { console.warn("[Comfyui-omniscience] skill refresh failed", error); }
   state.busy = result.task.status === "running";
+  restoreCompletedTaskOutcome();
   try {
     await loadContextStats();
   } catch (error) {
@@ -3365,6 +3409,7 @@ async function clearHistory() {
     try {
       await request("/omniscience/global-chat/history", { method: "DELETE" });
       state.globalMessages = [];
+      state.lastGlobalOutcome = "";
       // Workflow candidate cards and AI repair progress are rendered from the
       // transcript, but their polling records live outside that array.  Drop
       // both projections as part of the same clear operation so an in-flight
@@ -3391,6 +3436,7 @@ async function clearHistory() {
     await request(`/omniscience/tasks/${encodeURIComponent(taskId)}/history`, { method: "DELETE" });
     state.messages = [];
     state.cursor = -1;
+    state.lastTaskOutcome = "";
     state.error = "当前项目的历史对话已清理。";
     try {
       await loadContextStats();
@@ -3432,6 +3478,7 @@ async function sendMessage() {
       state.skillMenuIndex = 0;
       resetFileMenu();
       state.globalBusy = true;
+      state.lastGlobalOutcome = "running";
       renderPanel();
       const result = await request("/omniscience/global-chat/messages", {
         method: "POST",
@@ -3444,6 +3491,7 @@ async function sendMessage() {
         }),
       });
       state.globalMessages = result.messages || [...state.globalMessages, result.message].filter(Boolean);
+      state.lastGlobalOutcome = "completed";
       try {
         await loadSkills();
         const newlyInstalled = state.skills
@@ -3475,6 +3523,7 @@ async function sendMessage() {
     input.value = "";
     state.composerDraft = "";
     state.busy = true;
+    state.lastTaskOutcome = "running";
     renderPanel();
     // POST /messages only accepts the turn (202); progress arrives via pollEvents.
     await request(`/omniscience/tasks/${encodeURIComponent(currentTaskId())}/messages`, {
@@ -3486,6 +3535,8 @@ async function sendMessage() {
   } catch (error) {
     state.error = error.message;
     state.busy = false;
+    if (state.globalChatActive) state.lastGlobalOutcome = "failed";
+    else state.lastTaskOutcome = "failed";
   } finally {
     if (state.globalChatActive) state.globalBusy = false;
     renderPanel();
@@ -3501,6 +3552,7 @@ async function cancelTask() {
   try {
     state.task = await request(`/omniscience/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
     state.busy = false;
+    state.lastTaskOutcome = "cancelled";
     state.error = "本次运行已被强制取消，可以继续提问。";
     await loadTasks();
   } catch (error) {
