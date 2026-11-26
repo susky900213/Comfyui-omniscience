@@ -2631,7 +2631,7 @@ function nodeInstallControls() {
 
 async function deleteTask(task) {
   const folder = task.folder || task.title || "未命名项目";
-  if (!confirm(`确定删除任务节点“${folder}”？\n\n只删除任务记录、对话历史和由任务创建的软链接，不删除项目文件夹或源码。`)) return;
+  if (!confirm(`确定删除任务节点“${folder}”？\n\n将删除任务记录、对话历史、项目文件夹及其源码，并删除由任务创建的软链接。此操作不可恢复。`)) return;
   try {
     await request(`/omniscience/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" });
     if (state.task?.id === task.id) {
@@ -2690,7 +2690,7 @@ function taskNodeRow(task) {
   const remove = el("span", "omniscience-node-delete", "删除");
   remove.setAttribute("role", "button");
   remove.tabIndex = 0;
-  remove.title = "删除任务记录；项目文件夹和源码会保留";
+  remove.title = "删除任务记录、项目文件夹、源码和由任务创建的软链接";
   const runDelete = (event) => {
     event.stopPropagation();
     deleteTask(task);

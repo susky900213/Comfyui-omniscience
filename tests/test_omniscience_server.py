@@ -7573,7 +7573,7 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(agent.store.list_tasks(None)), 1)
             self.assertEqual(agent.custom_node_projects(), [])
 
-    async def test_delete_task_removes_history_and_owned_link_but_keeps_project(self):
+    async def test_delete_task_removes_history_source_and_owned_link(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             agent, workspace, nodes = self._agent(root)
@@ -7582,6 +7582,7 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
             link = nodes / "delete-me"
             self.assertTrue(project.is_dir())
             self.assertTrue(util.is_filesystem_link(link))
+            (project / "source.py").write_text("NODE = 1", encoding="utf-8")
             agent.store.append_message(task["id"], {"role": "user", "content": "keep project"})
 
             result = agent.delete_task(task["id"])
@@ -7589,10 +7590,10 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["task_id"], task["id"])
             self.assertIsNone(agent.store.get_task(task["id"]))
             self.assertEqual(agent.store.messages(task["id"]), [])
-            self.assertTrue(project.is_dir())
+            self.assertFalse(project.exists())
             self.assertFalse(link.exists())
 
-    async def test_delete_adopted_node_keeps_external_project_and_route_confirms_missing(self):
+    async def test_delete_adopted_node_removes_external_project_and_route_confirms_missing(self):
         from omniscience.api import deps
 
         with tempfile.TemporaryDirectory() as directory:
@@ -7611,7 +7612,8 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
                     _FakeRequest(match_info={"task_id": task["id"]})
                 )
                 self.assertEqual(response.status, 200)
-                self.assertTrue(marker.is_file())
+                self.assertFalse(marker.exists())
+                self.assertFalse(project.exists())
                 self.assertIsNone(agent.store.get_task(task["id"]))
                 missing = await recorder.handlers[("DELETE", "/omniscience/tasks/{task_id}")](
                     _FakeRequest(match_info={"task_id": task["id"]})
@@ -7636,7 +7638,7 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
         style = (Path(__file__).resolve().parents[1] / "web" / "omniscience.css").read_text(encoding="utf-8")
         self.assertIn("async function deleteTask(task)", source)
         self.assertIn('method: "DELETE"', source)
-        self.assertIn("只删除任务记录、对话历史", source)
+        self.assertIn("项目文件夹及其源码", source)
         self.assertIn('el("span", "omniscience-node-delete", "删除")', source)
         self.assertIn("event.stopPropagation();", source)
         self.assertIn(".omniscience-node-delete", style)

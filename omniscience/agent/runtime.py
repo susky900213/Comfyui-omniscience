@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -124,27 +125,59 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
         return task
 
     def delete_task(self, task_id: str) -> dict[str, Any]:
-        """Remove task history and owned links without deleting project files."""
+        """Remove a task, its source directory, and its owned ComfyUI link."""
         task = self.task(task_id)
         if task_id in self._running_tasks or task.get("status") == "running":
             raise ValueError("任务正在运行，请先停止后再删除。")
         metadata = dict(task.get("metadata") or {})
+        project = self._task_project_path_for_deletion(task, metadata)
         link_value = str(metadata.get("comfyui_link") or "")
         if link_value:
             link = Path(link_value).expanduser()
-            workspace = Path(str(task.get("workspace") or "")).expanduser()
             try:
-                owns_link = is_filesystem_link(link) and link.resolve(strict=False) == workspace.resolve()
+                owns_link = is_filesystem_link(link) and link.resolve(strict=False) == project
             except OSError:
                 owns_link = False
             if owns_link:
                 remove_filesystem_link(link)
+        if project.exists():
+            if not project.is_dir():
+                raise ValueError(f"任务源码不是文件夹，拒绝删除：{project}")
+            shutil.rmtree(project)
         if not self.store.delete_task(task_id):
             raise ValueError("任务不存在。")
         self._context_cache.pop(task_id, None)
         self._task_locks.pop(task_id, None)
         self._cancel_requested.discard(task_id)
         return {"deleted": True, "task_id": task_id, "project_path": str(task.get("workspace") or "")}
+
+    def _task_project_path_for_deletion(
+        self, task: dict[str, Any], metadata: dict[str, Any]
+    ) -> Path:
+        """Validate the task-owned direct child before recursively deleting it."""
+        raw_project = Path(str(task.get("workspace") or "")).expanduser()
+        if not str(task.get("workspace") or "").strip():
+            raise ValueError("任务没有有效的源码目录，拒绝删除。")
+        if is_filesystem_link(raw_project):
+            raise ValueError(f"任务源码目录是软链接或目录 Junction，拒绝删除：{raw_project}")
+
+        folder_name = str(metadata.get("project_folder") or raw_project.name)
+        if not folder_name or Path(folder_name).name != folder_name:
+            raise ValueError("任务源码目录名称无效，拒绝删除。")
+        project = raw_project.resolve(strict=False)
+
+        recorded_root = str(metadata.get("workspace_root") or "").strip()
+        if recorded_root:
+            root = Path(recorded_root).expanduser().resolve()
+        else:
+            # Old task rows may not have metadata. Fall back only to the
+            # currently configured task workspace; never infer ownership from
+            # the project path itself.
+            configured = self.settings.load().get("workspace") or str(default_workspace())
+            root = Path(str(configured)).expanduser().resolve()
+        if project.parent != root or project.name != folder_name:
+            raise ValueError(f"任务源码目录不在其登记的项目根目录下，拒绝删除：{project}")
+        return project
 
     def _validated_skill_ids(self, skill_ids: Any) -> list[str]:
         """Validate message-selected IDs against the global enabled Skill library."""

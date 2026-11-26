@@ -310,7 +310,7 @@ class TaskStore:
 
 
     def delete_task(self, task_id: str) -> bool:
-        """Delete one task and its dependent history, never its project files."""
+        """Delete one task and its dependent persistent history."""
         with self._lock, self._connection() as connection:
             exists = connection.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if exists is None:
