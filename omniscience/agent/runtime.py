@@ -1,6 +1,6 @@
 """Persistent task runtime (DESIGN.md sections 4, 5 and 9).
 
-``PersistentClineAgent`` is the application boundary for the ComfyUI panel:
+``PersistentOmniscienceAgent`` is the application boundary for the ComfyUI panel:
 all task input, assistant output, tool results, and checkpoints are
 persisted. Tool calls execute directly through the policy layer; approval
 records are retained only for old databases and API compatibility.
@@ -54,7 +54,7 @@ from ..util import (
     remove_filesystem_link,
 )
 from ..workspace import Workspace
-from .legacy import ClineAgent
+from .legacy import OmniscienceAgent
 from .node_install import NodeInstallerMixin
 from .projects import ProjectProvisioningMixin
 from .tools_exec import TaskToolExecutionMixin
@@ -62,7 +62,7 @@ from .tools_exec import TaskToolExecutionMixin
 logger = logging.getLogger("Comfyui-omniscience")
 
 
-class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, NodeInstallerMixin):
+class PersistentOmniscienceAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, NodeInstallerMixin):
     """Task-oriented runtime used by the ComfyUI panel."""
 
     def __init__(self, settings: SettingsStore):
@@ -751,7 +751,7 @@ class PersistentClineAgent(ProjectProvisioningMixin, TaskToolExecutionMixin, Nod
             call_id = str(call.get("id") or f"omniscience-tool-{index}")
             name = str((call.get("function") or {}).get("name") or "unknown_tool")
             try:
-                name, arguments = ClineAgent._parse_tool_call(call)
+                name, arguments = OmniscienceAgent._parse_tool_call(call)
                 denial = policy.policy_error(mode, name, arguments)
                 if denial is not None:
                     tool_result = results.fail(name, denial)

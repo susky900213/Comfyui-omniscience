@@ -1,7 +1,7 @@
 """Comfyui-omniscience coding assistant extension for ComfyUI.
 
 The extension deliberately implements the assistant against ComfyUI's HTTP
-and frontend extension APIs instead of importing Cline's VS Code extension.
+and frontend extension APIs instead of importing Omniscience's VS Code extension.
 This keeps it installable as a normal custom node and avoids changing the
 ComfyUI core application.
 """

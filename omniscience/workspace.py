@@ -157,7 +157,7 @@ class Workspace:
         new_text: str | None = None,
         insert_line: int | None = None,
     ) -> str:
-        """Precise edit entry point (DESIGN 5.3 borrow #1, Cline `editor`).
+        """Precise edit entry point (DESIGN 5.3 borrow #1, Omniscience `editor`).
 
         Either replace a uniquely-occurring ``old_text`` with ``new_text``, or
         insert ``new_text`` at ``insert_line``.  A non-existent file is created
@@ -203,7 +203,7 @@ class Workspace:
 
 
 def apply_unified_patch(original: str, patch: str) -> str:
-    """Apply a small unified diff, including the common Cline patch wrapper."""
+    """Apply a small unified diff, including the common Omniscience patch wrapper."""
 
     raw_lines = str(patch).replace("\r\n", "\n").splitlines(keepends=True)
     lines = [line for line in raw_lines if not line.startswith(("*** Begin Patch", "*** End Patch"))]

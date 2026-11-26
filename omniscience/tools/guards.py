@@ -1,6 +1,6 @@
 """Command guard (DESIGN 5.4): prompt is the first line, this is the backstop.
 
-Ported from Cline's ``command-guard.ts`` three-step approach: mask quoted
+Ported from Omniscience's ``command-guard.ts`` three-step approach: mask quoted
 strings, heredoc bodies, escapes, and comments (to avoid false positives),
 split on shell separators, then inspect the leading word of every segment
 against write-operation sets.  This is deliberately a blacklist of common

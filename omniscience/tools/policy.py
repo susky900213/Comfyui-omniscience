@@ -3,7 +3,7 @@
 The interactive approval chain is deliberately not revived (README: Act mode
 executes directly); the safety boundary is the workspace sandbox plus this
 policy.  Plan mode keeps read-only investigation tools *and* run_command for
-inspection, while command-guard hard-blocks mutations -- matching Cline's
+inspection, while command-guard hard-blocks mutations -- matching Omniscience's
 behavior rather than the old PLAN_TOOL_NAMES hiding strategy.
 """
 

@@ -41,7 +41,7 @@ MINING_TERMS = (
 SECRET_MARKERS = (
     r"\.ssh/(id_[a-z0-9]+|config)|id_rsa|\bknown_hosts\b|\.aws/credentials|\.kube/config|"
     r"\.netrc|\.npmrc|\.env\b|_token\b|\bapi[_ -]?key\b|access[_ -]?token|secret[_ -]?key|\bsecrets?\b|"
-    r"(OPENAI|ANTHROPIC|CLINE|OMNISCIENCE|AWS|GITHUB|GITLAB|STRIPE|GOOGLE)[A-Z_]*KEY|"
+    r"(OPENAI|ANTHROPIC|OMNISCIENCE|OMNISCIENCE|AWS|GITHUB|GITLAB|STRIPE|GOOGLE)[A-Z_]*KEY|"
     r"keychain|1password|lastpass|browser cookies?|登录态|会话 ?cookie|钱包.*(助记词|私钥)|私钥|密钥|口令|密码"
 )
 

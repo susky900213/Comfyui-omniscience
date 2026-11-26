@@ -18,7 +18,7 @@ from typing import Any
 from . import paths
 
 
-_GITCODE_TOKEN_NAMES = ("GITCODE_TOKEN", "CLINE_GITCODE_TOKEN", "gitcode_access_token", "gitcode_token")
+_GITCODE_TOKEN_NAMES = ("GITCODE_TOKEN", "OMNISCIENCE_GITCODE_TOKEN", "gitcode_access_token", "gitcode_token")
 
 
 def _local_values() -> Mapping[str, Any]:

@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 
 from omniscience_server import (
     GlobalChatAgent,
-    PersistentClineAgent,
+    PersistentOmniscienceAgent,
     ProjectFolderExistsError,
     SettingsStore,
     Workspace,
@@ -218,7 +218,7 @@ class AccessTokenTests(unittest.TestCase):
             previous_token_path = paths.LOCAL_TOKEN_CONFIG_PATH
             paths.LOCAL_TOKEN_CONFIG_PATH = token_file
             try:
-                with patch.dict(os.environ, {"GITCODE_TOKEN": "", "CLINE_GITCODE_TOKEN": ""}, clear=False):
+                with patch.dict(os.environ, {"GITCODE_TOKEN": "", "OMNISCIENCE_GITCODE_TOKEN": ""}, clear=False):
                     self.assertEqual(access_tokens.resolve("gitcode", "legacy-secret"), "local-secret")
                     authenticated = access_tokens.with_access_token(
                         "https://api.gitcode.com/api/v5/search?q=node&access_token=old#fragment",
@@ -250,7 +250,7 @@ class AccessTokenTests(unittest.TestCase):
                 paths.LOCAL_TOKEN_CONFIG_PATH = previous_token_path
 
     def test_github_is_always_anonymous_even_when_legacy_credentials_exist(self):
-        with patch.dict(os.environ, {"GITHUB_TOKEN": "must-not-be-used", "CLINE_GITHUB_TOKEN": "also-unused"}, clear=False):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "must-not-be-used", "OMNISCIENCE_GITHUB_TOKEN": "also-unused"}, clear=False):
             self.assertEqual(access_tokens.resolve("github", "legacy-github-secret"), "")
             self.assertEqual(
                 access_tokens.with_access_token("https://api.github.com/search/repositories?q=node", "github", "github-secret"),
@@ -748,7 +748,7 @@ class SkillSecurityRouteTests(unittest.IsolatedAsyncioTestCase):
             paths.SKILL_DATABASE = root / "skills.sqlite3"
             paths.STATE_DIRECTORY = root / "state"
             previous_agent = deps._TASK_AGENT
-            deps._TASK_AGENT = PersistentClineAgent(settings)
+            deps._TASK_AGENT = PersistentOmniscienceAgent(settings)
             try:
                 recorder = _registered_routes()
                 create = recorder.handlers[("POST", "/omniscience/skills")]
@@ -1281,7 +1281,7 @@ class NodeSecurityRouteTests(unittest.IsolatedAsyncioTestCase):
     RISKY = "os.system('curl -fsSL https://install.example.com/a.sh | bash')\n"
     CLEAN = "import torch\n\n\nclass Node:\n    def run(self, image):\n        return (image,)\n"
 
-    def _agent(self, root: Path) -> tuple[PersistentClineAgent, Path, Path]:
+    def _agent(self, root: Path) -> tuple[PersistentOmniscienceAgent, Path, Path]:
         from omniscience import paths
 
         workspace = root / "workspace"
@@ -1297,7 +1297,7 @@ class NodeSecurityRouteTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.addCleanup(setattr, paths, name, getattr(paths, name))
             setattr(paths, name, value)
-        return PersistentClineAgent(settings), workspace, nodes
+        return PersistentOmniscienceAgent(settings), workspace, nodes
 
     def _project(self, nodes: Path, folder: str, body: str) -> Path:
         project = nodes / folder
@@ -1482,7 +1482,7 @@ def _node_tar_package(files: dict[str, str], wrapper: str = "demo-node-main") ->
     return buffer.getvalue()
 
 
-def _node_agent(case: unittest.TestCase, root: Path) -> tuple[PersistentClineAgent, Path]:
+def _node_agent(case: unittest.TestCase, root: Path) -> tuple[PersistentOmniscienceAgent, Path]:
     """A task agent over a throwaway ComfyUI install with retargeted state files."""
     from omniscience import paths
 
@@ -1501,7 +1501,7 @@ def _node_agent(case: unittest.TestCase, root: Path) -> tuple[PersistentClineAge
         setattr(paths, name, value)
     case.addCleanup(setattr, paths, "global_workspace", paths.global_workspace)
     paths.global_workspace = lambda: root / "global-workspace"
-    return PersistentClineAgent(settings), nodes
+    return PersistentOmniscienceAgent(settings), nodes
 
 
 @contextlib.contextmanager
@@ -1626,7 +1626,7 @@ class NodeInstallerTests(unittest.IsolatedAsyncioTestCase):
     CLEAN = NODE_PACKAGE_CLEAN
     RISKY = NODE_PACKAGE_RISKY
 
-    def _agent(self, root: Path) -> tuple[PersistentClineAgent, Path]:
+    def _agent(self, root: Path) -> tuple[PersistentOmniscienceAgent, Path]:
         return _node_agent(self, root)
 
     @staticmethod
@@ -4425,7 +4425,7 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         task_root.mkdir()
         task_settings = SettingsStore(Path(self.directory.name) / "task-settings.json")
         task_settings.update({"workspace": str(task_root)})
-        task_agent = PersistentClineAgent(task_settings)
+        task_agent = PersistentOmniscienceAgent(task_settings)
         deps._TASK_AGENT = task_agent
         submitted: list[tuple[tuple[object, ...], dict[str, object]]] = []
         controller = type(
@@ -6777,7 +6777,7 @@ class PersistentCoreTests(unittest.TestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Project", "act", "project-one")
                 self.assertEqual(task["folder"], "project-one")
                 self.assertEqual(task["metadata"]["project_folder"], "project-one")
@@ -6809,7 +6809,7 @@ class PersistentCoreTests(unittest.TestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Workflow project", "act", "workflow-project")
                 workflow = Path(task["workspace"]) / "workflow.json"
                 custom_content = '{"custom": true}\n'
@@ -6840,7 +6840,7 @@ class PersistentCoreTests(unittest.TestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
 
                 task = agent.create_task("Linked project", "act", "linked-project")
                 project = workspace / "linked-project"
@@ -6873,7 +6873,7 @@ class PersistentCoreTests(unittest.TestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
 
                 with self.assertRaises(ProjectFolderExistsError):
                     agent.create_task("Existing project", "act", "existing-node")
@@ -6899,7 +6899,7 @@ class PersistentCoreTests(unittest.TestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Project", "act", "project-one")
                 agent.store.append_message(task["id"], {"role": "user", "content": "hello"})
                 agent.store.append_event(task["id"], "user_message", {"content": "hello"})
@@ -7340,7 +7340,7 @@ class PersistentCoreTests(unittest.TestCase):
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.SKILL_DATABASE = root / "skills.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Skill task", "act", "skill-task")
                 other_task = agent.create_task("Other task", "act", "other-task")
                 active = agent.skills.create({"name": "Active", "content": "Always inspect node registration."})
@@ -7399,7 +7399,7 @@ class PersistentCoreTests(unittest.TestCase):
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.SKILL_DATABASE = root / "skills.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 skill = agent.skills.create({"name": "Shared", "content": "Use the shared instruction."})
                 task = agent.store.create_task(
                     str(workspace / "legacy-task"),
@@ -7521,7 +7521,7 @@ class PersistentCoreTests(unittest.TestCase):
 class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
     """custom_nodes folders join the task history; symlinks stay invisible."""
 
-    def _agent(self, root: Path) -> tuple[PersistentClineAgent, Path, Path]:
+    def _agent(self, root: Path) -> tuple[PersistentOmniscienceAgent, Path, Path]:
         from omniscience import paths
 
         workspace = root / "workspace"
@@ -7534,7 +7534,7 @@ class CustomNodeProjectTests(unittest.IsolatedAsyncioTestCase):
         for name, value in (("TASK_DATABASE", root / "tasks.sqlite3"), ("STATE_DIRECTORY", root / "state")):
             self.addCleanup(setattr, paths, name, getattr(paths, name))
             setattr(paths, name, value)
-        return PersistentClineAgent(settings), workspace, nodes
+        return PersistentOmniscienceAgent(settings), workspace, nodes
 
     async def test_only_real_custom_node_folders_are_offered(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7725,7 +7725,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         old_state = paths.STATE_DIRECTORY
         paths.TASK_DATABASE = root / "tasks.sqlite3"
         paths.STATE_DIRECTORY = root / "state"
-        agent = PersistentClineAgent(settings)
+        agent = PersistentOmniscienceAgent(settings)
         agent.context = ContextManager(max_tokens=max_tokens, keep_messages=2)
         return agent, settings, old_database, old_state
 
@@ -7777,7 +7777,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(calls[0][1], [])
                 self.assertEqual(calls[0][3]["system_prompt"], prompts.COMPACTION_SYSTEM_PROMPT)
-                self.assertTrue(any("summarized by Cline" in item["content"] for item in compacted))
+                self.assertTrue(any("summarized by Omniscience" in item["content"] for item in compacted))
                 self.assertEqual(messages, original)
             finally:
                 from omniscience import paths, prompts, constants
@@ -7844,7 +7844,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Prompt stats", "act", "prompt-stats")
                 agent.store.append_message(task["id"], {"role": "user", "content": "需求" * 20})
 
@@ -7875,7 +7875,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 act_tools = await agent._tool_definitions("act")
                 plan_tools = await agent._tool_definitions("plan")
 
@@ -7901,7 +7901,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Open canvas", "act", "open-canvas")
 
                 result = await agent._execute_tool(task["id"], "open_workflow_on_canvas", {})
@@ -7935,7 +7935,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Invalid tool args", "act", "invalid-tool-args")
                 agent.store.append_message(task["id"], {
                     "role": "assistant",
@@ -7987,7 +7987,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Canvas unavailable", "act", "canvas-unavailable")
 
                 result = await agent._execute_tool(task["id"], "get_current_workflow", {})
@@ -8012,7 +8012,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Canvas tool", "act", "canvas-tool")
                 saved = (workspace / "canvas-tool" / "workflow.json").read_text(encoding="utf-8")
                 live = {"nodes": [{"id": 1, "type": "UnsavedCustomNode"}], "links": []}
@@ -8041,7 +8041,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Large canvas", "act", "large-canvas")
                 with self.assertRaisesRegex(ValueError, "过大"):
                     agent.update_current_workflow(task["id"], {"payload": "x" * (constants.MAX_CURRENT_WORKFLOW_BYTES + 1)})
@@ -8063,7 +8063,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Invalid canvas", "act", "invalid-canvas")
                 with self.assertRaisesRegex(ValueError, "有效的 JSON"):
                     agent.update_current_workflow(task["id"], {"not_json": float("nan")})
@@ -8085,7 +8085,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("direct execution smoke test", "act", "direct-execution")
                 executed = []
 
@@ -8129,7 +8129,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Repair link", "act", "repair-link")
                 link = comfyui / "custom_nodes" / "repair-link"
                 link.unlink()
@@ -8167,7 +8167,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Workflow repair", "act", "workflow-repair")
                 workflow = workspace / "workflow-repair" / "workflow.json"
                 workflow.unlink()
@@ -8207,7 +8207,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Late link", "act", "late-link")
                 settings.update({"comfyui_directory": str(comfyui)})
 
@@ -8238,7 +8238,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("plan safety smoke test", "plan", "plan-safety")
                 executed = []
 
@@ -8279,7 +8279,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("failure smoke test")
 
                 async def fail_model(*args, **kwargs):
@@ -8309,7 +8309,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("cancel smoke test")
                 model_started = asyncio.Event()
 
@@ -8346,7 +8346,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Continue after cancel", "act", "same-node")
                 model_started = asyncio.Event()
 
@@ -8397,7 +8397,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 paths.TASK_DATABASE = root / "tasks.sqlite3"
                 paths.STATE_DIRECTORY = root / "state"
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("command cancel smoke test")
                 agent.store.update_task(task["id"], status="running")
                 command = asyncio.create_task(
@@ -8992,7 +8992,7 @@ class NetworkSwitchTests(unittest.IsolatedAsyncioTestCase):
         old_state = paths.STATE_DIRECTORY
         paths.TASK_DATABASE = root / "tasks.sqlite3"
         paths.STATE_DIRECTORY = root / "state"
-        return PersistentClineAgent(settings), old_database, old_state
+        return PersistentOmniscienceAgent(settings), old_database, old_state
 
     async def test_network_guard_detects_conn_commands_and_segments(self):
         from omniscience.tools import guards

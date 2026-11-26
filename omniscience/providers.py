@@ -1,4 +1,4 @@
-"""Built-in model provider presets for the Cline-style settings picker.
+"""Built-in model provider presets for the Omniscience-style settings picker.
 
 Providers are OpenAI-compatible endpoint presets. Selecting one only fills
 defaults (base URL and suggested models) into the flat ``api_base_url`` and

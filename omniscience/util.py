@@ -349,7 +349,7 @@ def write_workflow_if_missing(project: Path, project_name: str) -> tuple[Path, b
 
 
 def default_workspace() -> Path:
-    configured = paths.env("OMNISCIENCE_WORKSPACE", "CLINE_WORKSPACE")
+    configured = paths.env("OMNISCIENCE_WORKSPACE", "OMNISCIENCE_WORKSPACE")
     workspace = Path(configured).expanduser() if configured else paths.DEFAULT_WORKSPACE
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace.resolve()

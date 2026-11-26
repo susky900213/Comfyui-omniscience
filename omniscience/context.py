@@ -138,7 +138,7 @@ class ContextManager:
                 summary_parts.append(f"{role}: {content}")
         summary = {
             "role": "user",
-            "content": "[Earlier context compacted by Cline]\n" + "\n".join(summary_parts[-80:]),
+            "content": "[Earlier context compacted by Omniscience]\n" + "\n".join(summary_parts[-80:]),
         }
         compacted = head + [summary] + tail
         # A small budget can be smaller than the preserved recent messages.
@@ -153,7 +153,7 @@ class ContextManager:
             changed = False
             for index, message in enumerate(compacted):
                 content = str(message.get("content") or "")
-                minimum = len("[Earlier context compacted by Cline]") if index == 1 else 0
+                minimum = len("[Earlier context compacted by Omniscience]") if index == 1 else 0
                 removable = max(0, len(content) - minimum)
                 if removable:
                     target_length = len(content) - min(removable, max(1, excess * 4))
@@ -213,7 +213,7 @@ class ContextManager:
             return self.fallback(messages, reserved_tokens)
         summary = {
             "role": "user",
-            "content": "[Earlier context summarized by Cline]\n" + str(summary_text).strip(),
+            "content": "[Earlier context summarized by Omniscience]\n" + str(summary_text).strip(),
         }
         compacted = head + [summary] + tail
         available_tokens = max(1, self.max_tokens - max(0, int(reserved_tokens)))
@@ -223,7 +223,7 @@ class ContextManager:
             while self.estimate_messages_tokens(compacted) > available_tokens:
                 largest = max(range(len(compacted)), key=lambda index: len(str(compacted[index].get("content") or "")))
                 content = str(compacted[largest].get("content") or "")
-                minimum = len("[Earlier context summarized by Cline]") if largest == 1 else 0
+                minimum = len("[Earlier context summarized by Omniscience]") if largest == 1 else 0
                 if len(content) <= minimum:
                     break
                 target_length = max(minimum, len(content) - 256)

@@ -68,7 +68,7 @@ WRITE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _function(
         "apply_patch",
         "Apply a context-based unified diff to one workspace file. Hunk headers use the old file's line numbers; context lines are matched verbatim and a mismatch rejects the whole patch without writing. "
-        "The Cline-style wrapper lines (*** Begin Patch / *** Update File: path) are tolerated and stripped.",
+        "The Omniscience-style wrapper lines (*** Begin Patch / *** Update File: path) are tolerated and stripped.",
         {"path": {"type": "string"}, "patch": {"type": "string", "description": "Unified diff with @@ hunk headers."}},
         ["path", "patch"],
     ),
@@ -151,7 +151,7 @@ GLOBAL_CHAT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _function(
         "install_github_skill",
         (
-            "Install Cline Skills from one public GitHub repository into the global Skill library. "
+            "Install Omniscience Skills from one public GitHub repository into the global Skill library. "
             "Call only when the user explicitly asked to install a Skill. Use the exact repository, "
             "folder, or SKILL.md source the user provided; if they gave owner/repo shorthand or only a "
             "repository URL, pass that repository -- every Skill folder it publishes is installed and "

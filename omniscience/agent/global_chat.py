@@ -24,7 +24,7 @@ from ..storage import TaskStore
 from ..util import json_text
 from .github_skill import GitHubSkillInstaller
 from .global_tools import GlobalChatToolMixin
-from .legacy import ClineAgent
+from .legacy import OmniscienceAgent
 from .node_install import NodeInstallerMixin
 from ..workflow_manager import WorkflowManagerMixin
 
@@ -36,7 +36,7 @@ class GlobalChatAgent(GlobalChatToolMixin, GitHubSkillInstaller, NodeInstallerMi
         self.settings = settings
         self.store = TaskStore(paths.TASK_DATABASE)
         self.skills = SkillStore(paths.SKILL_DATABASE)
-        self.model = ClineAgent(settings)
+        self.model = OmniscienceAgent(settings)
         self.browser = browser_manager(self.settings.load)
         self._lock = asyncio.Lock()
         self._model_download_tasks: dict[tuple[str, str], asyncio.Task] = {}

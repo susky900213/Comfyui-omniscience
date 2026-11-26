@@ -1,8 +1,8 @@
 """Legacy compatibility adapter for the original stateless chat endpoint.
 
-``ClineAgent`` keeps the pre-task runtime working for direct API callers:
+``OmniscienceAgent`` keeps the pre-task runtime working for direct API callers:
 in-memory transcripts, no persistence, and the original tool set. The real
-application boundary is :class:`omniscience.agent.runtime.PersistentClineAgent`.
+application boundary is :class:`omniscience.agent.runtime.PersistentOmniscienceAgent`.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class PendingAction:
     arguments: dict[str, Any]
 
 
-class ClineAgent:
+class OmniscienceAgent:
     def __init__(self, settings: SettingsStore):
         self.settings = settings
         self.pending: dict[str, PendingAction] = {}
@@ -333,7 +333,7 @@ class ClineAgent:
             command,
             cwd=workspace.root,
             shell=True,  # noqa: S602 - command execution is bounded by local policy
-            executable=ClineAgent._shell_executable(),
+            executable=OmniscienceAgent._shell_executable(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

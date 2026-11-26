@@ -19,19 +19,19 @@ _CONTROLLER: Any = None
 def legacy_agent() -> Any:
     global _LEGACY_AGENT
     if _LEGACY_AGENT is None:
-        from ..agent.legacy import ClineAgent
+        from ..agent.legacy import OmniscienceAgent
 
-        _LEGACY_AGENT = ClineAgent(SettingsStore())
+        _LEGACY_AGENT = OmniscienceAgent(SettingsStore())
     return _LEGACY_AGENT
 
 
 def task_agent() -> Any:
     global _TASK_AGENT, _CONTROLLER
     if _TASK_AGENT is None:
-        from ..agent.runtime import PersistentClineAgent
+        from ..agent.runtime import PersistentOmniscienceAgent
         from .turns import TaskTurnController
 
-        _TASK_AGENT = PersistentClineAgent(SettingsStore())
+        _TASK_AGENT = PersistentOmniscienceAgent(SettingsStore())
         _CONTROLLER = TaskTurnController(_TASK_AGENT)
         _TASK_AGENT.followup_provider = _CONTROLLER.drain
     return _TASK_AGENT

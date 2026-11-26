@@ -1,6 +1,6 @@
 """System prompt assembly (DESIGN.md section 9 and Appendix A).
 
-The builder follows Cline's ``buildClineSystemPrompt`` order:
+The builder follows Omniscience's ``buildOmniscienceSystemPrompt`` order:
 
     ACT base (placeholders filled)
     + mode-tag instructions        (plan and act both get this)
@@ -324,7 +324,7 @@ def skill_prompt(skills: list[dict[str, Any]], locale: Any = "") -> str:
 
 
 def project_rules(project_root: Path | None, filename: str = "OMNISCIENCE.md", locale: Any = "") -> str:
-    """Read the per-project rules file equivalent to Cline's .omnisciencerules."""
+    """Read the per-project rules file equivalent to Omniscience's .omnisciencerules."""
     if project_root is None:
         return ""
     try:
@@ -341,7 +341,7 @@ def project_rules(project_root: Path | None, filename: str = "OMNISCIENCE.md", l
 
 
 def workspace_metadata(task: dict[str, Any], comfyui_directory: str = "", locale: Any = "") -> str:
-    """Structured workspace info, replacing Cline's CLINE_METADATA block."""
+    """Structured workspace info, replacing Omniscience's OMNISCIENCE_METADATA block."""
     metadata = {
         "workspace": str(task.get("workspace") or ""),
         "project_folder": task.get("folder") or "",

@@ -54,7 +54,7 @@ STATE_DIRECTORY = Path(
     os.environ.get(
         "OMNISCIENCE_STATE_DIRECTORY",
         os.environ.get(
-            "CLINE_STATE_DIRECTORY",
+            "OMNISCIENCE_STATE_DIRECTORY",
             str(
                 LEGACY_STATE_DIRECTORY
                 if LEGACY_STATE_DIRECTORY.exists() and not DEFAULT_STATE_DIRECTORY.exists()
@@ -65,12 +65,12 @@ STATE_DIRECTORY = Path(
 ).expanduser()
 TASK_DATABASE = Path(
     os.environ.get(
-        "OMNISCIENCE_TASK_DATABASE", os.environ.get("CLINE_TASK_DATABASE", str(STATE_DIRECTORY / "tasks.sqlite3"))
+        "OMNISCIENCE_TASK_DATABASE", os.environ.get("OMNISCIENCE_TASK_DATABASE", str(STATE_DIRECTORY / "tasks.sqlite3"))
     )
 ).expanduser()
 SKILL_DATABASE = Path(
     os.environ.get(
-        "OMNISCIENCE_SKILL_DATABASE", os.environ.get("CLINE_SKILL_DATABASE", str(STATE_DIRECTORY / "skills.sqlite3"))
+        "OMNISCIENCE_SKILL_DATABASE", os.environ.get("OMNISCIENCE_SKILL_DATABASE", str(STATE_DIRECTORY / "skills.sqlite3"))
     )
 ).expanduser()
 
@@ -79,7 +79,7 @@ MCP_SETTINGS_PATH = Path(
     os.environ.get(
         "OMNISCIENCE_MCP_SETTINGS_PATH",
         os.environ.get(
-            "CLINE_MCP_SETTINGS_PATH",
+            "OMNISCIENCE_MCP_SETTINGS_PATH",
             str(
                 LEGACY_MCP_SETTINGS_PATH
                 if LEGACY_MCP_SETTINGS_PATH.exists() and not DEFAULT_MCP_SETTINGS_PATH.exists()
@@ -90,7 +90,7 @@ MCP_SETTINGS_PATH = Path(
 ).expanduser()
 
 CONFIG_PATH = Path(
-    os.environ.get("OMNISCIENCE_CONFIG_FILE", os.environ.get("CLINE_CONFIG_FILE", str(DEFAULT_CONFIG_PATH)))
+    os.environ.get("OMNISCIENCE_CONFIG_FILE", os.environ.get("OMNISCIENCE_CONFIG_FILE", str(DEFAULT_CONFIG_PATH)))
 ).expanduser()
 
 # Optional local-only repository token file.  The file is intentionally kept
@@ -103,14 +103,14 @@ LOCAL_TOKEN_CONFIG_PATH = Path(
     )
 ).expanduser()
 
-DEFAULT_MODEL = os.environ.get("OMNISCIENCE_MODEL", os.environ.get("CLINE_MODEL", ""))
-DEFAULT_API_BASE_URL = os.environ.get("OMNISCIENCE_API_BASE_URL", os.environ.get("CLINE_API_BASE_URL", "https://api.openai.com/v1"))
+DEFAULT_MODEL = os.environ.get("OMNISCIENCE_MODEL", os.environ.get("OMNISCIENCE_MODEL", ""))
+DEFAULT_API_BASE_URL = os.environ.get("OMNISCIENCE_API_BASE_URL", os.environ.get("OMNISCIENCE_API_BASE_URL", "https://api.openai.com/v1"))
 DEFAULT_WORKSPACE = Path.home() / ".Comfyui-node"
-DEFAULT_COMFYUI_DIRECTORY = os.environ.get("OMNISCIENCE_COMFYUI_DIRECTORY", os.environ.get("CLINE_COMFYUI_DIRECTORY", "")).strip()
+DEFAULT_COMFYUI_DIRECTORY = os.environ.get("OMNISCIENCE_COMFYUI_DIRECTORY", os.environ.get("OMNISCIENCE_COMFYUI_DIRECTORY", "")).strip()
 
 
 def env(name: str, legacy: str) -> str:
-    """Read an ``OMNISCIENCE_*`` override with the historical ``CLINE_*`` fallback."""
+    """Read an ``OMNISCIENCE_*`` override with the historical ``OMNISCIENCE_*`` fallback."""
     return os.environ.get(name) or os.environ.get(legacy) or ""
 
 

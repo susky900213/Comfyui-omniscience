@@ -17,8 +17,8 @@ from typing import Any
 try:  # ComfyUI loads custom nodes as packages; direct unittest does not.
     from .omniscience import constants, paths, prompts
     from .omniscience.agent.global_chat import GlobalChatAgent
-    from .omniscience.agent.legacy import ClineAgent, PendingAction
-    from .omniscience.agent.runtime import PersistentClineAgent
+    from .omniscience.agent.legacy import OmniscienceAgent, PendingAction
+    from .omniscience.agent.runtime import PersistentOmniscienceAgent
     from .omniscience.api import deps
     from .omniscience.api import routes as _routes
     from .omniscience.checkpointing import CheckpointManager
@@ -42,8 +42,8 @@ try:  # ComfyUI loads custom nodes as packages; direct unittest does not.
 except ImportError:
     from omniscience import constants, paths, prompts
     from omniscience.agent.global_chat import GlobalChatAgent
-    from omniscience.agent.legacy import ClineAgent, PendingAction
-    from omniscience.agent.runtime import PersistentClineAgent
+    from omniscience.agent.legacy import OmniscienceAgent, PendingAction
+    from omniscience.agent.runtime import PersistentOmniscienceAgent
     from omniscience.api import deps
     from omniscience.api import routes as _routes
     from omniscience.checkpointing import CheckpointManager
@@ -80,11 +80,11 @@ COMPACTION_SYSTEM_PROMPT = prompts.COMPACTION_SYSTEM_PROMPT
 GLOBAL_CHAT_SYSTEM_PROMPT = prompts.GLOBAL_CHAT_SYSTEM_PROMPT
 
 
-def _agent() -> ClineAgent:
+def _agent() -> OmniscienceAgent:
     return deps.legacy_agent()
 
 
-def _task_agent() -> PersistentClineAgent:
+def _task_agent() -> PersistentOmniscienceAgent:
     return deps.task_agent()
 
 
@@ -108,12 +108,12 @@ def register_routes(prompt_server: Any) -> None:
 __all__ = [
     "BROWSER_TOOL_DEFINITIONS",
     "CheckpointManager",
-    "ClineAgent",
+    "OmniscienceAgent",
     "ContextManager",
     "GLOBAL_CHAT_SYSTEM_PROMPT",
     "GlobalChatAgent",
     "LIVE_WORKFLOW_TOOL_DEFINITIONS",
-    "PersistentClineAgent",
+    "PersistentOmniscienceAgent",
     "PendingAction",
     "ProjectFolderExistsError",
     "SettingsStore",

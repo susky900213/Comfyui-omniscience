@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from omniscience import paths
 from omniscience.agent.global_chat import GlobalChatAgent
-from omniscience.agent.runtime import PersistentClineAgent
+from omniscience.agent.runtime import PersistentOmniscienceAgent
 from omniscience.api.turns import TaskTurnController
 from omniscience.i18n import normalize_locale
 from omniscience.prompts import build_system_prompt
@@ -123,7 +123,7 @@ if (applied.join(',') !== 'en,zh-CN') process.exit(1);
             paths.SKILL_DATABASE = root / "skills.sqlite3"
             paths.STATE_DIRECTORY = root / "state"
             try:
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Locale", "act", "locale")
                 agent.store.append_message(task["id"], {"role": "user", "content": "hello", "locale": "en"})
                 english = agent.system_prompt(task["id"])
@@ -178,7 +178,7 @@ if (applied.join(',') !== 'en,zh-CN') process.exit(1);
             paths.SKILL_DATABASE = root / "skills.sqlite3"
             paths.STATE_DIRECTORY = root / "state"
             try:
-                agent = PersistentClineAgent(settings)
+                agent = PersistentOmniscienceAgent(settings)
                 task = agent.create_task("Legacy approval", "act", "locale")
                 agent.store.append_message(task["id"], {"role": "user", "content": "你好", "locale": "zh"})
                 agent.store.create_approval(

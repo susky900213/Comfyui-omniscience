@@ -93,10 +93,10 @@ class SettingsStore:
             "workspace": workspace,
             "comfyui_directory": comfyui,
             "comfyui_server_url": str(data.get("comfyui_server_url") or "http://127.0.0.1:8188"),
-            "api_key_configured": bool(data.get("api_key") or paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
-            "api_key_from_environment": bool(paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY")),
+            "api_key_configured": bool(data.get("api_key") or paths.env("OMNISCIENCE_API_KEY", "OMNISCIENCE_API_KEY")),
+            "api_key_from_environment": bool(paths.env("OMNISCIENCE_API_KEY", "OMNISCIENCE_API_KEY")),
             "gitcode_token_configured": bool(self.gitcode_token()),
-            "gitcode_token_from_environment": bool(paths.env("GITCODE_TOKEN", "CLINE_GITCODE_TOKEN")),
+            "gitcode_token_from_environment": bool(paths.env("GITCODE_TOKEN", "OMNISCIENCE_GITCODE_TOKEN")),
         }
 
     def update(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -191,7 +191,7 @@ class SettingsStore:
         return self.public()
 
     def api_key(self) -> str:
-        return paths.env("OMNISCIENCE_API_KEY", "CLINE_API_KEY") or str(self.load().get("api_key") or "")
+        return paths.env("OMNISCIENCE_API_KEY", "OMNISCIENCE_API_KEY") or str(self.load().get("api_key") or "")
 
     def gitcode_token(self) -> str:
         return access_tokens.resolve("gitcode", self.load().get("gitcode_token"))
