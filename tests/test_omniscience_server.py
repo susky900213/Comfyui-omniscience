@@ -27,7 +27,7 @@ from omniscience_server import (
     _project_folder_name,
     apply_unified_patch,
 )
-from omniscience import access_tokens, archives, environment_diagnostics, node_review, node_security, skill_review, skill_security
+from omniscience import access_tokens, archives, environment_diagnostics, node_review, node_security, paths, skill_review, skill_security
 from omniscience import model_downloader, model_source, node_search, util, workflow_diagnostics, workflow_executor, workflow_manager
 from omniscience.agent import node_install
 from omniscience.workflow_manager_install import WorkflowInstallMixin
@@ -2071,7 +2071,7 @@ class NodeInstallRequestTests(unittest.TestCase):
 class WorkflowInstallRequestTests(unittest.TestCase):
     def test_request_detection_and_tool_surface(self):
         self.assertTrue(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "@workflow"))
-        self.assertTrue(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "帮我安装这个工作流"))
+        self.assertFalse(GlobalChatAgent.workflow_install_requested(GlobalChatAgent, "帮我安装这个工作流"))
         self.assertTrue(
             GlobalChatAgent.workflow_install_requested(
                 GlobalChatAgent, "导入 @uploads/photo-style.json"

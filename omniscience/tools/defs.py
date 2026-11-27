@@ -176,7 +176,7 @@ GLOBAL_CHAT_BROWSER_TOOL_DEFINITIONS: list[dict[str, Any]] = BROWSER_TOOL_DEFINI
 GLOBAL_CHAT_WORKFLOW_DEFINITIONS: list[dict[str, Any]] = [
     _function(
         "search_runninghub_workflows",
-        "Search RunningHub domestic or international sites for ComfyUI workflow candidates. Call only when the user explicitly asks to find or recommend a workflow. Return ranked candidates and wait for the user to select one; never install before selection.",
+        "Search RunningHub domestic or international sites for ComfyUI workflow candidates. Call when the user explicitly asks to find or recommend a workflow, or asks to install a named workflow without providing an uploaded JSON path. Return ranked candidates and wait for the user to select one; never install before selection.",
         {
             "query": {"type": "string", "description": "Your chosen concise RunningHub search keywords based on the user's workflow requirement. Preserve the important project/model/task terms; omit polite wording and generic wrapper words."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 20},
