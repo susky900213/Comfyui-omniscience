@@ -218,11 +218,11 @@ def _merge_loader_widget_models(nodes: list[dict[str, Any]], found: dict[tuple[s
         if str(node.get("id") or "").strip()
     }
     references = _loader_widget_model_references(nodes)
-    references_by_node = {
-        reference["node_id"]: reference
-        for reference in references
-        if reference.get("node_id")
-    }
+    references_by_node: dict[str, list[dict[str, str]]] = {}
+    for reference in references:
+        node_reference_id = reference.get("node_id")
+        if node_reference_id:
+            references_by_node.setdefault(node_reference_id, []).append(reference)
     for reference in references:
         node_id = reference["node_id"]
         field = reference["field"]
@@ -252,9 +252,10 @@ def _merge_loader_widget_models(nodes: list[dict[str, Any]], found: dict[tuple[s
             # attribution).  Detach the current instance before applying the
             # authoritative widget value.
             other_references = [
-                references_by_node.get(other_node_id)
+                other_reference
                 for other_node_id in model_node_ids
-                if other_node_id != node_id and references_by_node.get(other_node_id)
+                if other_node_id != node_id
+                for other_reference in references_by_node.get(other_node_id, [])
             ]
             has_different_selection = any(
                 str(other.get("name") or "").strip().casefold() != name.casefold()
@@ -306,7 +307,6 @@ def _merge_loader_widget_models(nodes: list[dict[str, Any]], found: dict[tuple[s
                     found[new_key] = selected_model
                     model = selected_model
                 _record_loader_field(model, field)
-                old_key = new_key
                 # The detached record already represents this widget value, so
                 # it must not fall through and be renamed a second time.
                 continue
