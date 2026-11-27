@@ -2368,6 +2368,51 @@ class WorkflowParserTests(unittest.TestCase):
         self.assertNotIn("url", unet)
         self.assertEqual(models["minimax_h3_turbo_4步加速_comfyui.safetensors"]["field"], "lora_name")
 
+    def test_shared_stale_loader_metadata_keeps_different_instance_models(self):
+        from omniscience.workflow_parser import inspect_workflow
+
+        stale_metadata = {
+            "name": "moss_image_sft_int8_convrot.safetensors",
+            "directory": "diffusion_models",
+            "url": "https://example.invalid/moss_image_sft_int8_convrot.safetensors",
+        }
+        report = inspect_workflow(
+            {
+                "nodes": [
+                    {
+                        "id": 28,
+                        "type": "UNETLoader",
+                        "widgets_values_named": {
+                            "unet_name": "moss_image_sft_bf16.safetensors",
+                            "weight_dtype": "default",
+                        },
+                        "properties": {"models": [stale_metadata]},
+                    },
+                    {
+                        "id": 41,
+                        "type": "UNETLoader",
+                        "widgets_values_named": {
+                            "unet_name": "moss_image_base_fp16_fixed.safetensors",
+                            "weight_dtype": "default",
+                        },
+                        "properties": {"models": [stale_metadata]},
+                    },
+                ]
+            }
+        )
+
+        models = {item["name"]: item for item in report["models"]}
+        self.assertEqual(
+            set(models),
+            {
+                "moss_image_sft_bf16.safetensors",
+                "moss_image_base_fp16_fixed.safetensors",
+            },
+        )
+        self.assertEqual(models["moss_image_sft_bf16.safetensors"]["nodes"], ["28"])
+        self.assertEqual(models["moss_image_base_fp16_fixed.safetensors"]["nodes"], ["41"])
+        self.assertTrue(all(item["metadata_mismatch"] for item in models.values()))
+
     def test_loader_choices_distinguish_recognized_and_unrecognized_selections(self):
         from omniscience.workflow_parser import inspect_workflow
 

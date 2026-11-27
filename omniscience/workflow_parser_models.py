@@ -212,7 +212,18 @@ def _loader_widget_model_references(nodes: list[dict[str, Any]]) -> list[dict[st
 
 def _merge_loader_widget_models(nodes: list[dict[str, Any]], found: dict[tuple[str, str], dict[str, Any]]) -> None:
     """Make loader selections authoritative while retaining metadata provenance."""
-    for reference in _loader_widget_model_references(nodes):
+    node_types_by_id = {
+        str(node.get("id") or "").strip(): str(node.get("class_type") or "").strip()
+        for node in nodes
+        if str(node.get("id") or "").strip()
+    }
+    references = _loader_widget_model_references(nodes)
+    references_by_node = {
+        reference["node_id"]: reference
+        for reference in references
+        if reference.get("node_id")
+    }
+    for reference in references:
         node_id = reference["node_id"]
         field = reference["field"]
         name = reference["name"]
@@ -233,6 +244,72 @@ def _merge_loader_widget_models(nodes: list[dict[str, Any]], found: dict[tuple[s
             continue
         if len(candidates) == 1:
             old_key, model = candidates[0]
+            model_node_ids = [str(item) for item in model.get("nodes") or [] if str(item).strip()]
+            # ComfyUI can copy the same stale ``properties.models`` entry to
+            # several loader instances.  If those instances select different
+            # files, mutating the shared record in place makes the last widget
+            # overwrite the earlier dependency (and loses its node
+            # attribution).  Detach the current instance before applying the
+            # authoritative widget value.
+            other_references = [
+                references_by_node.get(other_node_id)
+                for other_node_id in model_node_ids
+                if other_node_id != node_id and references_by_node.get(other_node_id)
+            ]
+            has_different_selection = any(
+                str(other.get("name") or "").strip().casefold() != name.casefold()
+                for other in other_references
+            )
+            if len(model_node_ids) > 1 and node_id in model_node_ids and has_different_selection:
+                remaining_node_ids = [item for item in model_node_ids if item != node_id]
+                old_name = str(model.get("name") or "").strip()
+                old_url = str(model.get("url") or "").strip()
+                selected_model = deepcopy(model)
+                selected_model["name"] = name
+                selected_model["metadata_name"] = old_name
+                selected_model["metadata_mismatch"] = True
+                if old_url:
+                    # The stale URL belongs to the metadata basename, not to
+                    # the file selected by this loader widget.
+                    selected_model["metadata_url"] = old_url
+                    selected_model.pop("url", None)
+                selected_model["nodes"] = [node_id]
+                selected_model["node_types"] = list(
+                    dict.fromkeys(
+                        node_types_by_id.get(node_id, "")
+                        or item
+                        for item in model.get("node_types") or []
+                        if str(item).strip()
+                    )
+                )
+                model["nodes"] = remaining_node_ids
+                model["node_types"] = list(
+                    dict.fromkeys(
+                        node_types_by_id.get(item, "")
+                        for item in remaining_node_ids
+                        if node_types_by_id.get(item, "").strip()
+                    )
+                ) or list(model.get("node_types") or [])
+                new_key = _normalise_model_metadata_key(model.get("directory"), name)
+                existing = found.get(new_key)
+                if existing is not None and existing is not model:
+                    existing_nodes = [str(item) for item in existing.get("nodes") or []]
+                    if node_id not in existing_nodes:
+                        existing["nodes"] = [*existing_nodes, node_id]
+                    existing_types = [str(item) for item in existing.get("node_types") or []]
+                    selected_type = node_types_by_id.get(node_id, "").strip()
+                    if selected_type and selected_type not in existing_types:
+                        existing_types.append(selected_type)
+                    existing["node_types"] = existing_types
+                    model = existing
+                else:
+                    found[new_key] = selected_model
+                    model = selected_model
+                _record_loader_field(model, field)
+                old_key = new_key
+                # The detached record already represents this widget value, so
+                # it must not fall through and be renamed a second time.
+                continue
             old_name = str(model.get("name") or "").strip()
             old_url = str(model.get("url") or "").strip()
             _record_loader_field(model, field)
