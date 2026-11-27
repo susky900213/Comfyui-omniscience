@@ -2915,6 +2915,8 @@ class GitHubNodeSearchTests(unittest.TestCase):
         query = request.call_args.args[0]
         self.assertTrue(query.startswith("https://api.github.com/search/repositories?"))
         self.assertIn("per_page=8", query)
+        self.assertNotIn("%22", query)
+        self.assertNotIn('"', query)
 
     def test_search_rejects_invalid_class_names(self):
         for value in ("", "\nmalicious", "x" * 161):
@@ -2944,6 +2946,8 @@ class GitHubNodeSearchTests(unittest.TestCase):
         proxy_url = request.call_args.args[0]
         self.assertTrue(proxy_url.startswith("https://github.tbap.top/https://api.github.com/search/repositories?"))
         self.assertIn("per_page=8", request.call_args.args[0])
+        self.assertNotIn("%22", proxy_url)
+        self.assertNotIn('"', proxy_url)
 
 
 class ComfyUIManagerClientTests(unittest.TestCase):
@@ -3316,6 +3320,15 @@ class WorkflowNodeSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine, "google")
         self.assertTrue(url.startswith("https://www.google.com/search?"))
         self.assertIn("KOOK_SaveJPGImage", url)
+        self.assertNotIn("%22", url)
+        self.assertNotIn('"', url)
+
+    def test_regional_node_search_url_does_not_quote_the_query(self):
+        engine, url = node_search.WebNodeSearcher.search_url("MOSSMergePreset", region="domestic")
+        self.assertEqual(engine, "bing")
+        self.assertEqual(url, "https://cn.bing.com/search?q=MOSSMergePreset&count=8&first=1")
+        self.assertNotIn("%22", url)
+        self.assertNotIn('"', url)
 
     async def test_manager_timeout_falls_back_to_regional_web_search(self):
         from importlib import import_module

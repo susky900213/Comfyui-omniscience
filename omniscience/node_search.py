@@ -255,7 +255,7 @@ class WebNodeSearcher:
 
     @staticmethod
     def _search_url(region: str, class_type: str, limit: int) -> tuple[str, str]:
-        query = f'"{class_type}"'
+        query = class_type
         count = max(1, min(MAX_RESULTS, int(limit)))
         if region == "domestic":
             engine = "bing"
@@ -335,7 +335,7 @@ class GitHubNodeSearcher:
         # intentionally always anonymous.
         name = _class_name(class_type, "GitHub")
         count = max(1, min(MAX_RESULTS, int(limit)))
-        query = urlencode({"q": f'"{name}" ComfyUI', "sort": "stars", "order": "desc", "per_page": count})
+        query = urlencode({"q": f"{name} ComfyUI", "sort": "stars", "order": "desc", "per_page": count})
         url = f"{GITHUB_API_BASE}/search/repositories?{query}"
         try:
             payload = GitHubSkillInstaller._github_request(url, max_bytes=MAX_RESPONSE_BYTES)
@@ -390,7 +390,7 @@ class GitHubProxyNodeSearcher:
     def search(cls, class_type: Any, *, limit: int = MAX_RESULTS) -> list[dict[str, Any]]:
         name = _class_name(class_type, "GitHub 国内代理")
         count = max(1, min(MAX_RESULTS, int(limit)))
-        query = urlencode({"q": f'"{name}" ComfyUI', "sort": "stars", "order": "desc", "per_page": count})
+        query = urlencode({"q": f"{name} ComfyUI", "sort": "stars", "order": "desc", "per_page": count})
         api_url = f"{GITHUB_API_BASE}/search/repositories?{query}"
         url = f"{GITHUB_PROXY_PREFIX}{api_url}"
         try:
